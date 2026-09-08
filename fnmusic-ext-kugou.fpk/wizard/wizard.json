@@ -1,0 +1,9 @@
+{
+    "title": "飞牛音乐酷狗扩展配置",
+    "description": "配置自建 KuGouMusicApi 地址并选择音质",
+    "url": "/wizard/ui/index.html",
+    "submit": {
+        "url": "/wizard/api/submit",
+        "method": "POST"
+    }
+}

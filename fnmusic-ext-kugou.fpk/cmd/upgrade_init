@@ -1,0 +1,3 @@
+#!/bin/bash
+# fnmusic-ext cmd/upgrade_init
+exit 0

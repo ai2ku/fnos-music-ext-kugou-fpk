@@ -1,0 +1,24 @@
+#!/bin/bash
+# fnmusic-ext cmd/upgrade_callback
+# 升级后：语法检查（不阻断）
+
+APPDEST="${TRIM_APPDEST:-}"
+[ -n "$APPDEST" ] || exit 0
+
+APP_DIR="$APPDEST/app"
+if [ ! -d "$APP_DIR" ] && [ -d "$APPDEST/proxy" ]; then
+    APP_DIR="$APPDEST"
+fi
+
+VENV_PY="$APPDEST/.venv-proxy/bin/python3"
+if [ ! -x "$VENV_PY" ] && [ -x "$APPDEST/app/.venv-proxy/bin/python3" ]; then
+    VENV_PY="$APPDEST/app/.venv-proxy/bin/python3"
+fi
+
+if [ -x "$VENV_PY" ]; then
+    "$VENV_PY" -m py_compile \
+        "$APP_DIR/proxy/app.py" \
+        "$APP_DIR/proxy/kugou_source.py" \
+        "$APP_DIR/proxy/recommend.py" 2>/dev/null
+fi
+exit 0

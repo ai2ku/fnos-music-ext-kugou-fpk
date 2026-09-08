@@ -1,0 +1,6 @@
+#!/bin/bash
+# fnmusic-ext cmd/install_init
+# 只做必要前置检查，Python 由 install_callback 全权处理
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/fnmusic-ext-install.log}"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+exit 0

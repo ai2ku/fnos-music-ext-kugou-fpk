@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>飞牛音乐酷狗扩展配置</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f6f8;min-height:100vh;padding:24px}
+.card{max-width:640px;margin:24px auto;background:#fff;border-radius:12px;padding:32px;box-shadow:0 4px 20px rgba(0,0,0,.08)}
+h2{font-size:20px;color:#1f2937;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.sub{color:#6b7280;font-size:13px;margin-bottom:24px;line-height:1.6}
+.field{margin-bottom:18px}
+label{display:block;font-size:13px;color:#374151;margin-bottom:6px;font-weight:500}
+.hint{color:#9ca3af;font-size:12px;margin-top:4px;line-height:1.5}
+input,select{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;outline:none;transition:border-color .15s}
+input:focus,select:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.12)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.check{display:flex;align-items:center;gap:8px;padding:10px 12px;background:#f9fafb;border-radius:6px;cursor:pointer;font-size:13px}
+.check input{width:auto}
+.actions{display:flex;gap:12px;margin-top:24px}
+.btn{flex:1;padding:12px;border:0;border-radius:6px;font-size:14px;font-weight:500;cursor:pointer;transition:opacity .15s}
+.btn-primary{background:#007aff;color:#fff}
+.btn-ghost{background:#f3f4f6;color:#374151}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.result{padding:14px 16px;border-radius:6px;margin-bottom:16px;display:none}
+.result.ok{background:#ecfdf5;border:1px solid #10b981;color:#065f46}
+.result.err{background:#fef2f2;border:1px solid #ef4444;color:#991b1b}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>🎵 飞牛音乐酷狗扩展</h2>
+<div class="sub">
+本应用会接管 <code>/var/run/trim_music.socket</code>，为飞牛音乐接入你自建的 KuGouMusicApi 作为外部音源。<br>
+请确保 KuGouMusicApi 服务已启动并可从飞牛 NAS 访问。
+</div>
+
+<div class="result" id="result"></div>
+
+<div class="field">
+<label>KuGouMusicApi 基地址</label>
+<input id="kugou_url" placeholder="http://127.0.0.1:8899" value="http://127.0.0.1:8899">
+<div class="hint">如果 KuGouMusicApi 部署在 NAS 本机容器，可用 http://127.0.0.1:8899；部署在别处则填对应 IP 和端口。</div>
+</div>
+
+<div class="row">
+<div class="field">
+<label>优先音质</label>
+<select id="kugou_quality">
+<option value="high">high（最高）</option><option value="320">320kbps（需 KuGou VIP 账号）</option>
+<option value="128" selected>128kbps（推荐）</option>
+<option value="64">64kbps（保底）</option>
+</select>
+</div>
+<div class="field">
+<label>搜索超时（秒）</label>
+<input id="kugou_timeout" value="15" type="number" min="5" max="60">
+</div>
+</div>
+
+<div class="field">
+<label>飞牛曲库目录（可选，覆盖默认）</label>
+<input id="library_dir" placeholder="留空使用飞牛默认曲库路径">
+<div class="hint">留空则自动从飞牛 music.db 读取 shared_library.path；填写后会覆盖。</div>
+</div>
+
+<div class="field">
+<label>可选：每日推荐（OpenAI 兼容接口，可留空关闭）</label>
+<input id="llm_base_url" placeholder="https://api.openai.com/v1">
+<div class="row" style="margin-top:8px">
+<input id="llm_api_key" placeholder="sk-..." type="password">
+<input id="llm_model" placeholder="gpt-4o-mini">
+</div>
+</div>
+
+<div class="actions">
+<button class="btn btn-ghost" onclick="reset()">重置默认</button>
+<button class="btn btn-primary" id="submitBtn" onclick="submit()">保存并启动</button>
+</div>
+</div>
+
+<script>
+const DEFAULTS = {
+    FNMUSIC_KUGOU_URL: 'http://127.0.0.1:8899',
+    FNMUSIC_KUGOU_QUALITY: '128',
+    FNMUSIC_KUGOU_SEARCH_TIMEOUT: '15',
+    FNMUSIC_KUGOU_ENABLED: 'true',
+    FNMUSIC_MUSICDL_ENABLED: 'false',
+    FNMUSIC_NETEASE_ENABLED: 'false',
+    FNMUSIC_LIBRARY_DIR: '',
+    FNMUSIC_LLM_BASE_URL: '',
+    FNMUSIC_LLM_API_KEY: '',
+    FNMUSIC_LLM_MODEL: 'gpt-4o-mini'
+};
+
+async function load(){
+    try {
+        const r = await fetch('/wizard/api/load');
+        if (r.ok) {
+            const d = await r.json();
+            for (const [k,v] of Object.entries(d||{})) {
+                const id = 'kugou_url'.replace(/kugou_url/,'');
+            }
+            // map by field ids
+            const map = {
+                FNMUSIC_KUGOU_URL: 'kugou_url',
+                FNMUSIC_KUGOU_QUALITY: 'kugou_quality',
+                FNMUSIC_KUGOU_SEARCH_TIMEOUT: 'kugou_timeout',
+                FNMUSIC_LIBRARY_DIR: 'library_dir',
+                FNMUSIC_LLM_BASE_URL: 'llm_base_url',
+                FNMUSIC_LLM_API_KEY: 'llm_api_key',
+                FNMUSIC_LLM_MODEL: 'llm_model'
+            };
+            for (const [k, el] of Object.entries(map)) {
+                if (d[k] && document.getElementById(el)) {
+                    document.getElementById(el).value = d[k];
+                }
+            }
+        }
+    } catch (e) { /* ignore */ }
+}
+
+function reset(){
+    for (const [k,v] of Object.entries(DEFAULTS)) {
+        const el = document.getElementById(k === 'FNMUSIC_KUGOU_URL' ? 'kugou_url' :
+                                       k === 'FNMUSIC_KUGOU_QUALITY' ? 'kugou_quality' :
+                                       k === 'FNMUSIC_KUGOU_SEARCH_TIMEOUT' ? 'kugou_timeout' :
+                                       k === 'FNMUSIC_LIBRARY_DIR' ? 'library_dir' :
+                                       k === 'FNMUSIC_LLM_BASE_URL' ? 'llm_base_url' :
+                                       k === 'FNMUSIC_LLM_API_KEY' ? 'llm_api_key' :
+                                       k === 'FNMUSIC_LLM_MODEL' ? 'llm_model' : null);
+        if (el) el.value = v;
+    }
+}
+
+async function submit(){
+    const btn = document.getElementById('submitBtn');
+    const result = document.getElementById('result');
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+    result.style.display = 'none';
+
+    const payload = {
+        FNMUSIC_KUGOU_URL: document.getElementById('kugou_url').value.trim(),
+        FNMUSIC_KUGOU_QUALITY: document.getElementById('kugou_quality').value,
+        FNMUSIC_KUGOU_SEARCH_TIMEOUT: String(document.getElementById('kugou_timeout').value || 15),
+        FNMUSIC_KUGOU_ENABLED: 'true',
+        FNMUSIC_MUSICDL_ENABLED: 'false',
+        FNMUSIC_NETEASE_ENABLED: 'false',
+        FNMUSIC_LIBRARY_DIR: document.getElementById('library_dir').value.trim(),
+        FNMUSIC_LLM_BASE_URL: document.getElementById('llm_base_url').value.trim(),
+        FNMUSIC_LLM_API_KEY: document.getElementById('llm_api_key').value.trim(),
+        FNMUSIC_LLM_MODEL: document.getElementById('llm_model').value.trim() || 'gpt-4o-mini'
+    };
+
+    if (!payload.FNMUSIC_KUGOU_URL) {
+        result.className = 'result err';
+        result.style.display = 'block';
+        result.textContent = '请填写 KuGouMusicApi 地址';
+        btn.disabled = false;
+        btn.textContent = '保存并启动';
+        return;
+    }
+
+    try {
+        const r = await fetch('/wizard/api/submit', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(payload)
+        });
+        const d = await r.json();
+        if (r.ok && (d.code === 0 || d.ok)) {
+            result.className = 'result ok';
+            result.style.display = 'block';
+            result.textContent = '保存成功，飞牛音乐已接管，可关闭窗口。';
+        } else {
+            result.className = 'result err';
+            result.style.display = 'block';
+            result.textContent = d.msg || '保存失败，请重试';
+        }
+    } catch (e) {
+        result.className = 'result err';
+        result.style.display = 'block';
+        result.textContent = '请求失败：' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '保存并启动';
+    }
+}
+
+window.addEventListener('DOMContentLoaded', load);
+</script>
+</body>
+</html>

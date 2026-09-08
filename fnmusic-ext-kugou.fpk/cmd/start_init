@@ -1,0 +1,4 @@
+#!/bin/bash
+# fnmusic-ext cmd/start_init
+# 极简：install 阶段已准备好，这里不做任何检查
+exit 0

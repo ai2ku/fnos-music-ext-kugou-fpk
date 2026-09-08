@@ -1,0 +1,4 @@
+#!/bin/bash
+# fnmusic-ext cmd/start_callback
+# 极简：install 阶段已准备好，服务启停由 cmd/main 管理
+exit 0

@@ -1,0 +1,41 @@
+#!/bin/bash
+# fnmusic-ext cmd/uninstall_init
+# 卸载前：只清理代理自己的 socket，不碰飞牛音乐的 socket
+
+TARGET_SOCK="/var/run/trim_music.socket"
+UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
+
+# 停本扩展进程
+PID_FILE="/tmp/fnmusic-ext.pid"
+if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+fi
+
+# 检查 TARGET 是否是代理占的 socket（通过 healthz 判断）
+is_proxy_socket() {
+    local h
+    h="$(curl -s --max-time 2 --unix-socket "$TARGET_SOCK" http://localhost/_ext/healthz 2>/dev/null || true)"
+    echo "$h" | grep -q '"upstream"'
+}
+
+# 只有 TARGET 是代理的 socket 时才删
+if [ -S "$TARGET_SOCK" ]; then
+    if is_proxy_socket; then
+        rm -f "$TARGET_SOCK" 2>/dev/null || true
+    fi
+fi
+
+# 如果 upstream socket 还在，还原到 TARGET（覆盖情况）
+if [ -S "$UPSTREAM_SOCK" ]; then
+    rm -f "$TARGET_SOCK" 2>/dev/null || true
+    mv "$UPSTREAM_SOCK" "$TARGET_SOCK" 2>/dev/null || true
+    chmod 666 "$TARGET_SOCK" 2>/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,125 @@
+#!/bin/bash
+# fnmusic-ext cmd/install_callback
+# 每步都写日志，便于诊断
+
+LOGF="$TRIM_TEMP_LOGFILE"
+if [ -z "$LOGF" ]; then
+    LOGF="/tmp/fnmusic-ext-install.log"
+fi
+mkdir -p "$(dirname "$LOGF")" 2>/dev/null || true
+
+echo "[install_callback] START whoami=$(id -un) @ $(date)" >> "$LOGF"
+
+APPDEST="$TRIM_APPDEST"
+if [ -z "$APPDEST" ] || [ ! -d "$APPDEST" ]; then
+    echo "[install_callback] FAIL: APPDEST 空/不存在" >> "$LOGF"
+    exit 1
+fi
+
+echo "[install_callback] APPDEST=$APPDEST" >> "$LOGF"
+
+# 官方契约：Python 3.12 依赖路径
+export PATH="/var/apps/python312/target/bin:/var/apps/python312/bin:/vol1/@appcenter/python312/bin:$PATH"
+
+# 找 Python 3.12
+PY312=""
+for CAND in python3.12 python3 python; do
+    if command -v "$CAND" >/dev/null 2>&1; then
+        V=$("$CAND" --version 2>/dev/null)
+        case "$V" in
+            *3.12*) PY312="$CAND" ;;
+        esac
+    fi
+    if [ -n "$PY312" ]; then break; fi
+done
+
+if [ -z "$PY312" ]; then
+    echo "[install_callback] FAIL: 未找到 Python 3.12" >> "$LOGF"
+    exit 1
+fi
+
+echo "[install_callback] PY312=$PY312" >> "$LOGF"
+
+# 建目录
+APP_DIR="$APPDEST/app"
+if [ ! -f "$APP_DIR/proxy/requirements.txt" ] && [ -f "$APPDEST/proxy/requirements.txt" ]; then
+    APP_DIR="$APPDEST"
+fi
+if [ ! -f "$APP_DIR/proxy/requirements.txt" ]; then
+    echo "[install_callback] FAIL: 未找到 proxy/requirements.txt（APP_DIR=$APP_DIR）" >> "$LOGF"
+    exit 1
+fi
+
+mkdir -p "$APP_DIR/cache" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir cache" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/online_favorites" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir online_favorites" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/play_history" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir play_history" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/recommend_cache" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir recommend_cache" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/log" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir log" >> "$LOGF"; exit 1; }
+echo "[install_callback] 目录建好" >> "$LOGF"
+
+# venv
+VENV="$APP_DIR/.venv-proxy"
+if [ ! -x "$VENV/bin/pip" ]; then
+    echo "[install_callback] 创建 venv..." >> "$LOGF"
+    "$PY312" -m venv "$VENV" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: venv" >> "$LOGF"; exit 1; }
+    echo "[install_callback] venv 创建成功" >> "$LOGF"
+else
+    echo "[install_callback] venv 已存在" >> "$LOGF"
+fi
+
+VENV_PIP="$VENV/bin/pip"
+VENV_PY="$VENV/bin/python3"
+echo "[install_callback] VENV_PIP=$VENV_PIP" >> "$LOGF"
+
+# 装依赖
+if [ ! -x "$VENV/bin/uvicorn" ]; then
+    REQ="$APP_DIR/proxy/requirements.txt"
+    echo "[install_callback] 装依赖 (REQ=$REQ)" >> "$LOGF"
+
+    # 跳过 pip upgrade，venv 自带 pip 已够新
+    # 用 timeout 避免网络卡住
+    if timeout 300 "$VENV_PIP" install -i "https://pypi.tuna.tsinghua.edu.cn/simple" -r "$REQ" >> "$LOGF" 2>&1; then
+        echo "[install_callback] 依赖安装成功 (清华)" >> "$LOGF"
+    elif timeout 300 "$VENV_PIP" install -i "https://mirrors.aliyun.com/pypi/simple" -r "$REQ" >> "$LOGF" 2>&1; then
+        echo "[install_callback] 依赖安装成功 (阿里)" >> "$LOGF"
+    elif timeout 300 "$VENV_PIP" install -r "$REQ" >> "$LOGF" 2>&1; then
+        echo "[install_callback] 依赖安装成功 (官方)" >> "$LOGF"
+    else
+        echo "[install_callback] FAIL: 依赖安装全部失败" >> "$LOGF"
+        exit 1
+    fi
+else
+    echo "[install_callback] 依赖已安装" >> "$LOGF"
+fi
+
+# 语法检查
+"$VENV_PY" -m py_compile "$APP_DIR/proxy/app.py" "$APP_DIR/proxy/kugou_source.py" "$APP_DIR/proxy/recommend.py" >> "$LOGF" 2>&1 || echo "[install_callback] WARN: 语法告警" >> "$LOGF"
+
+# 生成 .env
+ENV_FILE="$APP_DIR/.env"
+{
+    echo "FNMUSIC_KUGOU_ENABLED=1"
+    echo "FNMUSIC_KUGOU_URL=http://127.0.0.1:8899"
+    echo "FNMUSIC_KUGOU_QUALITY=high"
+    echo "FNMUSIC_KUGOU_SEARCH_TIMEOUT=15"
+    echo "FNMUSIC_KUGOU_TOKEN="
+    echo "FNMUSIC_KUGOU_USERID="
+    echo "FNMUSIC_KUGOU_DFID="
+    echo "FNMUSIC_KUGOU_T1="
+    echo "FNMUSIC_KUGOU_MID="
+    echo "FNMUSIC_KUGOU_GUID="
+    echo "FNMUSIC_KUGOU_DEV="
+    echo "FNMUSIC_KUGOU_MAC="
+    echo "FNMUSIC_MUSICDL_ENABLED=0"
+    echo "FNMUSIC_NETEASE_ENABLED=0"
+    echo "FNMUSIC_LIBRARY_DIR="
+    echo "FNMUSIC_LLM_BASE_URL="
+    echo "FNMUSIC_LLM_API_KEY="
+} > "$ENV_FILE" || { echo "[install_callback] FAIL: 写 .env" >> "$LOGF"; exit 1; }
+chmod 666 "$ENV_FILE" 2>/dev/null || true
+echo "[install_callback] .env 写好" >> "$LOGF"
+
+chmod +x "$APP_DIR/proxy/run_proxy.sh" 2>/dev/null || true
+
+echo "[install_callback] END OK @ $(date)" >> "$LOGF"
+exit 0

@@ -1,0 +1,3432 @@
+"""fnmusic-ext 拦截代理 (FastAPI + httpx).
+
+功能：
+1. 通用透传：所有非拦截路径原样转发到 trim-music unix socket
+2. 搜索合并：GET /music/api/v1/search/track* （兼容 q/keyword，并行 musicdl）
+3. 在线播放：stream + HLS 兜底 + transcode 空操作 + tee 缓存回放（音频与歌词 sidecar）
+4. 在线元数据/歌词/封面
+5. GET /_ext/healthz
+"""
+from __future__ import annotations
+
+import asyncio
+import glob
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import time
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Callable, Coroutine
+from urllib.parse import quote, urlencode, parse_qs
+from uuid import uuid4
+from pathlib import Path
+import tempfile
+
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse, HTMLResponse
+
+logger = logging.getLogger("fnmusic_proxy")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+_HOME = os.environ.get(
+    "FNMUSIC_HOME_DIR", "/var/apps/fnmusic_ext_kugou/target/app/home"
+)
+_APP_MODE = os.environ.get("FNMUSIC_APP_MODE", "").strip().lower()
+
+CONF = {
+    "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
+    "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
+    "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "kugou_enabled": os.environ.get("FNMUSIC_KUGOU_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "kugou_url": os.environ.get("FNMUSIC_KUGOU_URL", "http://127.0.0.1:8899"),
+    "kugou_quality": str(os.environ.get("FNMUSIC_KUGOU_QUALITY", "high")),
+    "kugou_search_timeout": float(os.environ.get("FNMUSIC_KUGOU_SEARCH_TIMEOUT", "15")),
+    "kugou_token": os.environ.get("FNMUSIC_KUGOU_TOKEN", ""),
+    "kugou_userid": os.environ.get("FNMUSIC_KUGOU_USERID", ""),
+    "kugou_dfid": os.environ.get("FNMUSIC_KUGOU_DFID", ""),
+    "kugou_t1": os.environ.get("FNMUSIC_KUGOU_T1", ""),
+    "kugou_mid": os.environ.get("FNMUSIC_KUGOU_MID", ""),
+    "kugou_guid": os.environ.get("FNMUSIC_KUGOU_GUID", ""),
+    "kugou_dev": os.environ.get("FNMUSIC_KUGOU_DEV", ""),
+    "kugou_mac": os.environ.get("FNMUSIC_KUGOU_MAC", ""),
+    "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "2.5")),
+    "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
+    "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
+    "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
+    "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
+    "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
+    "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
+    # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
+    "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
+    "music_db": os.environ.get(
+        "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
+    ),
+    "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "true").lower() in ("true", "1", "yes"),
+    "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
+    "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
+    "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "300")),
+    "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5")),
+    "fav_dir": os.environ.get(
+        "FNMUSIC_FAV_DIR", os.path.join(_HOME, "online_favorites")
+    ),
+}
+
+_KUGOU_PLAYLIST_PREFIX = "online:playlist:kugou:"
+
+
+def kugou_playlist_guid(remote_id: str, name: str = "") -> str:
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", str(remote_id or "").strip()) or "unknown"
+    return f"{_KUGOU_PLAYLIST_PREFIX}{safe}"
+
+
+def is_kugou_playlist_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(_KUGOU_PLAYLIST_PREFIX)
+
+
+def kugou_playlist_id_from_guid(guid: str) -> str:
+    s = str(guid or "")
+    if not s.startswith(_KUGOU_PLAYLIST_PREFIX):
+        return ""
+    rest = s[len(_KUGOU_PLAYLIST_PREFIX):]
+    return rest.split(":", 1)[0]
+
+
+def _kugou_playlist_name_from_guid(guid: str) -> str:
+    s = str(guid or "")
+    if not s.startswith(_KUGOU_PLAYLIST_PREFIX):
+        return ""
+    rest = s[len(_KUGOU_PLAYLIST_PREFIX):]
+    if ":" not in rest:
+        return ""
+    return rest.split(":", 1)[1]
+
+
+def _kugou_playlist_field(it: dict, keys: tuple[str, ...], default: Any = "") -> Any:
+    for k in keys:
+        if it.get(k) not in (None, ""):
+            return it.get(k)
+    return default
+
+
+def build_kugou_playlist_obj(it: dict) -> dict:
+    # 酷狗 /user/playlist 返回: global_collection_id / listid / name / count / owner / pic
+    coll_id = str(_kugou_playlist_field(it, ("global_collection_id", "globalCollectionId", "collection_id")) or "").strip()
+    pid = str(_kugou_playlist_field(it, ("listid", "listId", "id", "playlistId", "playlist_id", "pid", "playId")) or "").strip()
+    key = coll_id or pid
+    name = str(_kugou_playlist_field(it, ("name", "title", "playlistName", "playlist_name")) or "").strip()
+    guid = kugou_playlist_guid(key, name)
+    return {
+        "guid": guid,
+        "name": name or ("酷狗歌单" if key else ""),
+        "coverId": guid,
+        "collectionId": coll_id,
+    }
+
+
+def stamp_kugou_playlist_tracks(items: list[dict], now: float | None = None) -> list[dict]:
+    ts = int(now or time.time())
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        title = str(_kugou_playlist_field(it, ("songName", "title", "fileName", "name")) or "").strip()
+        artist = str(_kugou_playlist_field(it, ("singerName", "artist", "singName", "singer")) or "").strip()
+        album = str(_kugou_playlist_field(it, ("albumName", "album", "albumName", "albumName")) or "").strip()
+        dur = _kugou_playlist_field(it, ("duration", "playTime", "Duration", "PlayTime"), 0)
+        try:
+            dur_s = float(dur or 0)
+        except (TypeError, ValueError):
+            dur_s = 0.0
+        ext = str(_kugou_playlist_field(it, ("ExtName", "songType", "ext"), "mp3") or "mp3").strip().lower() or "mp3"
+        hashv = str(_kugou_playlist_field(it, ("hash", "songhash", "songHash", "FileHash", "fileHash", "id")) or "").strip()
+        guid = online_guid_from_item({"id": f"kugou:{hashv}", "source": "kugou"}) if hashv else ""
+        item = {
+            "guid": guid,
+            "id": guid,
+            "title": title,
+            "name": title,
+            "artist": artist,
+            "artists": [{"name": artist, "guid": f"{guid}:artist"}] if artist else [],
+            "album": {
+                "name": album,
+                "guid": f"{guid}:album",
+                "coverId": guid,
+                "artists": [{"name": artist, "guid": f"{guid}:artist"}] if artist else [],
+            },
+            "albumName": album,
+            "duration": int(dur_s * 1000),
+            "duration_ms": int(dur_s * 1000),
+            "durationMs": int(dur_s * 1000),
+            "duration_s": dur_s,
+            "ext": ext,
+            "format": ext,
+            "coverId": guid or _kugou_playlist_field(it, ("pic", "cover", "image"), guid),
+            "source": "kugou",
+            "is_online": bool(guid),
+            "createdAt": ts,
+            "updatedAt": ts,
+            "isFavorite": False,
+            "isCue": False,
+            "accessStatus": 0,
+        }
+        out.append(item)
+    return out
+
+
+async def fetch_kugou_user_playlist_bundles() -> list[dict]:
+    if not CONF.get("kugou_enabled", True):
+        return []
+    try:
+        res = await kugou_source.get_user_playlists(1, 500)
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST] fetch failed: %s", e)
+        return []
+    return [build_kugou_playlist_obj(x) for x in (res.get("items") or []) if isinstance(x, dict)]
+
+
+async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size: int = 50) -> dict:
+    if not is_kugou_playlist_guid(guid):
+        return {"items": [], "total": 0, "page": page, "pagesize": size}
+    pid = kugou_playlist_id_from_guid(guid)
+    if not pid:
+        return {"items": [], "total": 0, "page": page, "pagesize": size}
+    try:
+        async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
+            auth = kugou_source._auth_header()
+            headers = {"Authorization": auth} if auth else {}
+            r = await c.get("/playlist", params={"id": pid, "page": page, "pagesize": size}, headers=headers)
+            if r.status_code != 200:
+                return {"items": [], "total": 0, "page": page, "pagesize": size}
+            data = r.json()
+            st = data.get("status", data.get("code"))
+            if st not in (1, 200, 0):
+                return {"items": [], "total": 0, "page": page, "pagesize": size}
+            payload = data.get("data") or {}
+            if isinstance(payload, list):
+                payload = {"list": payload}
+            raw_list = None
+            for key in ("list", "items", "lists", "data", "songs", "records"):
+                v = payload.get(key)
+                if isinstance(v, list):
+                    raw_list = v
+                    break
+            total = int(payload.get("total") or payload.get("count") or len(raw_list or []))
+            return {"items": raw_list or [], "total": total, "page": page, "pagesize": size}
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST_TRACKS] guid=%s err=%s", guid, e)
+        return {"items": [], "total": 0, "page": page, "pagesize": size}
+
+# ===== KuGouMusicApi 源适配（新增）=====
+import kugou_source  # noqa: E402
+
+# ===== 启动时从 .env 加载持久化凭证（若存在则优先于环境变量）=====
+_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+if _ENV_FILE.exists():
+    try:
+        _loaded_env = {}
+        for _line in _ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            _loaded_env[_k.strip()] = _v.strip()
+        _KUGOU_KEY_MAP = {
+            "FNMUSIC_KUGOU_ENABLED": ("kugou_enabled", "bool"),
+            "FNMUSIC_KUGOU_URL": ("kugou_url", "str"),
+            "FNMUSIC_KUGOU_QUALITY": ("kugou_quality", "str"),
+            "FNMUSIC_KUGOU_TOKEN": ("kugou_token", "str"),
+            "FNMUSIC_KUGOU_USERID": ("kugou_userid", "str"),
+            "FNMUSIC_KUGOU_DFID": ("kugou_dfid", "str"),
+            "FNMUSIC_KUGOU_T1": ("kugou_t1", "str"),
+            "FNMUSIC_KUGOU_MID": ("kugou_mid", "str"),
+            "FNMUSIC_KUGOU_GUID": ("kugou_guid", "str"),
+            "FNMUSIC_KUGOU_DEV": ("kugou_dev", "str"),
+            "FNMUSIC_KUGOU_MAC": ("kugou_mac", "str"),
+        }
+        _changed = False
+        for _env_k, (_conf_k, _t) in _KUGOU_KEY_MAP.items():
+            if _env_k in _loaded_env and _loaded_env[_env_k]:
+                _v = _loaded_env[_env_k]
+                if _t == "bool":
+                    _v = _v.lower() in ("1", "true", "yes")
+                if CONF.get(_conf_k) != _v:
+                    CONF[_conf_k] = _v
+                    _changed = True
+        logger.info(".env loaded: kugou_url=%s token_len=%d userid=%s",
+                    CONF["kugou_url"], len(CONF["kugou_token"] or ""), CONF["kugou_userid"] or "(none)")
+    except Exception as e:
+        logger.warning("Failed to load .env: %s", e)
+
+# 将 CONF 当前值注入 kugou_source
+kugou_source.set_config({
+    "kugou_url": CONF["kugou_url"],
+    "kugou_quality": CONF["kugou_quality"],
+    "kugou_search_timeout": CONF["kugou_search_timeout"],
+    "kugou_enabled": CONF["kugou_enabled"],
+    "kugou_token": CONF["kugou_token"],
+    "kugou_userid": CONF["kugou_userid"],
+    "kugou_dfid": CONF["kugou_dfid"],
+    "kugou_t1": CONF["kugou_t1"],
+    "kugou_mid": CONF["kugou_mid"],
+    "kugou_guid": CONF["kugou_guid"],
+    "kugou_dev": CONF["kugou_dev"],
+    "kugou_mac": CONF["kugou_mac"],
+})
+
+
+async def fetch_kugou_search(keyword: str, limit: int, page: int = 1) -> dict | None:
+    """调 KuGouMusicApi /search，返回统一结果对象，包含 items 和 total。"""
+    try:
+        return await kugou_source.search(keyword, limit, page)
+    except Exception as e:
+        logger.warning("kugou search failed: %s", e)
+        return None
+
+
+async def resolve_kugou_url(song_id: str) -> tuple[str | None, str | None]:
+    """调 KuGouMusicApi /song/url，返回 (play_url, ext)。"""
+    try:
+        return await kugou_source.resolve_url(song_id)
+    except Exception as e:
+        logger.warning("kugou resolve_url failed: %s", e)
+        return None, None
+
+
+async def resolve_kugou_lyric(song_id: str) -> str:
+    """调 KuGouMusicApi 拉歌词文本，失败返回空。"""
+    try:
+        return await kugou_source.fetch_lyric(song_id)
+    except Exception as e:
+        logger.warning("kugou fetch_lyric failed: %s", e)
+        return ""
+
+_REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
+
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+CACHE_EXTS = ("mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "ape", "wv", "dsf", "dff", "tta")
+
+# 飞牛 Kl() 归一化：mpeg/mp3→mp3，wav/pcm→wav，m4a/aac/mp4→m4a，其余小写原样（flac/ogg/ape/wv…）
+_FORMAT_ALIASES = {
+    "mp3": "mp3",
+    "mpeg": "mp3",
+    "mpga": "mp3",
+    "flac": "flac",
+    "wav": "wav",
+    "wave": "wav",
+    "pcm": "wav",
+    "lpcm": "wav",
+    "ogg": "ogg",
+    "vorbis": "ogg",
+    "opus": "opus",
+    "m4a": "m4a",
+    "mp4": "m4a",
+    "mp4a": "m4a",
+    "aac": "m4a",
+    "alac": "m4a",
+    "ape": "ape",
+    "wv": "wv",
+    "wavpack": "wv",
+    "dsf": "dsf",
+    "dff": "dff",
+    "dsd": "dsd",
+    "tta": "tta",
+    "tak": "tak",
+    "wma": "wma",
+    "aiff": "aiff",
+    "aif": "aiff",
+}
+
+
+# 模块级搜索缓存
+_SEARCH_CACHE: dict[str, dict] = {}
+_STREAM_CACHE_MAX_ENTRIES = 8
+_STREAM_CACHE_MAX_BYTES = 320 * 1024 * 1024  # 320 MB,防止长时间试听占满内存
+
+# guid -> {"body": bytes, "ext": str, "ts": float}
+_STREAM_CACHE: dict[str, dict] = {}
+
+
+def _clean_search_cache() -> None:
+    """写入时若 len(_SEARCH_CACHE) > 200，按 ts 升序砍掉最旧一半。"""
+    if len(_SEARCH_CACHE) > 200:
+        sorted_keys = sorted(_SEARCH_CACHE.keys(), key=lambda k: _SEARCH_CACHE[k].get("ts", 0))
+        to_remove = sorted_keys[: len(sorted_keys) // 2]
+        for k in to_remove:
+            _SEARCH_CACHE.pop(k, None)
+
+
+def _set_search_cache(keyword: str, entry: dict) -> None:
+    _clean_search_cache()
+    _SEARCH_CACHE[keyword] = entry
+
+
+def _clean_stream_cache() -> None:
+    """超出容量时按最近使用时间淘汰；纯内存缓存，不落盘。"""
+    while len(_STREAM_CACHE) > _STREAM_CACHE_MAX_ENTRIES:
+        oldest_guid = min(_STREAM_CACHE, key=lambda k: _STREAM_CACHE[k].get("ts", 0))
+        _STREAM_CACHE.pop(oldest_guid, None)
+    while True:
+        total = sum(len(entry.get("body") or b"") for entry in _STREAM_CACHE.values())
+        if total <= _STREAM_CACHE_MAX_BYTES or not _STREAM_CACHE:
+            break
+        oldest_guid = min(_STREAM_CACHE, key=lambda k: _STREAM_CACHE[k].get("ts", 0))
+        _STREAM_CACHE.pop(oldest_guid, None)
+
+
+def remember_stream_audio(guid: str, body: bytes, ext: str) -> None:
+    """试听缓冲缓存到内存；进程重启即失效。"""
+    if not guid or not body or len(body) < 1024:
+        return
+    if len(body) > 48 * 1024 * 1024:  # 单首超过 48MB 不放内存，避免异常大音频撑爆
+        return
+    _clean_stream_cache()
+    _STREAM_CACHE[guid] = {
+        "body": body,
+        "ext": (ext or "mp3").lower(),
+        "ts": time.time(),
+    }
+    logger.warning("[STREAM_CACHE] remembered guid=%s size=%d ext=%s entries=%d", guid, len(body), ext, len(_STREAM_CACHE))
+
+
+def get_stream_audio(guid: str) -> bytes | None:
+    entry = _STREAM_CACHE.get(guid)
+    if not entry:
+        return None
+    body = entry.get("body")
+    if body:
+        entry["ts"] = time.time()
+        logger.warning("[STREAM_CACHE] hit guid=%s size=%d", guid, len(body))
+        return body
+    return None
+
+
+_STREAM_LYRIC_CACHE: dict[str, str] = {}
+
+
+def remember_stream_lyric(guid: str, text: str) -> None:
+    """歌词也只做进程内缓存，避免写 .lrc/.ref 到磁盘。"""
+    if not guid or not text:
+        return
+    if len(text) > 256 * 1024:
+        return
+    _STREAM_LYRIC_CACHE[guid] = text
+    logger.warning("[STREAM_LYRIC_CACHE] remembered guid=%s size=%d entries=%d", guid, len(text), len(_STREAM_LYRIC_CACHE))
+
+
+def get_stream_lyric(guid: str) -> str:
+    return _STREAM_LYRIC_CACHE.get(guid, "")
+
+
+def deduplicate_online_items(items: list[dict]) -> list[dict]:
+    """在线条目合并去重：按 (title, artist) 小写，保留最先出现的（musicbox 优先）。"""
+    seen = set()
+    res = []
+    for it in items:
+        t = str(it.get("title") or it.get("name") or "").strip().lower()
+        a = str(it.get("artist") or "").strip().lower()
+        if t and a:
+            key = (t, a)
+            if key in seen:
+                continue
+            seen.add(key)
+        res.append(it)
+    return res
+
+
+def play_format_from_ext(ext: str | None) -> str:
+    raw = (ext or "mp3").strip().lower().lstrip(".")
+    if raw.startswith("audio/"):
+        raw = raw.split("/", 1)[-1]
+    return _FORMAT_ALIASES.get(raw, raw or "mp3")
+
+
+def filter_headers(headers: Any, exclude_keys: set | None = None) -> dict:
+    exclude = HOP_BY_HOP | {k.lower() for k in (exclude_keys or set())}
+    return {k: v for k, v in headers.items() if k.lower() not in exclude}
+
+
+def copy_incoming_headers(request: Request) -> dict:
+    """透传鉴权 Cookie / Token。Starlette 头名为小写，需显式回填以免丢失 music-token。"""
+    headers = filter_headers(request.headers, exclude_keys={"host", "content-length"})
+    headers["accept-encoding"] = "identity"
+    for key in ("cookie", "authorization", "x-trim-music-temp-token"):
+        val = request.headers.get(key)
+        if val:
+            headers[key] = val
+    return headers
+
+
+def get_by_path(d: Any, path: str) -> Any:
+    curr = d
+    for p in path.split("."):
+        if isinstance(curr, dict) and p in curr:
+            curr = curr[p]
+        else:
+            return None
+    return curr
+
+
+async def fetch_local_lyric_by_keywords(title: str, artist: str, duration: float = 0.0) -> str:
+    """仅用于飞牛本地歌：先搜酷狗候选，再按相关度和时长匹配取歌词。"""
+    if not CONF.get("kugou_enabled", True):
+        return ""
+    keywords = " ".join(x for x in [title, artist] if x and str(x).strip()).strip()
+    if not keywords:
+        return ""
+
+    def _score_candidate(item: dict, idx: int) -> tuple[int, int, int, int]:
+        it_title = str(item.get("title") or item.get("FileName") or "").strip()
+        it_artist = str(item.get("artist") or item.get("SingerName") or "").strip()
+        try:
+            it_dur = float(item.get("duration_s") or item.get("Duration") or 0)
+        except Exception:
+            it_dur = 0.0
+        diff = abs(it_dur - duration) if duration > 0 and it_dur > 0 else 1e9
+        score = 0
+        if it_title and title and it_title == title:
+            score += 1000
+        elif it_title and title and it_title in title:
+            score += 600
+        elif it_title and title and title in it_title:
+            score += 500
+        if it_artist and artist and it_artist == artist:
+            score += 800
+        elif it_artist and artist and it_artist in artist:
+            score += 450
+        elif it_artist and artist and artist in it_artist:
+            score += 350
+        if diff <= 0.5:
+            score += 2000
+        elif diff <= 1.5:
+            score += 1200
+        elif diff <= 3.0:
+            score += 600
+        elif diff <= 5.0:
+            score += 200
+        return (score, 0 if diff <= 1.5 else 1, 0 if it_title == title else 1, -idx)
+
+    try:
+        candidates = await kugou_source.search(keywords, limit=30, page=1)
+        items = candidates.get("items") or []
+        if not items:
+            logger.warning("[LYRIC_FALLBACK] search empty keywords=%r total=%s", keywords, candidates.get("total"))
+            return ""
+        scored = []
+        for idx, item in enumerate(items):
+            scored.append((_score_candidate(item, idx), item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        ranked = [item for _, item in scored]
+        selected = ranked[0]
+        sid = str(selected.get("id") or "").split(":", 1)[-1].strip()
+        if not sid:
+            logger.warning("[LYRIC_FALLBACK] selected no hash keywords=%r items=%d", keywords, len(items))
+            return ""
+        lyric_text = await kugou_source.fetch_lyric(sid)
+        logger.warning(
+            "[LYRIC_FALLBACK] selected hash=%s title=%r artist=%r duration=%s lyrics_len=%d candidates=%d total=%s",
+            sid,
+            selected.get("title"),
+            selected.get("artist"),
+            selected.get("duration_s"),
+            len(lyric_text),
+            len(items),
+            candidates.get("total"),
+        )
+        return lyric_text
+    except Exception as e:
+        logger.warning("[LYRIC_FALLBACK] error keywords=%r err=%s", keywords, e)
+        return ""
+
+
+def _extract_artist_payload(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("artist") or value.get("singer") or "").strip()
+    if isinstance(value, (list, tuple)) and value:
+        parts = [ _extract_artist_payload(item) for item in value ]
+        return "/".join(x for x in parts if x)
+    return str(value).strip()
+
+
+def _extract_local_lyric_meta(payload: dict) -> tuple[str, str, float]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return "", "", 0.0
+    title = str(data.get("title") or data.get("name") or "").strip()
+    artist = _extract_artist_payload(data.get("artist") or data.get("singer") or data.get("artists") or data.get("albumArtist") or data.get("album_artists"))
+    if not title or not artist:
+        track = data.get("track")
+        if isinstance(track, dict):
+            title = title or str(track.get("title") or track.get("name") or "").strip()
+            artist = artist or _extract_artist_payload(track.get("artist") or track.get("singer") or track.get("artists") or track.get("albumArtist"))
+        inner = track.get("track") if isinstance(track, dict) else None
+        if not artist and isinstance(inner, dict):
+            artist = _extract_artist_payload(inner.get("artist") or inner.get("singer") or inner.get("artists") or inner.get("albumArtist"))
+    if not artist and isinstance(data.get("album"), dict):
+        artist = _extract_artist_payload(data["album"].get("artists") or data["album"].get("artist") or data["album"].get("singer"))
+    duration = 0.0
+    for path in (
+        ["data", "duration_s"],
+        ["data", "duration"],
+        ["data", "durationMs"],
+        ["data", "track", "duration_s"],
+        ["data", "track", "duration"],
+        ["data", "track", "durationMs"],
+        ["track", "duration_s"],
+        ["track", "duration"],
+    ):
+        raw = get_by_path(payload, ".".join(path))
+        try:
+            if raw is None or raw == "":
+                continue
+            val = float(raw)
+            if val <= 0:
+                continue
+            if val > 10000:
+                val = val / 1000.0
+            duration = val
+            break
+        except (TypeError, ValueError):
+            continue
+    return title, artist, duration
+
+
+async def fetch_local_lyric_for_guid(request: Request, client: httpx.AsyncClient, guid: str) -> str:
+    """本地歌歌词只在 lyric/list 内获取：用 metadata 解析标题/歌手/时长后搜酷狗。"""
+    if not guid:
+        return ""
+    meta_req = client.build_request(
+        "GET",
+        f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}",
+        headers=copy_incoming_headers(request),
+    )
+    meta_resp = await client.send(meta_req)
+    if meta_resp.status_code != 200:
+        logger.warning("[LYRIC_FALLBACK] lyric/list metadata probe failed guid=%s http=%s", guid, meta_resp.status_code)
+        return ""
+    try:
+        meta_payload = meta_resp.json()
+    except Exception:
+        logger.warning("[LYRIC_FALLBACK] lyric/list metadata probe bad json guid=%s", guid)
+        return ""
+    if not isinstance(meta_payload, dict):
+        return ""
+    title, artist, duration = _extract_local_lyric_meta(meta_payload)
+    if not (title and artist):
+        logger.warning("[LYRIC_FALLBACK] lyric/list metadata no title/artist guid=%s title=%r artist=%r duration=%s", guid, title, artist, duration)
+        return ""
+    text = await fetch_local_lyric_by_keywords(title, artist, duration)
+    if text:
+        write_lyric_cache(guid, text, title=title, artist=artist)
+        logger.warning("[LYRIC_FALLBACK] lyric/list fetched from metadata guid=%s title=%r artist=%r duration=%s len=%d", guid, title, artist, duration, len(text))
+    else:
+        logger.warning("[LYRIC_FALLBACK] lyric/list fetched empty from metadata guid=%s title=%r artist=%r duration=%s", guid, title, artist, duration)
+    return text
+
+
+def _existing_local_lyric(payload: dict) -> str:
+    for path in (
+        ["lyric"],
+        ["data", "lyric"],
+        ["data", "track", "lyric"],
+        ["data", "track", "track", "lyric"],
+        ["track", "lyric"],
+        ["data", "list", "0", "lyric"],
+        ["data", "items", "0", "lyric"],
+        ["data", "track", "items", "0", "lyric"],
+    ):
+        val = get_by_path(payload, ".".join(path))
+        if val:
+            return str(val).strip()
+    return ""
+
+
+async def forward_upstream_with_local_lyric_fallback(request: Request, client: httpx.AsyncClient) -> Response:
+    """透传上游；本地歌 metadata 强制 hasLyric=True，避免前端首次播放不请求歌词。"""
+    payload_or_resp = await fetch_upstream_envelope(request, client)
+    if isinstance(payload_or_resp, Response):
+        return payload_or_resp
+    payload = payload_or_resp
+    headers = payload.pop("_ext_headers", {})
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
+    force_has_lyric_true(payload)
+    return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
+
+
+def force_has_lyric_true(payload: dict) -> None:
+    """把 metadata/lyric 上游响应里所有可能的 hasLyric 字段强制置为 true。"""
+    payload["data"]["track"]["hasLyric"] = True
+
+
+def fill_local_track_list_cover_ids(payload: dict) -> None:
+    """只补 music/api/v1/track/list 路径 data.list[] 下的空 coverId。"""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return
+    list_obj = data.get("list")
+    if not isinstance(list_obj, list):
+        return
+    for item in list_obj:
+        if not isinstance(item, dict):
+            continue
+        guid = str(item.get("guid") or "").strip()
+        if not guid:
+            continue
+        if item.get("coverId") in (None, ""):
+            item["coverId"] = guid
+
+
+def payload_or_resp_status(payload: dict) -> int:
+    return int(payload.get("_ext_status") or 200)
+
+
+def set_by_path(d: dict, path: str, val: Any):
+    parts = path.split(".")
+    curr = d
+    for p in parts[:-1]:
+        if p not in curr or not isinstance(curr[p], dict):
+            curr[p] = {}
+        curr = curr[p]
+    curr[parts[-1]] = val
+
+
+def extract_keyword(request: Request) -> str:
+    """前端打包用 q，部分调用/验收用 keyword。"""
+    params = request.query_params
+    return (params.get("keyword") or params.get("q") or params.get("query") or "").strip()
+
+
+def online_guid_from_item(item: dict) -> str:
+    raw_id = str(item.get("id") or "")
+    src = str(item.get("source") or "")
+    if raw_id.startswith("online:"):
+        return raw_id
+    if ":" in raw_id:
+        return f"online:{raw_id}"
+    return f"online:{src}:{raw_id}"
+
+
+def song_id_from_online_guid(guid: str) -> str:
+    # "online:kugou:HASH" -> "HASH"（剥掉 online: 和 source: 两层前缀）
+    if not guid:
+        return ""
+    if guid.startswith("online:"):
+        rest = guid[len("online:"):]
+        if ":" in rest:
+            rest = rest.split(":", 1)[-1]
+        return rest
+    # 无前缀时也兼容 "kugou:HASH"
+    if guid.startswith("kugou:"):
+        return guid.split(":", 1)[-1]
+    return guid
+
+
+def is_online_guid(guid: str) -> bool:
+    return bool(guid) and guid.startswith("online:")
+
+
+def source_from_online_guid(guid: str) -> str:
+    parts = (guid or "").split(":")
+    return parts[1] if len(parts) >= 3 else ""
+
+def build_online_track(item: dict) -> dict:
+    """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
+    guid = online_guid_from_item(item)
+    src = str(item.get("source") or source_from_online_guid(guid) or "")
+    title = str(item.get("title") or item.get("name") or "")
+    artist = str(item.get("artist") or "")
+    album = str(item.get("album") or "")
+    duration_s = item.get("duration_s") or 0
+    try:
+        duration_s = float(duration_s)
+    except (TypeError, ValueError):
+        duration_s = 0
+    duration_ms = int(duration_s * 1000)
+    ext = str(item.get("ext") or "mp3") or "mp3"
+    play_format = play_format_from_ext(ext)
+    file_size = item.get("file_size") or 0
+    try:
+        file_size = int(file_size or 0)
+    except (TypeError, ValueError):
+        file_size = 0
+    # bitrate：优先用 item 自带的 bitrate（Kugou API 返回，单位 bps）
+    bitrate = item.get("bitrate") or 0
+    try:
+        bitrate = int(bitrate or 0)
+    except (TypeError, ValueError):
+        bitrate = 0
+    # 若 bitrate 为空则根据 format 选默认值；Kugou 128/320 直接乘 1000
+    if not bitrate:
+        if play_format in ("flac", "wav", "ape", "wv"):
+            bitrate = 1411000
+        else:
+            bitrate = 320000
+    else:
+        # 如果单位是 kbps（小于 1000），转成 bps
+        if bitrate < 1000:
+            bitrate *= 1000
+    cover = str(item.get("cover_url") or "")
+    # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
+    spec_path = f"online/{src}/{guid}.{play_format}"
+
+    artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
+    # 飞牛前端搜索列表读 album.union_cover 作为封面
+    album_obj = {
+        "name": album,
+        "guid": f"{guid}:album",
+        "artists": artists_list,
+        "coverId": guid,
+    }
+    audio_spec = {
+        "path": spec_path,
+        "format": "酷狗源" if src == "kugou" else play_format,
+        "codec": play_format,
+        "container": play_format,
+        "duration": duration_ms,
+        "size": file_size,
+        "channel": 2,
+        "sampleRate": 44100,
+        "bitDepth": 16 if play_format in ("wav", "flac", "aiff") else None,
+        "bitrate": bitrate,
+    }
+    audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
+
+    return {
+        "guid": guid,
+        "id": guid,
+        "title": title,
+        "name": title,
+        "artist": artist,
+        "artists": artists_list,
+        "album": album_obj,
+        "albumName": album,
+        "audioSpec": audio_spec,
+        "duration": duration_ms,
+        "duration_ms": duration_ms,
+        "durationMs": duration_ms,
+        "duration_s": duration_s,
+        "codec": play_format,
+        "codecName": play_format,
+        "format": play_format,
+        "ext": ext,
+        "size": file_size,
+        "file_size": file_size,
+        "bitrate": bitrate,
+        "sizeStr": f"{file_size / 1024 / 1024:.1f} MB" if file_size else "",
+        "fileSizeStr": f"{file_size / 1024 / 1024:.1f} MB" if file_size else "",
+        "bitrateStr": f"{bitrate // 1000}kbps" if bitrate else "320kbps",
+        "coverId": guid,
+        "source": src,
+        "is_online": True,
+        "isFavorite": False,
+        "isCue": False,
+        "hasLyric": bool(item.get("lyric")),
+        "genres": [],
+        "accessStatus": 0,
+    }
+
+
+def artist_from_track(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    a = item.get("artist") or item.get("singer") or item.get("singers") or ""
+    if isinstance(a, list):
+        names = []
+        for x in a:
+            if isinstance(x, dict):
+                names.append(str(x.get("name") or ""))
+            else:
+                names.append(str(x))
+        return " ".join(n for n in names if n).strip().lower()
+    if isinstance(a, dict):
+        return str(a.get("name") or "").strip().lower()
+    return str(a).strip().lower()
+
+
+def title_from_track(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("title") or item.get("name") or "").strip().lower()
+
+
+def should_cache(range_header: str | None) -> bool:
+    """完整拉取才落盘：无 Range，或 bytes=0-（开区间）。Safari bytes=0-1 探测不落盘。"""
+    if not range_header:
+        return True
+    r = range_header.strip().lower()
+    return bool(re.match(r"^bytes=0-$", r))
+
+
+def cache_safe_guid(guid: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", guid)
+
+
+def online_file_id(guid: str) -> str:
+    """online:migu:600929… → 600929…，仅用于查找旧文件，不再写进文件名。"""
+    return song_id_from_online_guid(guid).rsplit(":", 1)[-1]
+
+
+def safe_basename_title(title: str) -> str:
+    t = re.sub(r'[/\\:\0]', "_", (title or "").strip()) or "unknown"
+    t = re.sub(r"\s+", " ", t).strip(" .")
+    return t[:120]
+
+
+def library_basename(title: str, artist: str = "") -> str:
+    """曲库文件名：歌手 - 歌名（无源站 id）。飞牛无标签时会用文件名当标题。"""
+    title_s = safe_basename_title(title)
+    artist_s = safe_basename_title(artist) if (artist or "").strip() else ""
+    if artist_s and artist_s.lower() != title_s.lower() and artist_s != "unknown":
+        return f"{artist_s} - {title_s}"
+    return title_s
+
+
+def media_ref_path(guid: str) -> str:
+    return os.path.join(CONF["cache_dir"], f"{cache_safe_guid(guid)}.ref")
+
+
+def _path_stem(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    known = set(CACHE_EXTS) | {"lrc", "part"}
+    if ext.lstrip(".").lower() in known:
+        return root
+    return path
+
+
+def remember_media_path(guid: str, media_path: str) -> None:
+    """记住曲库里的文件词干（不含扩展名），音频和 .lrc 共用。"""
+    try:
+        os.makedirs(CONF["cache_dir"], exist_ok=True)
+        with open(media_ref_path(guid), "w", encoding="utf-8") as f:
+            f.write(_path_stem(media_path))
+    except Exception as e:
+        logger.warning("Failed to remember media path for %s: %s", guid, e)
+
+
+def recalled_media_stem(guid: str) -> str | None:
+    ref = media_ref_path(guid)
+    if not os.path.exists(ref):
+        return None
+    try:
+        with open(ref, encoding="utf-8") as f:
+            stem = _path_stem(f.read().strip())
+        if stem:
+            return stem
+    except Exception:
+        return None
+    return None
+
+
+def recalled_media_path(guid: str) -> str | None:
+    stem = recalled_media_stem(guid)
+    if not stem:
+        return None
+    for ext in CACHE_EXTS:
+        path = f"{stem}.{ext}"
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
+def unique_library_path(directory: str, basename: str, ext: str) -> str:
+    dest = os.path.join(directory, f"{basename}.{ext}")
+    if not os.path.exists(dest):
+        return dest
+    n = 2
+    while os.path.exists(os.path.join(directory, f"{basename} ({n}).{ext}")):
+        n += 1
+    return os.path.join(directory, f"{basename} ({n}).{ext}")
+
+
+def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -> None:
+    """写入 title/artist/album，飞牛扫描后用标签而不是文件名显示。"""
+    title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
+    if not title and not artist:
+        return
+    try:
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(path, easy=True)
+        if audio is None:
+            return
+        if getattr(audio, "tags", None) is None:
+            try:
+                audio.add_tags()
+            except Exception:
+                pass
+        if title:
+            audio["title"] = title
+        if artist:
+            audio["artist"] = artist
+        if album:
+            audio["album"] = album
+        audio.save()
+    except Exception as e:
+        logger.warning("Failed to write audio tags for %s: %s", path, e)
+
+
+def detect_library_dir() -> str:
+    """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。"""
+    explicit = str(CONF.get("library_dir") or "").strip()
+    if explicit:
+        return explicit
+    db = str(CONF.get("music_db") or "")
+    if db and os.path.exists(db):
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
+            finally:
+                con.close()
+            for (path,) in rows:
+                if path and os.path.isdir(path):
+                    return path
+        except Exception as e:
+            logger.warning("Failed to read shared_library path: %s", e)
+    return CONF["cache_dir"]
+
+
+def iter_media_dirs() -> list[str]:
+    dirs: list[str] = []
+    lib = detect_library_dir()
+    for d in (lib, CONF["cache_dir"]):
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def adopt_library_perms(path: str) -> None:
+    try:
+        parent = os.path.dirname(path) or "."
+        st = os.stat(parent)
+        os.chown(path, st.st_uid, st.st_gid)
+        os.chmod(path, 0o644)
+    except Exception:
+        pass
+
+
+def find_cache_file(guid: str) -> str | None:
+    recalled = recalled_media_path(guid)
+    if recalled:
+        return recalled
+    file_id = online_file_id(guid)
+    safe = cache_safe_guid(guid)
+    for d in iter_media_dirs():
+        if not os.path.isdir(d):
+            continue
+        for ext in CACHE_EXTS:
+            exact = os.path.join(d, f"{safe}.{ext}")
+            if os.path.exists(exact) and os.path.getsize(exact) > 0:
+                return exact
+            pattern = os.path.join(d, f"* - {glob.escape(file_id)}.{ext}")
+            for path in glob.glob(pattern):
+                if os.path.getsize(path) > 0:
+                    return path
+    return None
+
+
+def promote_cache_hit(guid: str, audio_path: str) -> str:
+    """旧 cache/ 音频：若曲库已有对应文件或歌词，则对齐过去。"""
+    recalled = recalled_media_path(guid)
+    if recalled:
+        return recalled
+    lib = detect_library_dir()
+    try:
+        if os.path.abspath(os.path.dirname(audio_path)) == os.path.abspath(lib):
+            remember_media_path(guid, audio_path)
+            return audio_path
+    except Exception:
+        return audio_path
+    file_id = online_file_id(guid)
+    ext = os.path.splitext(audio_path)[1] or ".mp3"
+    dest = None
+    if os.path.isdir(lib):
+        for lrc in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.lrc")):
+            dest = os.path.splitext(lrc)[0] + ext
+            break
+    if not dest:
+        return audio_path
+    if not os.path.exists(dest):
+        try:
+            os.makedirs(lib, exist_ok=True)
+            shutil.copy2(audio_path, dest)
+            adopt_library_perms(dest)
+        except Exception as e:
+            logger.warning("Failed to promote cache audio into library: %s", e)
+            return audio_path
+    remember_media_path(guid, dest)
+    return dest
+
+
+def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str:
+    recalled = recalled_media_path(guid)
+    if recalled:
+        return recalled
+    stem = recalled_media_stem(guid)
+    if stem:
+        return f"{stem}.{ext}"
+    lib = detect_library_dir()
+    file_id = online_file_id(guid)
+    if os.path.isdir(lib):
+        for path in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.{ext}")):
+            if os.path.getsize(path) > 0:
+                return path
+    os.makedirs(lib, exist_ok=True)
+    return unique_library_path(lib, library_basename(title, artist), ext)
+
+
+def find_lyric_file(guid: str) -> str | None:
+    stem = recalled_media_stem(guid)
+    if stem:
+        sibling = f"{stem}.lrc"
+        if os.path.exists(sibling) and os.path.getsize(sibling) > 0:
+            return sibling
+    audio = find_cache_file(guid)
+    if audio:
+        sibling = os.path.splitext(audio)[0] + ".lrc"
+        if os.path.exists(sibling) and os.path.getsize(sibling) > 0:
+            return sibling
+    file_id = online_file_id(guid)
+    safe = cache_safe_guid(guid)
+    for d in iter_media_dirs():
+        if not os.path.isdir(d):
+            continue
+        exact = os.path.join(d, f"{safe}.lrc")
+        if os.path.exists(exact) and os.path.getsize(exact) > 0:
+            return exact
+        pattern = os.path.join(d, f"* - {glob.escape(file_id)}.lrc")
+        for path in glob.glob(pattern):
+            if os.path.getsize(path) > 0:
+                return path
+    return None
+
+
+def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
+    found = find_lyric_file(guid)
+    if found:
+        return found
+    audio = find_cache_file(guid)
+    if audio:
+        return os.path.splitext(audio)[0] + ".lrc"
+    d = detect_library_dir()
+    os.makedirs(d, exist_ok=True)
+    if (title or "").strip() or (artist or "").strip():
+        return os.path.join(d, f"{library_basename(title, artist)}.lrc")
+    return os.path.join(d, f"{cache_safe_guid(guid)}.lrc")
+
+
+def read_lyric_cache(guid: str) -> str:
+    """歌词纯内存缓存；不再读取或要求磁盘 .lrc。"""
+    return get_stream_lyric(guid)
+
+
+def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -> None:
+    """歌词纯内存缓存；不落盘，避免写 .lrc/.ref/.part。"""
+    text = (text or "").strip()
+    if not text:
+        return
+    if text == read_lyric_cache(guid):
+        return
+    remember_stream_lyric(guid, text)
+
+
+async def resolve_online_lyric(request: Request, guid: str) -> str:
+    """本地 .lrc 优先；没有再向源站要，拿到就落盘。"""
+    cached = read_lyric_cache(guid)
+    if cached:
+        return cached
+
+    src = source_from_online_guid(guid)
+    if src == "kugou":
+        raw_song_id = song_id_from_online_guid(guid)
+        text = await resolve_kugou_lyric(raw_song_id)
+        if text:
+            write_lyric_cache(guid, text)
+        return text
+
+    data = await _online_info(request, guid)
+    text = str((data or {}).get("lyric") or "").strip()
+    if text:
+        write_lyric_cache(
+            guid,
+            text,
+            title=str((data or {}).get("title") or ""),
+            artist=str((data or {}).get("artist") or ""),
+        )
+    return text
+
+
+def media_type_for_ext(ext: str) -> str:
+    return {
+        "mp3": "audio/mpeg",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+        "ogg": "audio/ogg",
+        "opus": "audio/ogg",
+        "m4a": "audio/mp4",
+        "aac": "audio/aac",
+        "ape": "audio/x-ape",
+        "wv": "audio/x-wavpack",
+        "dsf": "audio/x-dsd",
+        "dff": "audio/x-dff",
+        "tta": "audio/x-tta",
+        "wma": "audio/x-ms-wma",
+        "aiff": "audio/aiff",
+    }.get(ext.lower(), "application/octet-stream")
+
+
+def ext_from_content_type(content_type: str) -> str:
+    ct = (content_type or "").lower()
+    if "flac" in ct:
+        return "flac"
+    if "wavpack" in ct or "x-wv" in ct:
+        return "wv"
+    if "wav" in ct or "wave" in ct:
+        return "wav"
+    if "opus" in ct:
+        return "opus"
+    if "ogg" in ct:
+        return "ogg"
+    if "ape" in ct:
+        return "ape"
+    if "aiff" in ct:
+        return "aiff"
+    if "mp4" in ct or "m4a" in ct:
+        return "m4a"
+    if "aac" in ct:
+        return "aac"
+    if "mpeg" in ct or "mp3" in ct:
+        return "mp3"
+    return play_format_from_ext(ct.split("/")[-1] if "/" in ct else "mp3")
+
+
+def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+    if not range_header:
+        return None
+    m = re.match(r"bytes=(\d*)-(\d*)", range_header.strip(), re.I)
+    if not m:
+        return None
+    start_s, end_s = m.group(1), m.group(2)
+    if start_s == "" and end_s == "":
+        return None
+    if start_s == "":
+        suffix = int(end_s)
+        start = max(file_size - suffix, 0)
+        end = file_size - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else file_size - 1
+    end = min(end, file_size - 1)
+    if start < 0 or start >= file_size or start > end:
+        return None
+    return start, end
+
+
+def serve_file_with_range(path: str, range_header: str | None, media_type: str) -> Response:
+    file_size = os.path.getsize(path)
+    rng = parse_http_range(range_header, file_size)
+
+    def iter_file(offset: int, length: int) -> AsyncGenerator[bytes, None]:
+        async def gen() -> AsyncGenerator[bytes, None]:
+            remaining = length
+            with open(path, "rb") as fp:
+                fp.seek(offset)
+                while remaining > 0:
+                    chunk = fp.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return gen()
+
+    if rng is None:
+        return StreamingResponse(
+            iter_file(0, file_size),
+            status_code=200,
+            headers={
+                "Content-Type": media_type,
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+            },
+        )
+
+    start, end = rng
+    length = end - start + 1
+    return StreamingResponse(
+        iter_file(start, length),
+        status_code=206,
+        headers={
+            "Content-Type": media_type,
+            "Content-Length": str(length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: str) -> Response:
+    """纯内存响应：不落盘，仅在当前进程内缓存的音频上支持 Range。"""
+    file_size = len(body)
+    rng = parse_http_range(range_header, file_size)
+
+    def iter_bytes(offset: int, length: int) -> AsyncGenerator[bytes, None]:
+        async def gen() -> AsyncGenerator[bytes, None]:
+            pos = offset
+            end = offset + length
+            while pos < end:
+                yield body[pos:min(pos + 64 * 1024, end)]
+                pos += 64 * 1024
+
+        return gen()
+
+    if rng is None:
+        return StreamingResponse(
+            iter_bytes(0, file_size),
+            status_code=200,
+            headers={
+                "Content-Type": media_type,
+                "Content-Length": str(file_size),
+                "Accept-Ranges": "bytes",
+            },
+        )
+
+    start, end = rng
+    length = end - start + 1
+    return StreamingResponse(
+        iter_bytes(start, length),
+        status_code=206,
+        headers={
+            "Content-Type": media_type,
+            "Content-Length": str(length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+def get_upstream_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    client = getattr(fastapi_app.state, "upstream_client", None)
+    if client is None:
+        transport = httpx.AsyncHTTPTransport(uds=CONF["upstream_sock"])
+        client = httpx.AsyncClient(transport=transport, base_url="http://unix", timeout=30.0)
+        fastapi_app.state.upstream_client = client
+    return client
+
+
+
+async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Response:
+    url_path = request.url.path
+    if request.url.query:
+        url_path = f"{url_path}?{request.url.query}"
+
+    headers = copy_incoming_headers(request)
+    body = await request.body()
+
+    req = client.build_request(
+        method=request.method,
+        url=url_path,
+        headers=headers,
+        content=body if body else None,
+    )
+    resp = await client.send(req, stream=True)
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+    async def body_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+
+    return StreamingResponse(
+        body_stream(),
+        status_code=resp.status_code,
+        headers=resp_headers,
+    )
+
+
+async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -> Response | dict:
+    """透传上游并解析 JSON 信封。失败时返回 Response，成功返回 dict。"""
+    url_path = request.url.path
+    if request.url.query:
+        url_path = f"{url_path}?{request.url.query}"
+    headers = copy_incoming_headers(request)
+    body = await request.body()
+    req = client.build_request(
+        method=request.method,
+        url=url_path,
+        headers=headers,
+        content=body if body else None,
+    )
+    resp = await client.send(req)
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    if resp.status_code != 200:
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    try:
+        payload = resp.json()
+    except Exception:
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    if not isinstance(payload, dict):
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    payload["_ext_headers"] = resp_headers
+    payload["_ext_status"] = resp.status_code
+    return payload
+
+
+def ensure_search_list(upstream_json: dict) -> list:
+    """保证 data.list 存在，本地 0 条时仍能追加在线条目。"""
+    data = upstream_json.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        upstream_json["data"] = data
+    target = get_by_path(upstream_json, CONF["search_list_path"])
+    if isinstance(target, list):
+        return target
+    for key in ("list", "items", "tracks", "records"):
+        if isinstance(data.get(key), list):
+            if key != "list":
+                data["list"] = data[key]
+            return data["list"]
+    data["list"] = []
+    if "total" not in data:
+        data["total"] = 0
+    return data["list"]
+
+
+def _search_data_root(upstream_json: dict) -> dict:
+    parts = CONF["search_list_path"].split(".")
+    parent = upstream_json
+    for p in parts[:-1]:
+        if isinstance(parent, dict) and p in parent:
+            parent = parent[p]
+    if isinstance(parent, dict):
+        return parent
+    data = upstream_json.get("data")
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _read_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def merge_online_tracks(
+    upstream_json: dict,
+    online_data: dict | list[dict] | None,
+    page: int = 1,
+    size: int = 50,
+) -> dict:
+    target_list = ensure_search_list(upstream_json)
+    for item in target_list:
+        if isinstance(item, dict) and not is_online_guid(str(item.get("guid") or "")):
+            if item.get("coverId") in (None, ""):
+                item["coverId"] = str(item.get("guid") or "")
+    if isinstance(online_data, dict):
+        online_result = online_data
+        raw_items = online_data.get("items", [])
+    elif isinstance(online_data, list):
+        online_result = None
+        raw_items = online_data
+    else:
+        online_result = None
+        raw_items = []
+
+    parent = _search_data_root(upstream_json)
+    official_total = _read_int(parent.get("total"), len(target_list))
+
+    if not raw_items:
+        logger.warning(
+            "[SEARCH_MERGE] official_count=%d official_total=%d online_items=%d online_total=%d page=%d size=%d",
+            len(target_list), official_total, 0, 0, page, size,
+        )
+        return upstream_json
+
+    existing_keys = set()
+    for item in target_list:
+        t = title_from_track(item)
+        a = artist_from_track(item)
+        if t and a:
+            existing_keys.add((t, a))
+
+    filtered_online = []
+    for online_item in raw_items:
+        ot = str(online_item.get("title") or online_item.get("name") or "").strip().lower()
+        oa = str(online_item.get("artist") or "").strip().lower()
+        if ot and oa and (ot, oa) in existing_keys:
+            continue
+        filtered_online.append(online_item)
+
+
+    for it in filtered_online:
+        target_list.append(build_online_track(it))
+
+    online_total = _read_int((online_result or {}).get("total"), len(filtered_online))
+    total = official_total + online_total
+    if total > 0:
+        parent["total"] = total
+    logger.warning(
+        "[SEARCH_MERGE] official_count=%d official_total=%d online_items=%d online_total=%d page_online=%d total=%d page=%d size=%d",
+        len(target_list), official_total, len(filtered_online), online_total, len(filtered_online), total, page, size,
+    )
+
+    return upstream_json
+
+
+def extract_guid(request: Request, path_guid: str | None = None) -> str:
+    if path_guid:
+        return path_guid
+    return (
+        request.query_params.get("guid")
+        or request.query_params.get("trackGUID")
+        or request.query_params.get("trackGuid")
+        or request.query_params.get("coverId")
+        or request.query_params.get("id")
+        or request.query_params.get("trackId")
+        or ""
+    )
+
+
+async def extract_guid_from_body(request: Request) -> str:
+    guid = extract_guid(request)
+    if guid:
+        return guid
+    try:
+        body = await request.json()
+    except Exception:
+        return ""
+    if isinstance(body, dict):
+        return str(
+            body.get("guid")
+            or body.get("trackGUID")
+            or body.get("trackGuid")
+            or body.get("id")
+            or body.get("trackId")
+            or ""
+        )
+    return ""
+
+
+def empty_ok() -> JSONResponse:
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {}})
+
+
+_EMPTY_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c62f8cfc0f01f00050001009a444a970000000049454e44ae426082"
+)
+
+
+def _static_cover_placeholder_response() -> Response:
+    return Response(
+        content=_EMPTY_PNG,
+        status_code=200,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
+
+
+def build_lyric_list_payload(guid: str, lyric_text: str) -> dict:
+    """对齐飞牛 $n.lyric.list → xr(list, preferred)。
+
+    每条需有非空 content；source=2 表示 EXTERNAL_LRC（非内嵌，不强制 offset）。
+    """
+    text = (lyric_text or "").strip()
+    if not text:
+        return {"code": 0, "msg": "ok", "data": {"list": [], "preferred": ""}}
+    lyric_guid = f"{guid}:lyric"
+    now = int(time.time())
+    item = {
+        "guid": lyric_guid,
+        "content": text,
+        "source": 2,
+        "isLRC": True,
+        "offset": 0,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": {"list": [item], "preferred": lyric_guid},
+    }
+
+
+def stub_online_info(guid: str) -> dict:
+    song_id = song_id_from_online_guid(guid)
+    return {
+        "id": song_id,
+        "source": source_from_online_guid(guid),
+        "title": "",
+        "artist": "",
+        "album": "",
+        "duration_s": 0,
+        "ext": "mp3",
+        "file_size": 0,
+        "cover_url": "",
+        "lyric": "",
+    }
+
+
+def build_metadata_payload(guid: str, data: dict | None) -> dict:
+    """飞牛 resolveTrackPlayback._h() 会无防护读取 data.track.genres.join / album / artists。
+
+    缺 genres 或 album 不是对象时直接抛错，播放器跳过且不会请求 stream。
+    """
+    info = dict(data or {})
+    info.setdefault("id", song_id_from_online_guid(guid))
+    info.setdefault("source", source_from_online_guid(guid))
+    vo = build_online_track(info)
+    album_obj = vo["album"] if isinstance(vo.get("album"), dict) else {
+        "name": str(vo.get("album") or ""),
+        "guid": f"{guid}:album",
+        "artists": vo.get("artists") or [],
+        "coverId": guid,
+    }
+    track = {
+        "guid": guid,
+        "id": guid,
+        "title": vo.get("title") or "",
+        "artists": vo.get("artists") or [],
+        "album": album_obj,
+        "genres": list(vo.get("genres") or []),
+        "duration": vo.get("duration") or 0,
+        "coverId": vo.get("coverUrl") or guid,
+        "coverUrl": vo.get("coverUrl") or "",
+        "format": vo.get("format") or "mp3",
+        "hasLyric": True,
+        "isFavorite": False,
+        "isCue": False,
+        "accessStatus": 0,
+        "audioSpec": vo["audioSpec"],
+    }
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": {
+            **vo,
+            "guid": guid,
+            "id": guid,
+            "album": album_obj,
+            "audioSpec": vo["audioSpec"],
+            "track": track,
+        },
+    }
+
+
+def _conf_log_value(key: str, value: Any) -> Any:
+    lowered = key.lower()
+    if any(part in lowered for part in _REDACT_KEY_PARTS):
+        return "***" if value else ""
+    return value
+
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI):
+    logger.info("=== fnmusic-ext configuration ===")
+    for k, v in CONF.items():
+        logger.info("  %s = %s", k, _conf_log_value(k, v))
+    logger.info("==================================")
+
+    created_upstream = False
+
+    if getattr(fastapi_app.state, "upstream_client", None) is None:
+        fastapi_app.state.upstream_client = httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=CONF["upstream_sock"]),
+            base_url="http://unix",
+            timeout=30.0,
+        )
+        created_upstream = True
+
+    try:
+        yield
+    finally:
+        if created_upstream and getattr(fastapi_app.state, "upstream_client", None):
+            await fastapi_app.state.upstream_client.aclose()
+            fastapi_app.state.upstream_client = None
+
+app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
+
+
+@app.get("/_ext/healthz")
+async def ext_healthz(request: Request):
+    upstream_client = get_upstream_client(request.app)
+
+    upstream_status = "fail"
+    kugou_status = "fail"
+
+    try:
+        r = await upstream_client.get("/music/api/v1/search/track?keyword=healthz_probe", timeout=2.0)
+        if r.status_code < 500:
+            upstream_status = "ok"
+    except Exception as e:
+        logger.debug("Upstream health check failed: %s", e)
+
+    if not CONF.get("kugou_enabled", True):
+        kugou_status = "disabled"
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as kc:
+                # /login/qr/key 不需要 Authorization 头，适合作为纯连通性探测
+                r = await kc.get(CONF["kugou_url"].rstrip("/") + "/login/qr/key")
+                if r.status_code == 200:
+                    kugou_status = "ok"
+                else:
+                    kugou_status = f"http_{r.status_code}"
+        except Exception as e:
+            logger.debug("Kugou health check failed: %s", e)
+    source_ok = kugou_status == "ok"
+
+    return {
+        "ok": upstream_status == "ok" and source_ok,
+        "upstream": upstream_status,
+        "kugou": kugou_status,
+    }
+
+
+@app.get("/music/api/v1/search/track")
+@app.get("/music/api/v1/search/track/{subpath:path}")
+async def search_track(request: Request):
+    upstream_client = get_upstream_client(request.app)
+    keyword = extract_keyword(request)
+
+    page_str = request.query_params.get("page")
+    try:
+        page = int(page_str) if page_str else 1
+    except (TypeError, ValueError):
+        page = 1
+    if page < 1:
+        page = 1
+
+    size_str = request.query_params.get("size")
+    try:
+        size = int(size_str) if size_str else 50
+    except (TypeError, ValueError):
+        size = 50
+    if size < 1:
+        size = 50
+    size = 500  # 对飞牛返回的汇总上限；酷狗侧按 50 条分页拉取
+
+    url_path = request.url.path
+    params = dict(request.query_params)
+    params.pop("size", None)
+    params.pop("page", None)
+    url_path = f"{url_path}?{urlencode(params)}" if params else url_path
+    headers = copy_incoming_headers(request)
+
+    req = upstream_client.build_request("GET", url_path, headers=headers)
+    upstream_resp = await upstream_client.send(req)
+
+    resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+    if upstream_resp.status_code != 200:
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    try:
+        upstream_json = upstream_resp.json()
+    except Exception:
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+    if not keyword:
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+    logger.warning("[SEARCH] keyword=%r page=%d size=%d kugou_enabled=%s token_len=%d userid=%s",
+                   keyword, page, size, CONF.get("kugou_enabled"),
+                   len(CONF.get("kugou_token") or ""), CONF.get("kugou_userid") or "(none)")
+
+    now = time.time()
+    cached_entry = _SEARCH_CACHE.get(keyword)
+    is_valid_cache = cached_entry is not None and (now - cached_entry.get("ts", 0) < CONF["search_cache_ttl"])
+
+    if not (is_valid_cache and cached_entry is not None):
+        cached_entry: dict[str, Any] = {"ts": time.time(), "official_total": None, "online": {}}
+        _set_search_cache(keyword, cached_entry)
+    entry = cached_entry
+    entry.setdefault("online", {})
+
+    async def _get_online_result(kugou_page: int) -> dict | None:
+        page_size = 50
+        cache = entry.setdefault("online", {})
+        cached = cache.get(kugou_page)
+        if isinstance(cached, dict):
+            return cached
+        try:
+            kugou_res = await asyncio.wait_for(
+                fetch_kugou_search(keyword, page_size, page=kugou_page), timeout=min(float(CONF["search_timeout"]), 8.0)
+            )
+        except Exception as exc:
+            logger.warning("kugou search failed keyword=%r page=%d: %s", keyword, kugou_page, exc)
+            return None
+        if not isinstance(kugou_res, dict):
+            return None
+        result = {
+            **kugou_res,
+            "items": deduplicate_online_items(kugou_res.get("items", [])),
+        }
+        cache[kugou_page] = result
+        return result
+
+    async def _fetch_online_pages() -> dict | None:
+        """酷狗不支持一次全量拉取：按 50 条/页循环，直到够 size、空页、达到 total 或安全上限。"""
+        cache = entry.setdefault("online", {})
+        page_size = 50
+        online_items: list[dict] = []
+        seen: set[tuple[str, ...]] = set()
+        total = 0
+        pages_fetched = 0
+        # 安全上限：size=500 -> 10 页；额外 2 页防止酷狗空页/重复导致不足。
+        max_pages = max(10, (size + page_size - 1) // page_size + 2)
+        for kugou_page in range(1, max_pages + 1):
+            pages_fetched = kugou_page
+            page_data = cache.get(kugou_page)
+            if not isinstance(page_data, dict):
+                page_data = await _get_online_result(kugou_page)
+                if not isinstance(page_data, dict):
+                    logger.warning("[SEARCH_KUGOU_PAGE_FAIL] keyword=%r kugou_page=%d", keyword, kugou_page)
+                    break
+            raw_items = page_data.get("items", [])
+            if not isinstance(raw_items, list):
+                raw_items = []
+            for item in raw_items:
+                t = str(item.get("title") or item.get("name") or "").strip().lower()
+                a = str(item.get("artist") or "").strip().lower()
+                key = (t, a) if t and a else (str(item.get("id") or ""), t, a)
+                if key in seen:
+                    continue
+                seen.add(key)
+                online_items.append(item)
+            total = _read_int(page_data.get("total"), total)
+            logger.warning("[SEARCH_KUGOU_PAGE_FETCH] keyword=%r kugou_page=%d page_items=%d merged_items=%d online_total=%d",
+                           keyword, kugou_page, len(raw_items), len(online_items), total)
+            if total and len(online_items) >= total:
+                break
+            if len(online_items) >= size:
+                online_items = online_items[:size]
+                break
+            if len(raw_items) < page_size:
+                break
+            if kugou_page > 1 and not raw_items:
+                break
+
+        result = {
+            "items": deduplicate_online_items(online_items),
+            "total": total or len(online_items),
+            "page": pages_fetched,
+            "pagesize": page_size,
+            "pages": pages_fetched,
+            "fetched_pages": pages_fetched,
+            "complete": bool(total and len(online_items) >= total),
+        }
+        cache["__all__"] = result
+        logger.warning("[SEARCH_KUGOU_ALL] keyword=%r pages=%d items=%d total=%d size=%d",
+                       keyword, pages_fetched, len(result.get("items", [])), result.get("total"), size)
+        return result
+
+    online_all: dict | None = None
+
+    # 飞牛官方 total 在首页更稳定；后续页官方结果可能已空，沿用已缓存的官方 total。
+    parent = _search_data_root(upstream_json)
+    current_official_total = _read_int(parent.get("total"), len(ensure_search_list(upstream_json)))
+    cached_official_total = entry.get("official_total")
+    if cached_official_total is None or current_official_total > _read_int(cached_official_total, 0):
+        entry["official_total"] = current_official_total
+    official_total = _read_int(entry.get("official_total"), current_official_total)
+
+    if CONF.get("kugou_enabled", True):
+        # 酷狗不支持全量拉取，按 50 条/页汇总到本地 size 上限。
+        online_all = await _fetch_online_pages()
+
+    logger.warning("[SEARCH_KUGOU_PAGE] keyword=%r official_total=%d kugou_pages=%s fetched_pages=%s online_items=%d online_total=%s",
+                   keyword, official_total, ((online_all or {}).get("page")), ((online_all or {}).get("fetched_pages")), len((online_all or {}).get("items", [])), (online_all or {}).get("total"))
+
+    merged = merge_online_tracks(upstream_json, online_all, page=page, size=size)
+    return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
+
+
+@app.get("/music/api/v1/search/suggest")
+@app.get("/music/api/v1/search/suggest/{subpath:path}")
+async def search_suggest(request: Request):
+    if not CONF["merge_suggest"]:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    upstream_client = get_upstream_client(request.app)
+    keyword = extract_keyword(request)
+
+    url_path = request.url.path
+    if request.url.query:
+        url_path = f"{url_path}?{request.url.query}"
+    headers = copy_incoming_headers(request)
+
+    kugou_task: asyncio.Task | None = None
+    if keyword and CONF.get("kugou_enabled", True):
+        kugou_task = asyncio.create_task(fetch_kugou_search(keyword, 8, page=1))
+
+    req = upstream_client.build_request("GET", url_path, headers=headers)
+    upstream_resp = await upstream_client.send(req)
+    resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+    if upstream_resp.status_code != 200:
+        if kugou_task:
+            kugou_task.cancel()
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    try:
+        upstream_json = upstream_resp.json()
+    except Exception:
+        if kugou_task:
+            kugou_task.cancel()
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+        if kugou_task:
+            kugou_task.cancel()
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+    kugou_data: dict | list[dict] | None = None
+    if kugou_task:
+        try:
+            # 先向上游响应，再等 Kugou；Kugou 重试可能 2-3s，给 15s 余量
+            kugou_data = await asyncio.wait_for(
+                asyncio.shield(kugou_task), timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[suggest] kugou task timeout keyword=%r", keyword)
+        except Exception as e:
+            logger.warning("Suggest kugou error: %s", e)
+            kugou_task.cancel()
+        else:
+            logger.info("[suggest] keyword=%r kugou items=%d", keyword, len((kugou_data or {}).get("items", []) if isinstance(kugou_data, dict) else (kugou_data or [])))
+
+    data_field = upstream_json.get("data")
+    logger.warning("[SUGGEST] keyword=%r upstream data type=%s keys=%s",
+                   keyword, type(data_field).__name__,
+                   list(data_field.keys())[:10] if isinstance(data_field, dict) else (len(data_field) if isinstance(data_field, list) else 'N/A'))
+
+    # 自动探测：支持多种 data 结构
+    # 飞牛 suggest 实际结构：data = {track:{total,items[]}, album:{...}, artist:{...}, playlist:{...}}
+    # 把 Kugou 歌曲追加到 track.items
+    target_list = None
+    target_type_key = None  # 记录追加到的顶层 key，以便同步更新 total
+    if isinstance(data_field, list):
+        target_list = data_field
+    elif isinstance(data_field, dict):
+        # 优先探测 track(飞牛 suggest 标准结构，单数)，再试常见变体
+        for k in ("track", "tracks", "songs", "items", "list", "results", "searchResults"):
+            v = data_field.get(k)
+            if isinstance(v, list):
+                target_list = v
+                target_type_key = k
+                break
+            elif isinstance(v, dict) and isinstance(v.get("items"), list):
+                # v = {total, items[]}，追到 items
+                target_list = v["items"]
+                target_type_key = k
+                break
+        if target_list is None:
+            # 无匹配时新建 track 结构，方便前端也能读到
+            data_field["track"] = {"total": 0, "items": []}
+            target_list = data_field["track"]["items"]
+            target_type_key = "track"
+
+    if isinstance(kugou_data, dict):
+        kugou_list = kugou_data.get("items", []) if isinstance(kugou_data.get("items", []), list) else []
+    elif isinstance(kugou_data, list):
+        kugou_list = kugou_data
+    else:
+        kugou_list = []
+
+    if isinstance(target_list, list) and kugou_list:
+        # 收集已有项身份去重
+        existing_keys = set()
+        for item in target_list:
+            if isinstance(item, str):
+                existing_keys.add(item.strip().lower())
+            elif isinstance(item, dict):
+                t = str(item.get("title") or item.get("songname") or item.get("name") or "").strip().lower()
+                a = str(item.get("artist") or item.get("singername") or item.get("singer") or "").strip().lower()
+                if t and a:
+                    existing_keys.add(f"{t}|{a}")
+                elif t:
+                    existing_keys.add(t)
+
+        # 探测 target_list 元素类型
+        sample = target_list[0] if target_list else None
+        if isinstance(sample, str):
+            elem_type = "str"
+        elif isinstance(sample, dict):
+            elem_type = "dict"
+        else:
+            elem_type = "dict"
+
+        added = 0
+        for item in kugou_list:
+            title = str(item.get("title") or "").strip()
+            artist = str(item.get("artist") or "").strip()
+            key_t = title.lower()
+            key_ta = f"{key_t}|{artist.lower()}" if artist else key_t
+            if not key_t or key_t in existing_keys or key_ta in existing_keys:
+                continue
+            if elem_type == "str":
+                target_list.append(f"{title}-{artist}" if artist else title)
+            else:
+                # 飞牛 track.items 元素是完整 track 对象，用 build_online_track 构造
+                target_list.append(build_online_track(item))
+            existing_keys.add(key_ta or key_t)
+            existing_keys.add(key_t)
+            added += 1
+            if added >= 8:
+                break
+
+        # 同步更新对应 type 的 total
+        if target_type_key and isinstance(data_field, dict):
+            tp = data_field.get(target_type_key)
+            if isinstance(tp, dict) and "total" in tp:
+                try:
+                    tp["total"] = int(tp.get("total") or 0) + added
+                except (TypeError, ValueError):
+                    tp["total"] = len(target_list)
+
+        logger.warning("[SUGGEST] keyword=%r merged added=%d target=%s len=%d elem=%s",
+                       keyword, added, target_type_key or 'list', len(target_list), elem_type)
+
+    # 同时注入 kugou_songs 字段作为兼容入口
+    if isinstance(data_field, dict) and kugou_list:
+        data_field["kugou_songs"] = [build_online_track(it) for it in kugou_list]
+        data_field["kugouSongs"] = data_field["kugou_songs"]
+
+    # 注入 _debug
+    upstream_json["_debug"] = {
+        "keyword": keyword,
+        "upstream_data_type": type(data_field).__name__,
+        "upstream_data_keys": list(data_field.keys())[:15] if isinstance(data_field, dict) else (len(data_field) if isinstance(data_field, list) else 'N/A'),
+        "kugou_items": len(kugou_list),
+        "kugou_first_3": [(k.get('title'), k.get('artist')) for k in kugou_list[:3]],
+        "target_type_key": target_type_key,
+    }
+
+    return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+
+def stream_tee_response(
+    resp: httpx.Response,
+    guid: str,
+    range_header: str | None,
+    coro_factory: Callable[[], Coroutine[Any, Any, Any]] | None = None,
+    client_to_close: httpx.AsyncClient | None = None,
+    resolved_ext: str | None = None,
+    pre_info: dict | None = None,
+) -> Response:
+    out_headers = {"Accept-Ranges": "bytes"}
+    for k in ("content-type", "content-length", "content-range"):
+        v = resp.headers.get(k)
+        if v:
+            out_headers[k] = v
+
+    if resolved_ext:
+        out_headers["content-type"] = media_type_for_ext(resolved_ext)
+
+    status_code = resp.status_code
+    content_length_str = resp.headers.get("content-length")
+    content_length = (
+        int(content_length_str) if content_length_str and content_length_str.isdigit() else None
+    )
+
+    ext = (resolved_ext or "").strip().lower() or ext_from_content_type(resp.headers.get("content-type") or "")
+
+    if should_cache(range_header):
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def _downloader():
+            parts: list[bytes] = []
+            written = 0
+            try:
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        parts.append(chunk)
+                        written += len(chunk)
+                        await queue.put(chunk)
+            except Exception as e:
+                logger.warning("tee download failed for %s: %s", guid, e)
+            finally:
+                await resp.aclose()
+                if client_to_close:
+                    await client_to_close.aclose()
+                complete = written >= 1024 and (content_length is None or written == content_length)
+                if complete:
+                    remember_stream_audio(guid, b"".join(parts), ext)
+                else:
+                    logger.warning("stream cache skipped guid=%s written=%d complete=%s content_length=%s ext=%s", guid, written, complete, content_length, ext)
+                await queue.put(None)
+
+        dl_task = asyncio.create_task(_downloader())
+
+        async def stream_tee() -> AsyncGenerator[bytes, None]:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+
+        return StreamingResponse(stream_tee(), status_code=status_code, headers=out_headers)
+
+    async def stream_no_cache() -> AsyncGenerator[bytes, None]:
+        try:
+            async for chunk in resp.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            await resp.aclose()
+            if client_to_close:
+                await client_to_close.aclose()
+
+    return StreamingResponse(stream_no_cache(), status_code=status_code, headers=out_headers)
+
+
+@app.get("/music/api/v1/track/stream")
+@app.get("/music/api/v1/track/stream/{subpath:path}")
+async def stream_track(request: Request):
+    guid = extract_guid(request)
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    range_header = request.headers.get("range")
+    memory_body = get_stream_audio(guid)
+    if memory_body:
+        entry = _STREAM_CACHE.get(guid) or {}
+        ext = str(entry.get("ext") or "mp3").lstrip(".") or "mp3"
+        return serve_bytes_with_range(memory_body, range_header, media_type_for_ext(ext))
+
+    src = source_from_online_guid(guid)
+    if src == "kugou":
+        raw_song_id = song_id_from_online_guid(guid)
+        play_url, resolved_ext = await resolve_kugou_url(raw_song_id)
+        if not play_url:
+            return JSONResponse(
+                content={"code": 404, "msg": "online source unavailable", "data": None},
+                status_code=404,
+            )
+        req_headers = {"Range": range_header} if range_header else {}
+        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        try:
+            stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
+            resp = await stream_client.send(stream_req, stream=True)
+            if resp.status_code >= 400:
+                await resp.aclose()
+                await stream_client.aclose()
+                return JSONResponse(
+                    content={"code": 404, "msg": "online source unavailable", "data": None},
+                    status_code=404,
+                )
+        except Exception as e:
+            logger.warning("kugou stream failed url=%s guid=%s err=%s", play_url, guid, e)
+            await stream_client.aclose()
+            return JSONResponse(
+                content={"code": 404, "msg": "online source unavailable", "data": None},
+                status_code=404,
+            )
+        return stream_tee_response(
+            resp,
+            guid=guid,
+            range_header=range_header,
+            coro_factory=None,
+            client_to_close=stream_client,
+            resolved_ext=resolved_ext or "mp3",
+            pre_info=None,
+        )
+    # 非 kugou 源（历史 netease 条目等）不再支持，直接 404
+    return JSONResponse(
+        content={"code": 404, "msg": "online source unavailable", "data": None},
+        status_code=404,
+    )
+
+
+@app.get("/music/api/v1/track/hls/{guid}/preset.m3u8")
+@app.get("/music/api/v1/track/hls/{guid}/{filename}")
+async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    info = await _online_info(request, guid)
+    duration_s = 0
+    if info:
+        try:
+            duration_s = int(float(info.get("duration_s") or 0))
+        except (TypeError, ValueError):
+            duration_s = 0
+    if duration_s <= 0:
+        duration_s = 240
+
+    stream_url = f"/music/api/v1/track/stream?guid={quote(guid, safe='')}"
+    playlist = (
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:3\n"
+        f"#EXT-X-TARGETDURATION:{max(duration_s, 1)}\n"
+        "#EXT-X-PLAYLIST-TYPE:VOD\n"
+        "#EXT-X-MEDIA-SEQUENCE:0\n"
+        f"#EXTINF:{duration_s:.3f},\n"
+        f"{stream_url}\n"
+        "#EXT-X-ENDLIST\n"
+    )
+    return Response(content=playlist, media_type="application/vnd.apple.mpegurl")
+
+
+@app.api_route("/music/api/v1/track/transcode/heartbeat", methods=["GET", "POST"])
+@app.api_route("/music/api/v1/track/transcode/quit", methods=["GET", "POST"])
+async def track_transcode_session(request: Request):
+    guid = await extract_guid_from_body(request)
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"guid": guid}})
+
+
+@app.api_route("/music/api/v1/track/transcode", methods=["GET", "POST"])
+async def track_transcode(request: Request):
+    guid = await extract_guid_from_body(request)
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    return JSONResponse(
+        content={
+            "code": 0,
+            "msg": "ok",
+            "status": "success",
+            "data": {"guid": guid, "status": "ready"},
+        }
+    )
+
+
+async def _online_info(request: Request, guid: str) -> dict | None:
+    src = source_from_online_guid(guid)
+    if src == "kugou":
+        raw_song_id = song_id_from_online_guid(guid)
+        info = await kugou_source.get_info(raw_song_id) or {}
+        info["id"] = f"kugou:{raw_song_id}"
+        info["source"] = "kugou"
+        cached_lyric = read_lyric_cache(guid)
+        if cached_lyric:
+            info["lyric"] = cached_lyric
+        else:
+            lyric_text = await resolve_kugou_lyric(raw_song_id)
+            if lyric_text:
+                info["lyric"] = lyric_text
+                write_lyric_cache(guid, lyric_text)
+        return info
+    # 非 kugou 源不再支持
+    return None
+
+
+def _fill_cover_size(cover: str, request: Request) -> str:
+    if not cover:
+        return ""
+    size = request.query_params.get("size") or "240"
+    try:
+        size_s = str(int(size)).strip()
+    except (TypeError, ValueError):
+        size_s = "240"
+    return cover.replace("{size}", size_s).replace("{SIZE}", size_s)
+
+
+async def _fetch_kugou_playlist_cover_url(request: Request, coll_id: str) -> str:
+    """用歌单 ID 回源酷狗，取歌单详情里的 pic 封面。"""
+    if not coll_id:
+        return ""
+    try:
+        async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
+            auth = kugou_source._auth_header()
+            headers = {"Authorization": auth} if auth else {}
+            r = await c.get("/playlist/detail", params={"ids": coll_id}, headers=headers)
+            if r.status_code != 200:
+                logger.warning("[KUGOU_PLAYLIST] detail http=%s coll_id=%s", r.status_code, coll_id)
+                return ""
+            data = r.json()
+            items = data.get("data") or []
+            if isinstance(items, list) and items:
+                first = items[0] if isinstance(items[0], dict) else {}
+                pic = str(first.get("pic") or first.get("cover") or "").strip()
+                if pic:
+                    return _fill_cover_size(pic, request)
+            logger.warning("[KUGOU_PLAYLIST] detail empty coll_id=%s data=%r", coll_id, data)
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST] detail error coll_id=%s err=%s", coll_id, e)
+    return ""
+
+
+async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
+    """按 GUID 取封面：在线直取在线信息，酷狗歌单取 pic，本地回退到酷狗搜索。"""
+    if not guid:
+        return ""
+    if is_kugou_playlist_guid(guid):
+        # 酷狗歌单：从 /playlist/detail 接口取 pic URL
+        coll_id = kugou_playlist_id_from_guid(guid)
+        if coll_id:
+            return await _fetch_kugou_playlist_cover_url(request, coll_id)
+        return ""
+    if is_online_guid(guid):
+        data = await _online_info(request, guid)
+        return _fill_cover_size(str((data or {}).get("cover_url") or ""), request)
+    return await _resolve_local_static_cover_url(request, guid)
+
+
+async def _resolve_local_static_cover_url(request: Request, guid: str) -> str:
+    """本地 coverId=guid 时，先回查 metadata 拿到歌名/歌手，再搜酷狗并解析 union_cover。"""
+    if not guid or is_online_guid(guid):
+        return ""
+    client = get_upstream_client(request.app)
+    meta_req = client.build_request(
+        "GET",
+        f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}",
+        headers=copy_incoming_headers(request),
+    )
+    meta_resp = await client.send(meta_req)
+    if meta_resp.status_code != 200:
+        return ""
+    try:
+        meta_payload = meta_resp.json()
+    except Exception:
+        return ""
+    title, artist, _ = _extract_local_lyric_meta(meta_payload)
+    if not title and not artist:
+        return ""
+    keyword = " ".join(x for x in [title, artist] if x).strip()
+    if not keyword:
+        return ""
+    result = await fetch_kugou_search(keyword, 10, page=1)
+    if not isinstance(result, dict):
+        return ""
+    items = result.get("items") or []
+    if not isinstance(items, list) or not items:
+        return ""
+    first = items[0] if isinstance(items[0], dict) else {}
+    tp = first.get("trans_param") if isinstance(first.get("trans_param"), dict) else {}
+    cover = str(
+        tp.get("union_cover")
+        or first.get("union_cover")
+        or first.get("cover_url")
+        or ""
+    ).strip()
+    if not cover:
+        return ""
+    return _fill_cover_size(cover, request)
+
+
+async def _resolve_static_cover_guid(request: Request, subpath: str) -> tuple[str, Response | None]:
+    """解析封面 GUID；遇到鉴权失败直接返回错误响应。"""
+    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    if not guid and subpath.startswith("online:"):
+        guid = subpath
+    return guid, None
+
+
+async def _fetch_cover_image_response(url: str) -> Response | None:
+    """COEP 拦截 302 跨域跳转，改为服务端代理拉取图片后同源流式返回。"""
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.kugou.com/"},
+        ) as c:
+            cr = await c.get(url)
+            if cr.status_code == 200 and cr.content:
+                ct = cr.headers.get("content-type") or "image/jpeg"
+                return Response(
+                    content=cr.content,
+                    status_code=200,
+                    media_type=ct,
+                    headers={
+                        "Cache-Control": "public, max-age=86400",
+                        "Cross-Origin-Resource-Policy": "same-origin",
+                    },
+                )
+            logger.warning("static_cover fetch %s -> http=%d len=%d", url, cr.status_code, len(cr.content))
+    except Exception as e:
+        logger.warning("static_cover fetch %s err=%s", url, e)
+    return None
+
+
+@app.get("/music/api/v1/lyric/list")
+@app.get("/music/api/v1/lyric/list/{subpath:path}")
+async def lyric_list(request: Request, subpath: str = ""):
+    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    if not is_online_guid(guid):
+        cached = get_stream_lyric(guid)
+        if cached:
+            logger.warning("[LYRIC_FALLBACK] lyric/list cache hit guid=%s len=%d", guid, len(cached))
+            return JSONResponse(content=build_lyric_list_payload(guid, cached))
+
+        client = get_upstream_client(request.app)
+        payload_or_resp = await fetch_upstream_envelope(request, client)
+        if isinstance(payload_or_resp, Response):
+            return payload_or_resp
+        payload = payload_or_resp
+        headers = payload.pop("_ext_headers", {})
+        title, artist, duration = _extract_local_lyric_meta(payload)
+        existing = _existing_local_lyric(payload)
+        if existing:
+            write_lyric_cache(guid, existing)
+            logger.warning("[LYRIC_FALLBACK] lyric/list existing lyric found guid=%s title=%r artist=%r len=%d", guid, title, artist, len(existing))
+            return JSONResponse(content=build_lyric_list_payload(guid, existing), headers=headers or None)
+        if title and artist:
+            lyric_text = await fetch_local_lyric_by_keywords(title, artist, duration)
+            if lyric_text:
+                write_lyric_cache(guid, lyric_text, title=title, artist=artist)
+                logger.warning("[LYRIC_FALLBACK] lyric/list fallback fetched guid=%s title=%r artist=%r len=%d", guid, title, artist, len(lyric_text))
+                return JSONResponse(content=build_lyric_list_payload(guid, lyric_text), headers=headers or None)
+        lyric_text = await fetch_local_lyric_for_guid(request, client, guid)
+        if lyric_text:
+            return JSONResponse(content=build_lyric_list_payload(guid, lyric_text), headers=headers or None)
+        logger.warning("[LYRIC_FALLBACK] lyric/list no lyric text guid=%s title=%r artist=%r duration=%s", guid, title, artist, duration)
+        return JSONResponse(content=build_lyric_list_payload(guid, ""), headers=headers or None)
+
+    lyric_text = await resolve_online_lyric(request, guid)
+    return JSONResponse(content=build_lyric_list_payload(guid, lyric_text))
+
+
+@app.get("/music/api/v1/track/lyrics")
+@app.get("/music/api/v1/track/lyrics/{subpath:path}")
+@app.get("/music/api/v1/detail/lyrics/{subpath:path}")
+async def track_lyrics(request: Request, subpath: str = ""):
+    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    if not is_online_guid(guid):
+        return await forward_upstream_with_local_lyric_fallback(request, get_upstream_client(request.app))
+
+    lyric_text = await resolve_online_lyric(request, guid)
+    if lyric_text:
+        res = {"code": 0, "msg": "ok", "data": {"guid": guid, "lyric": lyric_text}}
+        set_by_path(res, CONF["lyric_field"], lyric_text)
+        return JSONResponse(content=res)
+    return empty_ok()
+
+
+@app.get("/music/api/v1/track/metadata")
+@app.get("/music/api/v1/track/metadata/{subpath:path}")
+@app.get("/music/api/v1/track/audio-info")
+async def track_metadata(request: Request, subpath: str = ""):
+    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    if not is_online_guid(guid):
+        return await forward_upstream_with_local_lyric_fallback(request, get_upstream_client(request.app))
+
+    data = await _online_info(request, guid) or stub_online_info(guid)
+    cached_lyric = read_lyric_cache(guid)
+    if cached_lyric:
+        data = {**data, "lyric": cached_lyric}
+    elif data.get("lyric"):
+        write_lyric_cache(
+            guid,
+            str(data.get("lyric") or ""),
+            title=str(data.get("title") or ""),
+            artist=str(data.get("artist") or ""),
+        )
+    return JSONResponse(content=build_metadata_payload(guid, data))
+
+
+@app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
+async def static_cover(request: Request, subpath: str = ""):
+    guid, auth_resp = await _resolve_static_cover_guid(request, subpath)
+    if auth_resp is not None:
+        return auth_resp
+    if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    cover = await _fetch_cover_url_by_guid(request, guid)
+    if not cover:
+        logger.warning("[STATIC_COVER] missing cover guid=%s is_kugou=%s is_online=%s", guid, is_kugou_playlist_guid(guid), is_online_guid(guid))
+        return _static_cover_placeholder_response()
+    response = await _fetch_cover_image_response(cover)
+    if response is not None:
+        return response
+    logger.warning("[STATIC_COVER] image proxy failed cover=%s", cover)
+    return _static_cover_placeholder_response()
+
+
+# === online favorites ===
+
+_FAV_LOCK = asyncio.Lock()
+
+
+def sanitize_user_guid(guid: str | None) -> str:
+    """过滤文件名合法字符 [A-Za-z0-9-_]，非法字符替换为 _；为空则返回 'shared'。"""
+    raw = str(guid or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9\-_]", "_", raw)
+    return safe or "shared"
+
+
+def user_fav_path(user_guid: str) -> str:
+    fav_dir = CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites")
+    safe_name = sanitize_user_guid(user_guid)
+    return os.path.join(fav_dir, f"{safe_name}.json")
+
+
+def load_online_favorites(user_guid: str) -> list[dict]:
+    path = user_fav_path(user_guid)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("items"), list):
+                return data["items"]
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        logger.warning("Failed to load online favorites for %s from %s: %s", user_guid, path, e)
+    return []
+
+
+def save_online_favorites(user_guid: str, items: list[dict]) -> bool:
+    path = user_fav_path(user_guid)
+    parent = os.path.dirname(path) or "."
+    part_path = f"{path}.{uuid4().hex[:8]}.part"
+    try:
+        os.makedirs(parent, exist_ok=True)
+        with open(part_path, "w", encoding="utf-8") as f:
+            json.dump({"items": items}, f, ensure_ascii=False, indent=2)
+        os.replace(part_path, path)
+        return True
+    except Exception as e:
+        logger.warning("Failed to save online favorites for %s to %s: %s", user_guid, path, e)
+        if os.path.exists(part_path):
+            try:
+                os.remove(part_path)
+            except Exception:
+                pass
+        return False
+
+
+def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: int | None = None) -> dict:
+    raw_info = dict(info or {})
+    raw_info.setdefault("id", song_id_from_online_guid(guid))
+    raw_info.setdefault("source", source_from_online_guid(guid))
+    vo = build_online_track(raw_info)
+
+    now = int(time.time())
+    ts = created_at or now
+
+    artist_name = vo.get("artist") or ""
+    artists_list = [
+        {
+            "guid": f"{guid}:artist",
+            "name": artist_name,
+            "coverId": guid,
+            "createdAt": ts,
+            "updatedAt": ts,
+        }
+    ] if artist_name else []
+
+    album_name = vo.get("albumName") or (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
+    album_obj = {
+        "guid": f"{guid}:album",
+        "name": album_name,
+        "artists": artists_list,
+        "coverId": guid,
+        "releaseDate": 0,
+        "barcode": "",
+        "createdAt": ts,
+        "updatedAt": ts,
+    }
+
+    audio_spec = vo.get("audioSpec") or {}
+
+    return {
+        "guid": guid,
+        "title": vo.get("title") or "",
+        "duration": vo.get("duration") or 0,
+        "isFavorite": True,
+        "isCue": False,
+        "genres": [],
+        "artists": artists_list,
+        "album": album_obj,
+        "audioSpec": audio_spec,
+        "accessStatus": 0,
+        "coverId": guid,
+        "year": 0,
+        "discNo": 1,
+        "trackNo": 1,
+        "isrc": "",
+        "createdAt": ts,
+        "updatedAt": ts,
+    }
+
+
+async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> tuple[bool, str, Response | None]:
+    """向上游探测用户是否已登录。复用当前请求 headers。
+    返回 (is_authed, user_guid, error_response)。
+    """
+    headers = copy_incoming_headers(request)
+    try:
+        probe_req = client.build_request("GET", "/music/api/v1/user/me", headers=headers)
+        probe_resp = await client.send(probe_req)
+        resp_headers = filter_headers(probe_resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+        if probe_resp.status_code == 401:
+            return False, "", Response(
+                content=probe_resp.content,
+                status_code=401,
+                headers=resp_headers,
+                media_type=probe_resp.headers.get("content-type"),
+            )
+
+        if probe_resp.status_code == 200:
+            try:
+                probe_json = probe_resp.json()
+                if isinstance(probe_json, dict) and probe_json.get("code") == 99999:
+                    return False, "", JSONResponse(
+                        content=probe_json,
+                        status_code=200,
+                        headers=resp_headers,
+                    )
+                if isinstance(probe_json, dict) and probe_json.get("code") == 0:
+                    data = probe_json.get("data")
+                    if isinstance(data, dict) and data.get("guid"):
+                        return True, str(data["guid"]), None
+                    logger.warning("user/me response missing data.guid, falling back to 'shared': %s", probe_json)
+                    return True, "shared", None
+            except Exception as e:
+                logger.warning("Failed to parse user/me json response: %s", e)
+                return True, "shared", None
+            return True, "shared", None
+
+        # 其他非 200/401 状态码，上游异常
+        return True, "shared", None
+    except Exception as e:
+        logger.warning("Upstream auth probe failed: %s", e)
+        # 探测异常时保守放行
+        return True, "shared", None
+
+
+@app.post("/music/api/v1/favorite-track/create")
+async def favorite_track_create(request: Request):
+    upstream_client = get_upstream_client(request.app)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    guid = ""
+    if isinstance(body, dict):
+        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, upstream_client)
+
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+
+    now = int(time.time())
+    info = await _online_info(request, guid)
+    if not info:
+        cached_lyric = read_lyric_cache(guid)
+        title = ""
+        artist = ""
+        cached_media = find_cache_file(guid)
+        if cached_media:
+            base = os.path.splitext(os.path.basename(cached_media))[0]
+            if " - " in base:
+                artist, title = base.split(" - ", 1)
+            else:
+                title = base
+        info = {
+            "id": song_id_from_online_guid(guid),
+            "source": source_from_online_guid(guid),
+            "title": title,
+            "artist": artist,
+            "lyric": cached_lyric,
+        }
+
+    track_obj = build_favorite_track_obj(guid, info, created_at=now)
+
+    async with _FAV_LOCK:
+        try:
+            items = load_online_favorites(user_guid)
+            # 查重
+            idx = next((i for i, it in enumerate(items) if it.get("guid") == guid), None)
+            if idx is not None:
+                # 幂等更新
+                items[idx]["track"] = track_obj
+            else:
+                items.append({
+                    "guid": guid,
+                    "createdAt": now,
+                    "track": track_obj,
+                })
+            save_online_favorites(user_guid, items)
+        except Exception as e:
+            logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
+
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+@app.post("/music/api/v1/favorite-track/delete")
+async def favorite_track_delete(request: Request):
+    upstream_client = get_upstream_client(request.app)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    guid = ""
+    if isinstance(body, dict):
+        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+
+    if not is_online_guid(guid):
+        return await forward_to_upstream(request, upstream_client)
+
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+
+    async with _FAV_LOCK:
+        try:
+            items = load_online_favorites(user_guid)
+            items = [it for it in items if it.get("guid") != guid]
+            save_online_favorites(user_guid, items)
+        except Exception as e:
+            logger.warning("Error deleting from online favorites for user %s: %s", user_guid, e)
+
+    return JSONResponse(content={"code": 0, "msg": "", "data": None})
+
+
+@app.get("/music/api/v1/favorite-track/list")
+async def favorite_track_list(request: Request):
+    upstream_client = get_upstream_client(request.app)
+    url_path = request.url.path
+    if request.url.query:
+        url_path = f"{url_path}?{request.url.query}"
+    headers = copy_incoming_headers(request)
+
+    req = upstream_client.build_request("GET", url_path, headers=headers)
+    upstream_resp = await upstream_client.send(req)
+    resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+    if upstream_resp.status_code != 200:
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    try:
+        upstream_json = upstream_resp.json()
+    except Exception:
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+    # 探测当前用户身份
+    is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+
+    # 成功获取官方列表，合并本地在线收藏
+    data = upstream_json.get("data")
+    if not isinstance(data, dict):
+        data = {"list": [], "total": 0}
+        upstream_json["data"] = data
+
+    official_list = data.get("list")
+    if not isinstance(official_list, list):
+        official_list = []
+        data["list"] = official_list
+
+    # 飞牛音乐前端收藏列表依赖 isFavorite=True 状态判断，遍历补齐官方列表中可能缺失的字段
+    for item in official_list:
+        if isinstance(item, dict):
+            item["isFavorite"] = True
+
+    official_total = data.get("total")
+    if not isinstance(official_total, int):
+        official_total = len(official_list)
+
+    async with _FAV_LOCK:
+        try:
+            fav_items = load_online_favorites(user_guid)
+        except Exception as e:
+            logger.warning("Error reading online favorites for list for user %s: %s", user_guid, e)
+            fav_items = []
+
+    # 按 createdAt 倒序
+    fav_items_sorted = sorted(fav_items, key=lambda x: x.get("createdAt", 0), reverse=True)
+    online_tracks = []
+    for it in fav_items_sorted:
+        t = it.get("track")
+        if isinstance(t, dict):
+            # 确保关键属性为最新或格式完整
+            t["isFavorite"] = True
+            online_tracks.append(t)
+        else:
+            g = it.get("guid") or ""
+            if g:
+                online_tracks.append(build_favorite_track_obj(g, created_at=it.get("createdAt")))
+
+    data["list"] = official_list + online_tracks
+    data["total"] = official_total + len(online_tracks)
+
+    return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+
+# === daily recommend + play history ===
+
+
+@app.get("/music/api/v1/playlist/list")
+@app.get("/music/api/v1/playlist/list/{subpath:path}")
+async def playlist_list(request: Request):
+    upstream_client = get_upstream_client(request.app)
+
+    # 1. 先加载酷狗用户歌单（不依赖上游）
+    kugou_playlists = []
+    try:
+        kugou_playlists = await fetch_kugou_user_playlist_bundles()
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST] list inject failed: %s", e)
+
+    now_ts = int(time.time())
+    injected = [
+        {
+            "guid": p.get("guid"),
+            "name": p.get("name"),
+            "coverId": p.get("coverId") or p.get("guid"),
+            "createdAt": now_ts,
+            "updatedAt": now_ts,
+        }
+        for p in kugou_playlists
+    ]
+
+    # 2. 尝试获取官方歌单列表（可能失败）
+    official = []
+    resp_headers = {}
+    envelope_code = 0
+    envelope_msg = "ok"
+
+    envelope = await fetch_upstream_envelope(request, upstream_client)
+    if isinstance(envelope, dict):
+        resp_headers = envelope.pop("_ext_headers", {})
+        envelope_code = envelope.get("code", 0)
+        envelope_msg = envelope.get("msg", "ok")
+        data = envelope.get("data")
+        if isinstance(data, dict):
+            raw_list = data.get("list")
+            if isinstance(raw_list, list):
+                official = raw_list
+    elif isinstance(envelope, Response):
+        # 上游返回错误，但酷狗歌单仍然要返回
+        pass
+
+    # 3. 去重：移除官方列表中已存在的酷狗歌单
+    official = [
+        it for it in official
+        if not (isinstance(it, dict) and is_kugou_playlist_guid(str(it.get("guid") or "")))
+    ]
+
+    # 4. 合并酷狗歌单 + 官方歌单
+    merged_list = injected + official
+
+    return JSONResponse(
+        content={
+            "code": envelope_code,
+            "msg": envelope_msg,
+            "data": {
+                "list": merged_list,
+                "total": len(merged_list),
+            },
+        },
+        headers=resp_headers if resp_headers else None,
+    )
+
+
+@app.get("/music/api/v1/playlist/detail")
+async def playlist_detail(request: Request):
+    guid = str(request.query_params.get("guid") or "").strip()
+    if not is_kugou_playlist_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    # 酷狗歌单：从酷狗列表中找到对应条目
+    try:
+        bundles = await fetch_kugou_user_playlist_bundles()
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST] detail fetch failed: %s", e)
+        return JSONResponse(content={"code": 1, "msg": str(e), "data": None})
+
+    for b in bundles:
+        if b.get("guid") == guid:
+            now_ts = int(time.time())
+            return JSONResponse(content={
+                "code": 0, "msg": "ok",
+                "data": {
+                    "guid": guid,
+                    "name": b.get("name"),
+                    "coverId": b.get("coverId"),
+                    "createdAt": now_ts,
+                    "updatedAt": now_ts,
+                }
+            })
+
+    # 未找到，返回空
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+
+
+@app.get("/music/api/v1/playlist/batch-detail")
+async def playlist_batch_detail(request: Request):
+    raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
+    guids = [g.strip() for g in raw.split(",") if g.strip()]
+    kugou_ids = [g for g in guids if is_kugou_playlist_guid(g)]
+    if not kugou_ids:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    upstream_client = get_upstream_client(request.app)
+    rest = [g for g in guids if not is_kugou_playlist_guid(g)]
+    official_list: list = []
+    if rest:
+        headers = copy_incoming_headers(request)
+        req = upstream_client.build_request(
+            "GET",
+            f"/music/api/v1/playlist/batch-detail?guids={quote(','.join(rest), safe=',')}",
+            headers=headers,
+        )
+        resp = await upstream_client.send(req)
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict) and payload.get("code") == 0:
+                    data = payload.get("data") or {}
+                    if isinstance(data, dict) and isinstance(data.get("list"), list):
+                        official_list = data["list"]
+                    elif isinstance(data, list):
+                        official_list = data
+            except Exception:
+                official_list = []
+
+    try:
+        bundles = await fetch_kugou_user_playlist_bundles()
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST] batch-detail fetch failed: %s", e)
+        bundles = []
+
+    now_ts = int(time.time())
+    kugou_details = []
+    for b in bundles:
+        if b.get("guid") in kugou_ids:
+            kugou_details.append({
+                "guid": b.get("guid"), "id": b.get("guid"),
+                "name": b.get("name"), "title": b.get("name"),
+                "coverId": b.get("coverId"), "coverUrl": b.get("coverUrl", ""),
+                "creator": b.get("creator", ""),
+                "createdAt": now_ts, "updatedAt": now_ts,
+                "trackCount": int(b.get("trackCount") or 0),
+                "source": "kugou", "isKugouPlaylist": True,
+            })
+
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": kugou_details + official_list}})
+
+
+@app.get("/music/api/v1/track/playlist-detail/list")
+async def playlist_track_list(request: Request):
+    guid = str(
+        request.query_params.get("playlistGUID")
+        or request.query_params.get("playlistGuid")
+        or request.query_params.get("guid")
+        or ""
+    ).strip()
+    if not is_kugou_playlist_guid(guid):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 50)
+    except (TypeError, ValueError):
+        size = 50
+    if size < 1:
+        size = 50
+    payload = await fetch_kugou_playlist_tracks(request.app, guid, page=page, size=size)
+    tracks = stamp_kugou_playlist_tracks(list(payload.get("items") or []))
+    return JSONResponse(
+        content={
+            "code": 0,
+            "msg": "ok",
+            "data": {"list": tracks, "total": int(payload.get("total") or len(tracks)), "sort": request.query_params.get("sort") or ""},
+        }
+    )
+
+
+@app.post("/music/api/v1/event/report")
+async def event_report(request: Request):
+    upstream_client = get_upstream_client(request.app)
+    raw = await request.body()
+    try:
+        body = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+    except Exception:
+        body = {}
+    events = body.get("events") if isinstance(body, dict) else None
+    other_events: list = []
+    if isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            other_events.append(ev)
+    else:
+        return await forward_to_upstream(request, upstream_client)
+
+    if other_events:
+        headers = copy_incoming_headers(request)
+        fwd = dict(body)
+        fwd["events"] = other_events
+        req = upstream_client.build_request(
+            "POST",
+            "/music/api/v1/event/report",
+            headers=headers,
+            content=json.dumps(fwd).encode("utf-8"),
+        )
+        resp = await upstream_client.send(req)
+        resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+
+
+@app.get("/music/api/v1/play-history/list")
+async def play_history_list(request: Request):
+    upstream_client = get_upstream_client(request.app)
+    envelope = await fetch_upstream_envelope(request, upstream_client)
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {})
+    if envelope.get("code") != 0:
+        return JSONResponse(content=envelope, headers=headers)
+
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        data = {"list": [], "total": 0}
+        envelope["data"] = data
+
+    # 酷狗歌单里的在线播放历史暂时不注入
+    return JSONResponse(content=envelope, headers=headers)
+
+
+# ============================================================
+# QR 登录 API（供 fnOS 设置页面调用）
+# ============================================================
+
+@app.get("/_ext/login/qr/create")
+async def login_qr_create():
+    """生成登录二维码。返回 { status, qrCode, key }"""
+    if not CONF["kugou_enabled"]:
+        return JSONResponse({"status": "disabled", "message": "KuGou source is disabled"}, status_code=400)
+    key = await kugou_source.qr_key()
+    if not key:
+        return JSONResponse({"status": "error", "message": "Failed to get QR key"}, status_code=500)
+    qr_base64 = await kugou_source.qr_create(key)
+    if not qr_base64:
+        return JSONResponse({"status": "error", "message": "Failed to create QR code"}, status_code=500)
+    return JSONResponse({
+        "status": "ok",
+        "key": key,
+        "qrCode": qr_base64,
+    })
+
+
+@app.get("/_ext/login/qr/check")
+async def login_qr_check(key: str):
+    """检查二维码扫描状态。
+    
+    返回:
+    - status=0: 二维码过期
+    - status=1: 等待扫码
+    - status=2: 已扫码，等待确认
+    - status=4: 登录成功
+    """
+    if not CONF["kugou_enabled"]:
+        return JSONResponse({"status": "disabled", "message": "KuGou source is disabled"}, status_code=400)
+    result = await kugou_source.qr_check(key)
+    
+    qr_status = result.get("status", -1)
+    
+    if qr_status == 4:
+        # 登录成功，保存凭证
+        credentials = kugou_source.save_credentials(result)
+        
+        # 更新 .env 文件持久化凭证
+        env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+        try:
+            env_updates = {
+                "FNMUSIC_KUGOU_TOKEN": credentials["token"],
+                "FNMUSIC_KUGOU_USERID": credentials["userid"],
+                "FNMUSIC_KUGOU_DFID": credentials["dfid"],
+                "FNMUSIC_KUGOU_T1": credentials["t1"],
+                "FNMUSIC_KUGOU_MID": credentials["mid"],
+                "FNMUSIC_KUGOU_GUID": credentials["guid"],
+                "FNMUSIC_KUGOU_DEV": credentials["dev"],
+                "FNMUSIC_KUGOU_MAC": credentials["mac"],
+            }
+            # 读取现有 .env
+            env_content = {}
+            if os.path.exists(env_path):
+                with open(env_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if "=" in line and not line.startswith("#"):
+                            k, v = line.split("=", 1)
+                            env_content[k.strip()] = v.strip()
+            # 更新凭证
+            env_content.update(env_updates)
+            # 写回 .env
+            with open(env_path, "w") as f:
+                for k, v in env_content.items():
+                    f.write(f"{k}={v}\n")
+            logger.info("QR login success: credentials saved to %s", env_path)
+        except Exception as e:
+            logger.warning("Failed to save credentials to .env: %s", e)
+        
+        # 更新内存中的 CONF
+        CONF["kugou_token"] = credentials["token"]
+        CONF["kugou_userid"] = credentials["userid"]
+        CONF["kugou_dfid"] = credentials["dfid"]
+        CONF["kugou_t1"] = credentials["t1"]
+        CONF["kugou_mid"] = credentials["mid"]
+        CONF["kugou_guid"] = credentials["guid"]
+        CONF["kugou_dev"] = credentials["dev"]
+        CONF["kugou_mac"] = credentials["mac"]
+        
+        # 重新注入 kugou_source
+        kugou_source.set_config({
+            "kugou_token": CONF["kugou_token"],
+            "kugou_userid": CONF["kugou_userid"],
+            "kugou_dfid": CONF["kugou_dfid"],
+            "kugou_t1": CONF["kugou_t1"],
+            "kugou_mid": CONF["kugou_mid"],
+            "kugou_guid": CONF["kugou_guid"],
+            "kugou_dev": CONF["kugou_dev"],
+            "kugou_mac": CONF["kugou_mac"],
+        })
+        
+        return JSONResponse({
+            "status": "authenticated",
+            "nickname": result.get("nickname", ""),
+            "userid": credentials["userid"],
+        })
+    elif qr_status == 2:
+        return JSONResponse({"status": "scanned", "message": "QR scanned, waiting for confirmation"})
+    elif qr_status == 0:
+        return JSONResponse({"status": "expired", "message": "QR code expired, please regenerate"})
+    elif qr_status == 1:
+        return JSONResponse({"status": "pending", "message": "Waiting for scan"})
+    else:
+        return JSONResponse({"status": "error", "message": result.get("message", "Unknown error")})
+
+
+@app.get("/_ext/login/status")
+async def login_status():
+    """查询当前登录状态"""
+    if not CONF["kugou_token"]:
+        return JSONResponse({"status": "not_logged_in"})
+    return JSONResponse({
+        "status": "logged_in",
+        "userid": CONF["kugou_userid"],
+        "has_token": bool(CONF["kugou_token"]),
+        "has_userid": bool(CONF["kugou_userid"]),
+        "has_dfid": bool(CONF["kugou_dfid"]),
+    })
+
+
+@app.post("/_ext/login/logout")
+async def login_logout():
+    """退出登录，清除凭证"""
+    # 清除内存中的凭证
+    CONF["kugou_token"] = ""
+    CONF["kugou_userid"] = ""
+    CONF["kugou_dfid"] = ""
+    CONF["kugou_t1"] = ""
+    CONF["kugou_mid"] = ""
+    CONF["kugou_guid"] = ""
+    CONF["kugou_dev"] = ""
+    CONF["kugou_mac"] = ""
+    
+    # 重新注入 kugou_source
+    kugou_source.set_config({
+        "kugou_token": "",
+        "kugou_userid": "",
+        "kugou_dfid": "",
+        "kugou_t1": "",
+        "kugou_mid": "",
+        "kugou_guid": "",
+        "kugou_dev": "",
+        "kugou_mac": "",
+    })
+    
+    # 清除 .env 中的凭证
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(env_path):
+        try:
+            env_content = {}
+            with open(env_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        env_content[k.strip()] = v.strip()
+            # 清除凭证字段
+            for key in ["FNMUSIC_KUGOU_TOKEN", "FNMUSIC_KUGOU_USERID", "FNMUSIC_KUGOU_DFID",
+                       "FNMUSIC_KUGOU_T1", "FNMUSIC_KUGOU_MID", "FNMUSIC_KUGOU_GUID",
+                       "FNMUSIC_KUGOU_DEV", "FNMUSIC_KUGOU_MAC"]:
+                env_content[key] = ""
+            with open(env_path, "w") as f:
+                for k, v in env_content.items():
+                    f.write(f"{k}={v}\n")
+            logger.info("Logout: credentials cleared from %s", env_path)
+        except Exception as e:
+            logger.warning("Failed to clear credentials from .env: %s", e)
+    
+    return JSONResponse({"status": "ok", "message": "Logged out"})
+
+
+def _settings_page_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "web" / "settings.html"
+
+
+@app.get("/app/fnmusic_ext_kugou")
+@app.get("/app/fnmusic_ext_kugou/")
+@app.get("/app/fnmusic_ext_kugou/settings")
+@app.get("/app/fnmusic_ext_kugou/settings/")
+async def settings_page():
+    page = _settings_page_path()
+    if not page.exists():
+        return HTMLResponse("<h1>Settings page missing</h1>", status_code=500)
+    return HTMLResponse(page.read_text(encoding="utf-8"), media_type="text/html; charset=utf-8")
+
+
+@app.get("/app/fnmusic_ext_kugou/_ext/healthz")
+async def gateway_healthz(request: Request):
+    try:
+        up = await ext_healthz(request)
+        upstream_status = up.get("upstream")
+        kugou_status = up.get("kugou")
+    except Exception:
+        upstream_status = "unknown"
+        kugou_status = "unknown"
+    return JSONResponse({"ok": True, "upstream": upstream_status, "kugou": kugou_status, "gateway": "ok"})
+
+
+@app.get("/app/fnmusic_ext_kugou/_ext/login/qr/create")
+async def login_qr_create_gateway():
+    return await login_qr_create()
+
+
+@app.get("/app/fnmusic_ext_kugou/_ext/login/qr/check")
+async def login_qr_check_gateway(key: str):
+    return await login_qr_check(key)
+
+
+@app.get("/app/fnmusic_ext_kugou/_ext/login/status")
+async def login_status_gateway():
+    return await login_status()
+
+
+@app.post("/app/fnmusic_ext_kugou/_ext/login/logout")
+async def login_logout_gateway():
+    return await login_logout()
+
+
+@app.get("/app/fnmusic_ext_kugou/_ext/settings")
+async def get_settings_gateway(request: Request):
+    # 支持 GET 保存模式:?save=1&kugou_url=...&kugou_quality=...&kugou_enabled=...
+    # 目的:绕开 nginx 对 POST 的 auth_request 间歇性拦截,保存请求直接写文件不转发。
+    if (request.query_params.get("save") == "1"):
+        form = {k: v for k, v in request.query_params.items() if k not in ("save",)}
+        return await _save_settings_impl(form)
+    return JSONResponse({
+        "kugou_url": CONF["kugou_url"],
+        "kugou_quality": CONF["kugou_quality"],
+        "kugou_enabled": CONF["kugou_enabled"],
+    })
+
+
+async def _parse_form_dict(request: Request) -> dict:
+    # 不用 request.form()，避开 python-multipart 依赖。
+    # 兼容 x-www-form-urlencoded 与 JSON。
+    ctype = (request.headers.get("content-type") or "").lower()
+    raw = await request.body()
+    if not raw:
+        return {}
+    if "application/json" in ctype:
+        try:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+            if isinstance(obj, dict):
+                return {k: str(v) for k, v in obj.items()}
+        except Exception:
+            pass
+    try:
+        parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+        return {k: (v[0] if isinstance(v, list) and v else "") for k, v in parsed.items()}
+    except Exception:
+        return {}
+
+
+@app.post("/app/fnmusic_ext_kugou/_ext/settings")
+async def save_settings_gateway(request: Request):
+    form = await _parse_form_dict(request)
+    return await _save_settings_impl(form)
+
+
+@app.get("/_ext/settings")
+async def get_settings(request: Request):
+    if (request.query_params.get("save") == "1"):
+        form = {k: v for k, v in request.query_params.items() if k not in ("save",)}
+        return await _save_settings_impl(form)
+    return JSONResponse({
+        "kugou_url": CONF["kugou_url"],
+        "kugou_quality": CONF["kugou_quality"],
+        "kugou_enabled": CONF["kugou_enabled"],
+    })
+
+
+@app.post("/_ext/settings")
+async def save_settings(request: Request):
+    form = await _parse_form_dict(request)
+    return await _save_settings_impl(form)
+
+
+async def _save_settings_impl(form):
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    env_content = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env_content[k.strip()] = v.strip()
+
+    if "kugou_url" in form:
+        value = str(form["kugou_url"]).strip()
+        if value:
+            env_content["FNMUSIC_KUGOU_URL"] = value
+            CONF["kugou_url"] = value
+            kugou_source.set_config({"kugou_url": value})
+    if "kugou_quality" in form:
+        value = str(form["kugou_quality"]).strip()
+        if value:
+            env_content["FNMUSIC_KUGOU_QUALITY"] = value
+            CONF["kugou_quality"] = value
+            kugou_source.set_config({"kugou_quality": value})
+    if "kugou_enabled" in form:
+        value = str(form["kugou_enabled"]).strip()
+        if value:
+            enabled = value in ("1", "true", "True", "yes")
+            env_content["FNMUSIC_KUGOU_ENABLED"] = "1" if enabled else "0"
+            CONF["kugou_enabled"] = enabled
+            kugou_source.set_config({"kugou_enabled": enabled})
+
+    try:
+        os.makedirs(env_path.parent, exist_ok=True)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"保存失败: 无法创建目录 {env_path.parent}: {e}"}, status_code=500)
+
+    tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=str(env_path.parent))
+    try:
+        for k, v in env_content.items():
+            tmp.write(f"{k}={v}\n")
+        tmp.flush()
+        tmp.close()
+        os.replace(tmp.name, env_path)
+        os.chmod(env_path, 0o600)
+    except Exception as e:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        return JSONResponse({"status": "error", "message": f"保存失败: {e}"}, status_code=500)
+    return JSONResponse({"status": "ok", "message": "配置已保存，请重启扩展应用生效"})
+
+
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def catch_all(request: Request, full_path: str):
+    if full_path == "music/api/v1/track/list":
+        upstream_client = get_upstream_client(request.app)
+        payload_or_resp = await fetch_upstream_envelope(request, upstream_client)
+        if isinstance(payload_or_resp, Response):
+            return payload_or_resp
+        payload = payload_or_resp
+        headers = payload.pop("_ext_headers", {})
+        fill_local_track_list_cover_ids(payload)
+        return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
+
+    if _APP_MODE in {"gateway", "ui", "app"}:
+        return JSONResponse({"status": "not_found", "path": full_path}, status_code=404)
+    return await forward_to_upstream(request, get_upstream_client(request.app))

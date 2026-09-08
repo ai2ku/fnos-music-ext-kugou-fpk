@@ -1,0 +1,161 @@
+#!/bin/bash
+# fnmusic-ext cmd/main
+# 进程管理 + 停止时还原 socket
+
+LOG="/tmp/fnmusic-ext-main.log"
+PID_FILE="/tmp/fnmusic-ext.pid"
+RUN_LOG="/tmp/fnmusic-ext-run.log"
+APPDEST_FILE="/tmp/fnmusic-ext-appdest"
+
+mkdir -p /tmp 2>/dev/null || true
+log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }
+
+ACTION="${1:-}"
+[ -n "$ACTION" ] || { log "usage: $0 {start|stop|status}"; exit 1; }
+
+APPDEST="${TRIM_APPDEST:-}"
+if [ -z "$APPDEST" ] && [ -f "$APPDEST_FILE" ]; then
+    APPDEST="$(cat "$APPDEST_FILE" 2>/dev/null)"
+fi
+[ -n "$APPDEST" ] || { log "APPDEST 未注入"; exit 1; }
+
+APP_DIR="$APPDEST/app"
+if [ ! -x "$APP_DIR/proxy/run_proxy.sh" ] && [ -x "$APPDEST/proxy/run_proxy.sh" ]; then
+    APP_DIR="$APPDEST"
+fi
+if [ ! -x "$APP_DIR/proxy/run_proxy.sh" ] && [ -x "$APPDEST/app/proxy/run_proxy.sh" ]; then
+    APP_DIR="$APPDEST/app"
+fi
+if [ ! -x "$APP_DIR/proxy/run_proxy.sh" ]; then
+    log "未找到 run_proxy.sh（APP_DIR=$APP_DIR）"
+    exit 1
+fi
+
+APP_SOCK="$APP_DIR/fnmusic_ext_kugou.sock"
+
+is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+# 检查 socket 类型：unix socket / regular file / 不存在
+sock_is_unix() {
+    [ -e "$1" ] && stat -c '%F' "$1" 2>/dev/null | grep -qi '^socket'
+}
+
+# 检查 TARGET 上的服务是不是代理（通过 healthz 判断）
+is_proxy_at_target() {
+    local h
+    h="$(curl -s --max-time 2 --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz 2>/dev/null || true)"
+    echo "$h" | grep -q '"upstream"'
+}
+
+restore_socket() {
+    local TARGET="/var/run/trim_music.socket"
+    local UPSTREAM="/var/run/trim_music_upstream.socket"
+
+    log "还原 socket: $UPSTREAM -> $TARGET"
+
+    # 若 TARGET 上是代理 socket，删掉
+    if [ -e "$TARGET" ]; then
+        if is_proxy_at_target; then
+            rm -f "$TARGET" 2>/dev/null || true
+            log "删除代理 socket"
+        else
+            log "⚠️ TARGET 上是飞牛音乐，不删除"
+        fi
+    fi
+
+    # 若 upstream 是 unix socket，mv 回 TARGET
+    if sock_is_unix "$UPSTREAM"; then
+        rm -f "$TARGET" 2>/dev/null || true
+        mv "$UPSTREAM" "$TARGET" 2>/dev/null || true
+        chmod 666 "$TARGET" 2>/dev/null || true
+        log "socket 已还原"
+    else
+        log "⚠️ upstream socket 不存在，无法还原（飞牛【音乐】需手动重启）"
+    fi
+}
+
+log "==== $ACTION (whoami=$(id -un)) APPDEST=$APPDEST ===="
+
+case "$ACTION" in
+    start)
+        if is_running; then
+            log "已在运行 (PID=$(cat "$PID_FILE"))"
+            exit 0
+        fi
+        rm -f "$PID_FILE" 2>/dev/null || true
+
+        # 关键：确保代理没有残留 socket 占用 TARGET
+        if is_proxy_at_target; then
+            rm -f /var/run/trim_music.socket 2>/dev/null || true
+            log "清理残留代理 socket"
+            sleep 1
+        fi
+
+        cd "$APP_DIR" || { log "cd 失败"; exit 1; }
+        rm -f "$APP_SOCK" 2>/dev/null || true
+        export TRIM_APPDEST="$APPDEST"
+        export FNMUSIC_APP_SOCK="$APP_SOCK"
+        export FNMUSIC_UPSTREAM_SOCK="/var/run/trim_music.socket"
+
+        nohup bash -c 'exec ./proxy/run_proxy.sh' >>"$RUN_LOG" 2>&1 &
+        local_pid=$!
+        echo "$local_pid" > "$PID_FILE"
+        log "启动代理 PID=$local_pid"
+
+        nohup bash -c 'exec /var/apps/python312/target/bin/python3 ./proxy/app_socket_bridge.py' >>"$RUN_LOG" 2>&1 &
+        bridge_pid=$!
+        log "启动网关桥接器 PID=$bridge_pid"
+
+        sleep 5
+        if is_running; then
+            log "代理存活 PID=$local_pid"
+        else
+            log "代理进程死亡。run.log 尾部："
+            tail -30 "$RUN_LOG" 2>&1 >> "$LOG" || true
+            kill "$bridge_pid" 2>/dev/null || true
+            rm -f "$APP_SOCK" 2>/dev/null || true
+            exit 1
+        fi
+        if sock_is_unix "$APP_SOCK"; then
+            log "网关 socket 存活: $APP_SOCK"
+            exit 0
+        fi
+        log "网关 socket 未出现: $APP_SOCK；run.log 尾部："
+        tail -30 "$RUN_LOG" 2>&1 >> "$LOG" || true
+        exit 1
+        ;;
+    stop)
+        if is_running; then
+            pid="$(cat "$PID_FILE")"
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+            rm -f "$PID_FILE"
+            log "已停止代理进程"
+        else
+            log "代理未在运行"
+        fi
+        pkill -f "[p]roxy/app_socket_bridge.py" 2>/dev/null || true
+        sleep 1
+        pkill -9 -f "[p]roxy/app_socket_bridge.py" 2>/dev/null || true
+        rm -f "$APP_SOCK" 2>/dev/null || true
+        restore_socket
+        exit 0
+        ;;
+    status)
+        if is_running; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)
+        log "未知动作: $ACTION"
+        exit 1
+        ;;
+esac

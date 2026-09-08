@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Venv
+.venv-proxy/
+
+# Runtime data (should not be committed)
+cache/
+online_favorites/
+play_history/
+recommend_cache/
+log/
+*.log
+
+# Env files (contain secrets)
+.env
+wizard_submit.json
+
+# Build output
+dist/
+fnmusic_ext_kugou.fpk
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# fnpack tool (download separately)
+fnpack
+fnpack-1.2.3-linux-amd64

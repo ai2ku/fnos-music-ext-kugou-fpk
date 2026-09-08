@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞牛音乐酷狗扩展</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f5f5;color:#333;padding:20px}
+.c{max-width:760px;margin:0 auto}
+.hdr{background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:24px;border-radius:12px 12px 0 0}
+.hdr h1{font-size:20px;margin-bottom:4px}.hdr .sub{font-size:13px;opacity:.85}
+.card{background:white;padding:20px;border-radius:0 0 12px 12px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.card+.card{margin-top:14px;border-radius:12px}
+.card h2{font-size:15px;margin-bottom:12px;color:#444;border-left:3px solid #667eea;padding-left:10px}
+.row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0}.row:last-child{border:none}.row .k{color:#888;font-size:13px}.row .v{font-size:13px;font-weight:500}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}.badge.on{background:#d4f5d4;color:#2d7a2d}.badge.off{background:#f5d4d4;color:#a03030}.badge.warn{background:#fff3cd;color:#8a6d3b}
+label{display:block;font-size:13px;color:#666;margin-bottom:4px}
+input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;font-size:14px;margin-bottom:10px}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.btn{padding:8px 20px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;color:white;display:inline-block;text-decoration:none}.btn:hover{transform:translateY(-1px);box-shadow:0 2px 6px rgba(0,0,0,.15)}.btn-primary{background:#667eea}.btn-warn{background:#f39c12}.btn-danger{background:#e74c3c}.btn-green{background:#27ae60}.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.hint{color:#888;font-size:12px;margin-top:8px;line-height:1.5}.msg{padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;display:none}.msg.ok{background:#d4f5d4;color:#2d7a2d;display:block}.msg.err{background:#f5d4d4;color:#a03030;display:block}.qrbox{text-align:center;padding:16px 0}
+</style>
+</head>
+<body>
+<div class="c">
+<div class="hdr"><h1>飞牛音乐酷狗扩展</h1><div class="sub">KuGouMusicApi 音源与扫码登录</div></div>
+<div id="msg" class="msg"></div>
+<div class="card">
+<h2>服务状态</h2>
+<div class="row"><span class="k">扩展服务</span><span class="v"><span class="badge warn" id="health-badge">检测中</span></span></div>
+<div class="row"><span class="k">上游音乐</span><span class="v" id="upstream">检测中</span></div>
+<div class="row"><span class="k">KuGou 源</span><span class="v" id="kugou">检测中</span></div>
+</div>
+<div class="card">
+<h2>KuGou 音源配置</h2>
+<label>API 地址</label>
+<input type="text" id="kugou_url" placeholder="http://127.0.0.1:8899">
+<label>音质 (kbps)</label>
+<select id="kugou_quality">
+<option value="high">high</option><option value="320">320</option><option value="128">128</option><option value="64">64</option>
+</select>
+<label>启用状态</label>
+<select id="kugou_enabled"><option value="1">启用</option><option value="0">停用</option></select>
+<div class="btns"><button class="btn btn-green" onclick="saveSettings()">保存配置</button><button class="btn btn-primary" onclick="loadAll()">刷新</button></div>
+<div class="hint">保存后请重启扩展应用，使 KuGou 源配置生效。</div>
+</div>
+<div class="card">
+<h2>KuGou 登录</h2>
+<div class="row"><span class="k">登录状态</span><span class="v"><span class="badge off" id="login-badge">未登录</span></span></div>
+<div class="row" id="login-userid" style="display:none"><span class="k">用户ID</span><span class="v" id="login-userid-val"></span></div>
+<div class="btns"><button class="btn btn-primary" id="btn-login" onclick="showQRLogin()">扫码登录</button><button class="btn btn-danger" id="btn-logout" onclick="doLogout()" style="display:none">退出登录</button></div>
+<div class="qrbox" id="qr-login-container" style="display:none"><div id="qr-image" style="margin-bottom:12px"></div><div id="qr-status">正在生成二维码...</div><div id="qr-timer" style="font-size:12px;color:#999;margin-top:8px"></div></div>
+</div>
+</div>
+<script>
+const API=location.pathname.replace(/\/$/,'');
+let qrPollTimer=null, qrExpireTimer=null;
+function show(t,m){var e=document.getElementById('msg');e.className='msg '+t;e.textContent=m;}
+function hideMsg(){document.getElementById('msg').className='msg';}
+async function jget(path){const r=await fetch(API+path);return await r.json();}
+async function post(path,body,retries){retries=retries==null?2:retries;let lastErr;for(let i=0;i<=retries;i++){try{const r=await fetch(API+path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''});if(!r.ok){let detail='';try{const t=await r.text();detail=t?` (${t})`:'';}catch(e){}const err=new Error('HTTP '+r.status+detail);lastErr=err;if(i<retries){await new Promise(rs=>setTimeout(rs,700));continue;}throw err;}return await r.json();}catch(e){lastErr=e;if(i<retries){await new Promise(rs=>setTimeout(rs,700));continue;}throw e;}}}
+async function loadHealth(){try{const d=await jget('/_ext/healthz');const b=document.getElementById('health-badge');b.className='badge '+(d.ok?'on':'off');b.textContent=d.ok?'正常':'异常';document.getElementById('upstream').textContent=d.upstream||'unknown';document.getElementById('kugou').textContent=d.kugou||'unknown';}catch(e){}}
+async function loadSettings(){try{const d=await jget('/_ext/settings');document.getElementById('kugou_url').value=d.kugou_url||'http://127.0.0.1:8899';document.getElementById('kugou_quality').value=d.kugou_quality||'high';document.getElementById('kugou_enabled').value=d.kugou_enabled?'1':'0';}catch(e){}}
+async function loadLogin(){try{const d=await jget('/_ext/login/status');const b=document.getElementById('login-badge');if(d.status==='logged_in'){b.className='badge on';b.textContent='已登录';document.getElementById('login-userid').style.display='flex';document.getElementById('login-userid-val').textContent=d.userid||'';document.getElementById('btn-login').style.display='none';document.getElementById('btn-logout').style.display='inline-block';}else{b.className='badge off';b.textContent='未登录';document.getElementById('login-userid').style.display='none';document.getElementById('btn-login').style.display='inline-block';document.getElementById('btn-logout').style.display='none';}}catch(e){}}
+async function loadAll(){hideMsg();loadHealth();loadSettings();loadLogin();}
+async function saveSettings(){try{const qs=['save=1','kugou_url='+encodeURIComponent(document.getElementById('kugou_url').value.trim()),'kugou_quality='+encodeURIComponent(document.getElementById('kugou_quality').value),'kugou_enabled='+encodeURIComponent(document.getElementById('kugou_enabled').value)].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
+async function showQRLogin(){document.getElementById('qr-login-container').style.display='block';document.getElementById('qr-image').innerHTML='';document.getElementById('qr-status').textContent='正在生成二维码...';try{const d=await jget('/_ext/login/qr/create');if(d.status==='ok'){document.getElementById('qr-image').innerHTML='<img src="'+d.qrCode+'" style="width:220px;height:220px;border-radius:8px" alt="登录二维码">';document.getElementById('qr-status').textContent='请使用酷狗音乐 APP 扫码';startPoll(d.key);qrExpireTimer=setTimeout(()=>{document.getElementById('qr-status').textContent='二维码可能已过期，请重新生成';},120000);}else{document.getElementById('qr-status').textContent='生成失败：'+(d.message||d.status);}}catch(e){document.getElementById('qr-status').textContent='请求失败：'+e.message;}}
+function startPoll(key){if(qrPollTimer)clearInterval(qrPollTimer);qrPollTimer=setInterval(async()=>{try{const d=await jget('/_ext/login/qr/check?key='+encodeURIComponent(key));if(d.status==='authenticated'){clearInterval(qrPollTimer);if(qrExpireTimer)clearTimeout(qrExpireTimer);document.getElementById('qr-status').textContent='登录成功！'+(d.nickname?' ('+d.nickname+')':'');document.getElementById('qr-status').style.color='#27ae60';setTimeout(loadAll,800);}else if(d.status==='scanned'){document.getElementById('qr-status').textContent='已扫码，请在酷狗音乐确认登录';}else if(d.status==='expired'){clearInterval(qrPollTimer);document.getElementById('qr-status').textContent='二维码已过期，请重新生成';}}catch(e){}},2000);}
+async function doLogout(){if(!confirm('确定退出 KuGou 登录？'))return;try{const d=await jget('/_ext/login/logout');show(d.status==='ok'?'ok':'err',d.message||'已退出');loadLogin();}catch(e){show('err','退出失败：'+e.message);}}
+loadAll();
+</script>
+</body>
+</html>

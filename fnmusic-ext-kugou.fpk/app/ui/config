@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "fnmusic_ext_kugou.main": {
+      "title": "飞牛音乐酷狗扩展",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/fnmusic_ext_kugou",
+      "gatewaySocket": "fnmusic_ext_kugou.sock",
+      "url": "/app/fnmusic_ext_kugou",
+      "allUsers": true
+    }
+  }
+}
