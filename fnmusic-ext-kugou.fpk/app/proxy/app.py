@@ -79,7 +79,7 @@ CONF = {
     ),
 }
 
-_KUGOU_PLAYLIST_PREFIX = "online:playlist:kugou:"
+_KUGOU_PLAYLIST_PREFIX = "online:kugou:playlist:"
 
 
 def kugou_playlist_guid(remote_id: str, name: str = "") -> str:
@@ -337,40 +337,43 @@ async def fetch_kugou_artist_detail(app_state, artist_guid: str) -> dict | None:
     artist_id = parsed_artist_id
     now = int(time.time())
     try:
-        result = await kugou_source.get_artist_audios(artist_id, sort="hot", page=1, pagesize=500)
+        async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
+            auth = kugou_source._auth_header()
+            headers = {"Authorization": auth} if auth else {}
+            r = await c.get("/artist/detail", params={"id": artist_id}, headers=headers)
+            if r.status_code != 200:
+                logger.warning("[KUGOU_ARTIST_DETAIL] http=%s artist_id=%s body=%r", r.status_code, artist_id, r.text[:200])
+                return None
+            body = r.json()
+            data = body.get("data") or {}
+            if isinstance(data, list):
+                data = data[0] if data and isinstance(data[0], dict) else {}
+            if not isinstance(data, dict):
+                logger.warning("[KUGOU_ARTIST_DETAIL] bad body artist_id=%s body=%r", artist_id, body)
+                return None
+            name = str(data.get("author_name") or data.get("name") or data.get("artist") or "").strip()
+            track_count = int(data.get("song_count") or data.get("trackCount") or data.get("track_count") or 0)
+            album_count = int(data.get("album_count") or data.get("albumCount") or 0)
+            if not name:
+                logger.warning("[KUGOU_ARTIST_DETAIL] empty name artist_id=%s body=%r", artist_id, body)
+                return None
+            guid = f"online:kugou:artist:{artist_id}"
+            return {
+                "code": 0,
+                "msg": "",
+                "data": {
+                    "guid": guid,
+                    "name": name,
+                    "coverId": guid,
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "trackCount": track_count,
+                    "albumCount": album_count,
+                },
+            }
     except Exception as e:
-        logger.warning("[KUGOU_ARTIST_DETAIL] artist_id=%s error=%s", artist_id, e)
+        logger.warning("[KUGOU_ARTIST_DETAIL] error artist_id=%s err=%s", artist_id, e)
         return None
-    items = result.get("items") or []
-    if not items:
-        return None
-    name = ""
-    album_ids: set[str] = set()
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if not name:
-            name = str(item.get("artist") or "").strip()
-        aid = str(item.get("album_id") or item.get("albumId") or "").strip()
-        album_name = str(item.get("album") or item.get("albumName") or item.get("album_name") or "").strip()
-        if aid or album_name:
-            album_ids.add(aid or album_name)
-    if not name:
-        return None
-    guid = f"online:kugou:artist:{artist_id}"
-    return {
-        "code": 0,
-        "msg": "",
-        "data": {
-            "guid": guid,
-            "name": name,
-            "coverId": guid,
-            "createdAt": now,
-            "updatedAt": now,
-            "trackCount": len(items),
-            "albumCount": len(album_ids),
-        },
-    }
 
 
 async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size: int = 50) -> dict:
