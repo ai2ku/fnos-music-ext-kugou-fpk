@@ -378,6 +378,27 @@ async def fetch_kugou_artist_detail(app_state, artist_guid: str) -> dict | None:
         return None
 
 
+async def fetch_kugou_artist_tracks(app_state, artist_guid: str, page: int = 1, size: int = 50) -> dict:
+    """酷狗歌手作品 -> 飞牛 track/artist-detail/list 的歌曲列表。
+
+    上游接口：KuGouMusicApi /artist/audios?id=<artist_id>&sort=hot&page=&pagesize=。
+    返回结构与 playlist-detail/list 一致：{"items": [...], "total": n, "page": p, "pagesize": s}。
+    items 已由 get_artist_audios 归一化为内部格式，可直接喂给 build_online_track。
+    """
+    artist_id, artist_kind = parse_kugou_artist_guid(artist_guid)
+    if artist_kind != "kugou_artist" or not artist_id:
+        return {"items": [], "total": 0, "page": page, "pagesize": size}
+    try:
+        payload = await kugou_source.get_artist_audios(artist_id, sort="hot", page=page, pagesize=size)
+    except Exception as e:
+        logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s page=%s size=%s err=%s", artist_id, page, size, e)
+        return {"items": [], "total": 0, "page": page, "pagesize": size}
+    items = payload.get("items") or []
+    logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s page=%s size=%s got=%s total=%s",
+                   artist_id, page, size, len(items), payload.get("total"))
+    return {"items": items, "total": int(payload.get("total") or len(items)), "page": page, "pagesize": size}
+
+
 async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size: int = 50) -> dict:
     if not is_kugou_playlist_guid(guid):
         return {"items": [], "total": 0, "page": page, "pagesize": size}
@@ -3365,6 +3386,51 @@ async def artist_detail(request: Request):
     if isinstance(kugou_payload, dict):
         return JSONResponse(content=kugou_payload, status_code=200)
     return await forward_to_upstream(request, get_upstream_client(request.app))
+
+
+@app.get("/music/api/v1/track/artist-detail/list")
+@app.get("/music/api/v1/track/artist-detail/list/{subpath:path}")
+async def track_artist_detail_list(request: Request):
+    """/track/artist-detail/list：酷狗歌手作品歌曲列表；非酷狗 GUID 走飞牛上游。
+
+    参数映射参考 /track/playlist-detail/list：page/size + artistGUID，返回
+    {"code":0,"data":{"list":[...],"total":n}}，track 项结构与 build_online_track 一致。
+    """
+    artist_guid = str(
+        request.query_params.get("artistGUID")
+        or request.query_params.get("artistGuid")
+        or request.query_params.get("artist_id")
+        or request.query_params.get("artistId")
+        or request.query_params.get("guid")
+        or ""
+    ).strip()
+    if not artist_guid:
+        return JSONResponse(content={"code": 400, "msg": "artistGUID required", "data": None})
+    parsed_artist_id, artist_kind = parse_kugou_artist_guid(artist_guid)
+    if artist_kind != "kugou_artist":
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 50)
+    except (TypeError, ValueError):
+        size = 50
+    if size < 1:
+        size = 50
+    payload = await fetch_kugou_artist_tracks(request.app, artist_guid, page=page, size=size)
+    # get_artist_audios 内部已调 search_item_to_raw 归一化；不要再套 track_item_to_raw，
+    # 否则会把 title 清空（后者只认原始 KuGou 字段 hash/singerinfo/albuminfo）。
+    raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
+    tracks = [build_online_track(x) for x in raw_tracks if x.get("hash") or x.get("id")]
+    return JSONResponse(
+        content={
+            "code": 0,
+            "msg": "ok",
+            "data": {"list": tracks, "total": int(payload.get("total") or len(tracks))},
+        }
+    )
 
 
 @app.get("/music/api/v1/playlist/list")
