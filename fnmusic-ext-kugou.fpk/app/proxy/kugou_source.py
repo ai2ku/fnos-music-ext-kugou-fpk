@@ -213,17 +213,59 @@ def search_item_to_raw(it: dict) -> dict:
     # 歌单 track/all 的真实字段完整，直接走精确路径。
     if isinstance(it.get("singerinfo"), list) or isinstance(it.get("albuminfo"), dict):
         return track_item_to_raw(it)
-    sid = str(it.get("hash") or it.get("songhash") or it.get("songHash") or it.get("FileHash") or it.get("fileHash") or "").strip()
+
+    # /privilege/lite 的真实回参按小写字段精确映射。
+    if "hash" in it or "singername" in it or "albumname" in it:
+        sid = str(it.get("hash") or "").strip()
+        if not sid:
+            return {}
+        raw_name = str(it.get("name") or "").strip()
+        singername = str(it.get("singername") or "").strip()
+        albumname = str(it.get("albumname") or "").strip()
+        title = _strip_singer_prefix_from_name(raw_name, [singername] if singername else [], albumname)
+        return {
+            "id": f"kugou:{sid}",
+            "source": "kugou",
+            "hash": sid,
+            "title": title,
+            "artist": singername,
+            "artists": [{"name": singername, "id": ""}] if singername else [],
+            "album": albumname,
+            "album_id": str(it.get("album_id") or "").strip(),
+            "duration_s": _to_int(it.get("duration") or 0),
+            "ext": str(it.get("extname") or it.get("quality") or "mp3").strip().lower() or "mp3",
+            "cover_url": str(it.get("cover") or it.get("image") or "").strip(),
+            "union_cover": str(it.get("cover") or it.get("image") or "").strip(),
+            "file_size": _to_int(it.get("filesize") or 0),
+            "bitrate": _to_int(it.get("bitrate") or 0),
+            "lyric": "",
+        }
+
+    sid = str(it.get("FileHash") or "").strip()
     if not sid:
         return {}
-    album_info = _album_info_from_any(it)
-    album_name = _album_name_from_albuminfo(album_info)
-    artists = _singers_from_any(it)
-    title = _song_name_from_any(it, album_name)
-    artist = "、".join(str(x.get("name") or "").strip() for x in artists)
-    ext = _format_from_any(it)
-    cover = _cover_from_any(it)
-    file_size, bitrate = _size_bitrate_from_any(it)
+    artists = [
+        {
+            "name": str(singer.get("name") or "").strip(),
+            "id": str(singer.get("id") or "").strip(),
+        }
+        for singer in (it.get("Singers") or [])
+        if isinstance(singer, dict) and str(singer.get("name") or "").strip()
+    ]
+    album_id = str(it.get("AlbumID") or "").strip()
+    album_name = str(it.get("AlbumName") or "").strip()
+    artist = "、".join(str(x.get("name") or "").strip() for x in artists if str(x.get("name") or "").strip())
+    title = str(it.get("OriSongName") or "").strip()
+    suffix = str(it.get("Suffix") or "").strip()
+    if suffix:
+        title = f"{title} {suffix}" if title else suffix
+    ext = str(it.get("ExtName") or "mp3").strip().lower() or "mp3"
+    cover = str(it.get("Image") or "").strip()
+    file_size = _to_int(it.get("FileSize") or 0)
+    bitrate = _to_int(it.get("Bitrate") or 0)
+    duration = _to_int(it.get("Duration") or 0)
+    if not duration and file_size and bitrate:
+        duration = int(round(file_size * 8 / (bitrate * 1000)))
     return {
         "id": f"kugou:{sid}",
         "source": "kugou",
@@ -232,8 +274,8 @@ def search_item_to_raw(it: dict) -> dict:
         "artist": artist,
         "artists": artists,
         "album": album_name,
-        "album_id": album_info.get("id", ""),
-        "duration_s": _duration_seconds_from_any(it),
+        "album_id": album_id,
+        "duration_s": duration,
         "ext": ext,
         "cover_url": cover,
         "union_cover": cover,
@@ -654,27 +696,16 @@ async def get_user_playlists(page: int = 1, pagesize: int = 500) -> dict:
 
 
 async def get_info(song_id: str) -> dict | None:
-    """从内存索引拿元数据。搜过的歌直接命中；未搜过则用 hash 搜一次回源。"""
+    """从内存索引拿元数据。搜过的歌直接命中；未搜过则用 /privilege/lite?hash= 回源。"""
     if not song_id:
         return None
     cached = _search_index.get(song_id)
     if cached:
         return dict(cached)
-    # 未搜过（直接进入详情页），用 hash 反向搜一次拿封面/标题等
-    try:
-        async with _client() as c:
-            r = await c.get(
-                "/search",
-                params={"hash": song_id, "page": 1, "pagesize": 1, "type": "song"},
-            )
-            if r.status_code == 200:
-                data = r.json()
-                lists = ((data.get("data") or {}).get("lists") or [])
-                if lists and isinstance(lists[0], dict):
-                    # 复用 search 的字段解析逻辑，直接走 search 函数
-                    return await search_by_hash(song_id)
-    except Exception as e:
-        logger.warning("get_info search-by-hash %s err=%s", song_id, e)
+    # 未搜过（直接进入详情页），用 /privilege/lite?hash= 拉元数据
+    lite_info = await fetch_privilege_lite_info(song_id)
+    if lite_info:
+        return lite_info
     return {
         "id": f"kugou:{song_id}",
         "source": "kugou",
@@ -688,6 +719,46 @@ async def get_info(song_id: str) -> dict | None:
         "bitrate": 0,
         "lyric": "",
     }
+
+
+async def fetch_privilege_lite_info(song_id: str) -> dict | None:
+    """从 /privilege/lite?hash= 拉一首歌的元数据并映射到统一格式。"""
+    if not song_id:
+        return None
+    try:
+        async with _client() as c:
+            r = await c.get(
+                "/privilege/lite",
+                params={"hash": song_id},
+            )
+            if r.status_code == 200:
+                body = r.json()
+                status = body.get("status", body.get("code"))
+                if status not in (1, 200, 0):
+                    logger.warning("[KUGOU] privilege_lite status=%s hash=%s body=%r", status, song_id, str(body)[:300])
+                    return None
+                data = body.get("data") or body
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    data = data[0]
+                if not isinstance(data, dict):
+                    return None
+                cover_url = ""
+                info_obj = data.get("info")
+                if isinstance(info_obj, dict):
+                    cover_url = str(info_obj.get("image") or "").strip()
+                tp = data.get("trans_param")
+                if isinstance(tp, dict) and not cover_url:
+                    cover_url = str(tp.get("union_cover") or "").strip()
+                raw_item = search_item_to_raw(data)
+                if raw_item:
+                    if cover_url and not raw_item.get("cover_url"):
+                        raw_item["cover_url"] = cover_url
+                        raw_item["union_cover"] = cover_url
+                    _remember_song(raw_item)
+                    return raw_item
+    except Exception as e:
+        logger.warning("privilege_lite %s err=%s", song_id, e)
+    return None
 
 
 async def search_by_hash(song_id: str) -> dict | None:

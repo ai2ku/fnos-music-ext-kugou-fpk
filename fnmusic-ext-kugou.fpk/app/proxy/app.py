@@ -354,6 +354,7 @@ async def fetch_kugou_artist_detail(app_state, artist_guid: str) -> dict | None:
             name = str(data.get("author_name") or data.get("name") or data.get("artist") or "").strip()
             track_count = int(data.get("song_count") or data.get("trackCount") or data.get("track_count") or 0)
             album_count = int(data.get("album_count") or data.get("albumCount") or 0)
+            cover_url = str(data.get("sizable_avatar") or data.get("avatar") or data.get("pic") or "").strip()
             if not name:
                 logger.warning("[KUGOU_ARTIST_DETAIL] empty name artist_id=%s body=%r", artist_id, body)
                 return None
@@ -365,6 +366,7 @@ async def fetch_kugou_artist_detail(app_state, artist_guid: str) -> dict | None:
                     "guid": guid,
                     "name": name,
                     "coverId": guid,
+                    "coverUrl": cover_url,
                     "createdAt": now,
                     "updatedAt": now,
                     "trackCount": track_count,
@@ -1829,6 +1831,7 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
     info = dict(data or {})
     info.setdefault("id", song_id_from_online_guid(guid))
     info.setdefault("source", source_from_online_guid(guid))
+    cover_url = str(info.get("cover_url") or info.get("coverUrl") or "").strip()
     vo = build_online_track(info)
     album_obj = vo["album"] if isinstance(vo.get("album"), dict) else {
         "name": str(vo.get("album") or ""),
@@ -1844,8 +1847,8 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
         "album": album_obj,
         "genres": list(vo.get("genres") or []),
         "duration": vo.get("duration") or 0,
-        "coverId": vo.get("coverUrl") or guid,
-        "coverUrl": vo.get("coverUrl") or "",
+        "coverId": guid,
+        "coverUrl": cover_url,
         "format": vo.get("format") or "mp3",
         "hasLyric": True,
         "isFavorite": False,
@@ -2526,6 +2529,32 @@ async def _fetch_kugou_playlist_cover_url(request: Request, coll_id: str) -> str
     return ""
 
 
+async def _fetch_kugou_artist_cover_url(request: Request, artist_id: str) -> str:
+    """用歌手 ID 回源酷狗，取歌手详情里的 sizable_avatar 封面。"""
+    if not artist_id:
+        return ""
+    try:
+        async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
+            auth = kugou_source._auth_header()
+            headers = {"Authorization": auth} if auth else {}
+            r = await c.get("/artist/detail", params={"id": artist_id}, headers=headers)
+            if r.status_code != 200:
+                logger.warning("[KUGOU_ARTIST_COVER] detail http=%s artist_id=%s", r.status_code, artist_id)
+                return ""
+            data = r.json()
+            payload = data.get("data") if isinstance(data, dict) else None
+            if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                payload = payload[0]
+            if not isinstance(payload, dict):
+                return ""
+            cover = str(payload.get("sizable_avatar") or payload.get("avatar") or payload.get("pic") or "").strip()
+            if cover:
+                return _fill_cover_size(cover, request)
+    except Exception as e:
+        logger.warning("[KUGOU_ARTIST_COVER] detail error artist_id=%s err=%s", artist_id, e)
+    return ""
+
+
 async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
     """按 GUID 取封面：在线直取在线信息，酷狗歌单取 pic，本地回退到酷狗搜索。"""
     if not guid:
@@ -2536,6 +2565,8 @@ async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
         if coll_id:
             return await _fetch_kugou_playlist_cover_url(request, coll_id)
         return ""
+    if isinstance(guid, str) and guid.startswith("online:kugou:artist:"):
+        return await _fetch_kugou_artist_cover_url(request, guid[len("online:kugou:artist:"):])
     if is_online_guid(guid):
         data = await _online_info(request, guid)
         return _fill_cover_size(str((data or {}).get("cover_url") or ""), request)
