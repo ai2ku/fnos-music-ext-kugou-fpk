@@ -629,6 +629,36 @@ def get_stream_lyric(guid: str) -> str:
     return _STREAM_LYRIC_CACHE.get(guid, "")
 
 
+# === 本地封面缓存：coverId=guid 的解析结果进程内记忆，避免每张封面都回源 metadata + 酷狗搜索 ===
+
+_LOCAL_COVER_URL_TTL_S = 24 * 3600
+_LOCAL_COVER_FAIL_TTL_S = 5 * 60
+_LOCAL_COVER_URL_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def remember_local_cover_url(guid: str, url: str) -> None:
+    """记住本地曲子的封面 URL；url 为空表示解析失败，短缓存以免每张封面都打回源。"""
+    if not guid:
+        return
+    ttl = _LOCAL_COVER_URL_TTL_S if url else _LOCAL_COVER_FAIL_TTL_S
+    _LOCAL_COVER_URL_CACHE[guid] = (time.time() + ttl, url)
+
+
+def remembered_local_cover_url(guid: str) -> str | None:
+    """命中未过期缓存返回 URL 模板（可能为空串），未命中或过期返回 None。
+
+    缓存的是未替换 {size} 占位符的原始 URL，取出后需再用 _fill_cover_size 按本次请求填尺寸。
+    """
+    entry = _LOCAL_COVER_URL_CACHE.get(guid)
+    if not entry:
+        return None
+    expire_at, url = entry
+    if expire_at <= time.time():
+        _LOCAL_COVER_URL_CACHE.pop(guid, None)
+        return None
+    return url
+
+
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
     """在线条目合并去重：按 (title, artist) 小写，保留最先出现的（musicbox 优先）。"""
     seen = set()
@@ -678,6 +708,72 @@ def get_by_path(d: Any, path: str) -> Any:
     return curr
 
 
+def _kugou_item_matches_local(item: dict, title: str, artist: str, duration: float) -> tuple[int, int, int, int, bool, float, str, str]:
+    """按歌名/歌手/时长给酷狗候选打分。
+
+    返回 (score, dur_rank, title_rank, matched, dur_diff, cand_title, cand_artist)。
+    matched=True 表示可以作为"同款"版本：
+      - 本地同时有歌名和歌手时，必须两者都命中（只同名不同人的不算）；
+      - 本地只有其中一个时，要求那一个命中。
+    """
+    it_title = str(item.get("title") or item.get("FileName") or "").strip()
+    it_artist = str(item.get("artist") or item.get("SingerName") or "").strip()
+    try:
+        it_dur = float(item.get("duration_s") or item.get("Duration") or 0)
+    except Exception:
+        it_dur = 0.0
+    diff = abs(it_dur - duration) if duration > 0 and it_dur > 0 else 1e9
+    score = 0
+    title_hit = False
+    if it_title and title and it_title == title:
+        score += 1000
+        title_hit = True
+    elif it_title and title and it_title in title:
+        score += 600
+        title_hit = True
+    elif it_title and title and title in it_title:
+        score += 500
+        title_hit = True
+    artist_hit = False
+    if it_artist and artist and it_artist == artist:
+        score += 800
+        artist_hit = True
+    elif it_artist and artist and it_artist in artist:
+        score += 450
+        artist_hit = True
+    elif it_artist and artist and artist in it_artist:
+        score += 350
+        artist_hit = True
+    if diff <= 0.5:
+        score += 2000
+    elif diff <= 1.5:
+        score += 1200
+    elif diff <= 3.0:
+        score += 600
+    elif diff <= 5.0:
+        score += 200
+    if title and artist:
+        matched = title_hit and artist_hit
+    elif title:
+        matched = title_hit
+    elif artist:
+        matched = artist_hit
+    else:
+        matched = False
+    return (score, 0 if diff <= 1.5 else 1, 0 if it_title == title else 1, matched, diff, it_title, it_artist)
+
+
+async def _kugou_candidates(keywords: str, limit: int = 30) -> list[dict]:
+    """搜酷狗返回统一格式候选；失败或空都返回空列表。"""
+    try:
+        candidates = await kugou_source.search(keywords, limit=limit, page=1)
+    except Exception as e:
+        logger.warning("[KUGOU_SEARCH] error keywords=%r err=%s", keywords, e)
+        return []
+    items = (candidates or {}).get("items") or [] if isinstance(candidates, dict) else []
+    return [x for x in items if isinstance(x, dict)]
+
+
 async def fetch_local_lyric_by_keywords(title: str, artist: str, duration: float = 0.0) -> str:
     """仅用于飞牛本地歌：先搜酷狗候选，再按相关度和时长匹配取歌词。"""
     if not CONF.get("kugou_enabled", True):
@@ -686,46 +782,14 @@ async def fetch_local_lyric_by_keywords(title: str, artist: str, duration: float
     if not keywords:
         return ""
 
-    def _score_candidate(item: dict, idx: int) -> tuple[int, int, int, int]:
-        it_title = str(item.get("title") or item.get("FileName") or "").strip()
-        it_artist = str(item.get("artist") or item.get("SingerName") or "").strip()
-        try:
-            it_dur = float(item.get("duration_s") or item.get("Duration") or 0)
-        except Exception:
-            it_dur = 0.0
-        diff = abs(it_dur - duration) if duration > 0 and it_dur > 0 else 1e9
-        score = 0
-        if it_title and title and it_title == title:
-            score += 1000
-        elif it_title and title and it_title in title:
-            score += 600
-        elif it_title and title and title in it_title:
-            score += 500
-        if it_artist and artist and it_artist == artist:
-            score += 800
-        elif it_artist and artist and it_artist in artist:
-            score += 450
-        elif it_artist and artist and artist in it_artist:
-            score += 350
-        if diff <= 0.5:
-            score += 2000
-        elif diff <= 1.5:
-            score += 1200
-        elif diff <= 3.0:
-            score += 600
-        elif diff <= 5.0:
-            score += 200
-        return (score, 0 if diff <= 1.5 else 1, 0 if it_title == title else 1, -idx)
-
     try:
-        candidates = await kugou_source.search(keywords, limit=30, page=1)
-        items = candidates.get("items") or []
+        items = await _kugou_candidates(keywords, limit=30)
         if not items:
-            logger.warning("[LYRIC_FALLBACK] search empty keywords=%r total=%s", keywords, candidates.get("total"))
+            logger.warning("[LYRIC_FALLBACK] search empty keywords=%r", keywords)
             return ""
         scored = []
         for idx, item in enumerate(items):
-            scored.append((_score_candidate(item, idx), item))
+            scored.append((_kugou_item_matches_local(item, title, artist, duration)[:3] + (-idx,), item))
         scored.sort(key=lambda x: x[0], reverse=True)
         ranked = [item for _, item in scored]
         selected = ranked[0]
@@ -742,12 +806,130 @@ async def fetch_local_lyric_by_keywords(title: str, artist: str, duration: float
             selected.get("duration_s"),
             len(lyric_text),
             len(items),
-            candidates.get("total"),
         )
         return lyric_text
     except Exception as e:
         logger.warning("[LYRIC_FALLBACK] error keywords=%r err=%s", keywords, e)
         return ""
+
+
+def _cover_url_from_item(item: dict) -> str:
+    """取统一格式候选里的封面 URL。6c7213d 后 cover 字段已被拍平，按优先级取值。"""
+    for key in ("union_cover", "cover_url", "cover", "image", "coverUrl", "picUrl"):
+        value = item.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+async def _local_audio_metadata(request: Request, client: httpx.AsyncClient, guid: str) -> tuple[str, str, float]:
+    """回查上游 metadata 取歌名/歌手/时长；失败返回空。"""
+    try:
+        meta_req = client.build_request(
+            "GET",
+            f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}",
+            headers=copy_incoming_headers(request),
+        )
+        meta_resp = await client.send(meta_req)
+        if meta_resp.status_code != 200:
+            logger.warning("[STATIC_COVER] metadata probe http=%d guid=%s", meta_resp.status_code, guid)
+            return "", "", 0.0
+        meta_payload = meta_resp.json()
+        if not isinstance(meta_payload, dict):
+            return "", "", 0.0
+        return _extract_local_lyric_meta(meta_payload)
+    except Exception as e:
+        logger.warning("[STATIC_COVER] metadata probe error guid=%s err=%s", guid, e)
+        return "", "", 0.0
+
+
+def _tags_from_local_audio(audio_path: str) -> tuple[str, str]:
+    """读本地音频标签里的歌名/歌手；metadata 拿不到时用它兜底。"""
+    if not audio_path or not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
+        return "", ""
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(audio_path, easy=True)
+        if audio is None or getattr(audio, "tags", None) is None:
+            return "", ""
+        tags = audio.tags
+        title = ""
+        artist = ""
+        for name in ("title", "songname", "song", "name"):
+            val = getattr(tags, name, None)
+            if val:
+                try:
+                    title = str(val[0]) if isinstance(val, (list, tuple)) else str(val)
+                except Exception:
+                    title = str(val)
+                break
+        for name in ("artist", "singer", "albumartist", "performer", "author"):
+            val = getattr(tags, name, None)
+            if val:
+                try:
+                    artist = str(val[0]) if isinstance(val, (list, tuple)) else str(val)
+                except Exception:
+                    artist = str(val)
+                break
+        if not title:
+            stem = os.path.basename(os.path.splitext(audio_path)[0])
+            if " - " in stem:
+                a, t = stem.split(" - ", 1)
+                artist = artist or a.strip()
+                title = t.strip()
+            else:
+                title = stem.strip()
+        return title.strip(), artist.strip()
+    except Exception as e:
+        logger.warning("[STATIC_COVER] read tags failed path=%s err=%s", audio_path, e)
+        return "", ""
+
+
+def _local_art_file(audio_path: str) -> str | None:
+    """查音频同目录的 .cover.jpg / .cover.png / .jpg 封面文件。"""
+    if not audio_path:
+        return None
+    stem = os.path.splitext(audio_path)[0]
+    for name in (stem + ".cover.jpg", stem + ".cover.png", stem + ".jpg", stem + ".jpeg", stem + ".png"):
+        if os.path.exists(name) and os.path.getsize(name) > 0:
+            return name
+    return None
+
+
+_ART_EXT_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
+
+
+def _local_sidecar_art_response(guid: str) -> Response | None:
+    """本地音频同目录有封面文件时直接同源返回，不必打酷狗。"""
+    audio_path = find_cache_file(guid)
+    art_path = _local_art_file(audio_path) if audio_path else None
+    if not art_path:
+        return None
+    try:
+        data = open(art_path, "rb").read()
+    except Exception as e:
+        logger.warning("[STATIC_COVER] read sidecar art failed path=%s err=%s", art_path, e)
+        return None
+    if not data:
+        return None
+    mime = _ART_EXT_MIME.get(os.path.splitext(art_path)[1].lower(), "image/jpeg")
+    logger.warning("[STATIC_COVER] sidecar art served guid=%s path=%s bytes=%d", guid, art_path, len(data))
+    return Response(
+        content=data,
+        status_code=200,
+        media_type=mime,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
 
 
 def _extract_artist_payload(value: Any) -> str:
@@ -2574,45 +2756,90 @@ async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
 
 
 async def _resolve_local_static_cover_url(request: Request, guid: str) -> str:
-    """本地 coverId=guid 时，先回查 metadata 拿到歌名/歌手，再搜酷狗并解析 union_cover。"""
+    """本地 coverId=guid 的封面兜底。
+
+    顺序：进程内缓存 → 本地同目录封面文件 → 音频标签元数据 → 搜酷狗挑同款版本取封面。
+    结果（含失败）都写入进程内缓存，避免每张封面都回源 metadata + 酷狗搜索。
+    """
     if not guid or is_online_guid(guid):
         return ""
+    cached = remembered_local_cover_url(guid)
+    if cached is not None:
+        logger.warning("[STATIC_COVER] cache hit guid=%s has_url=%s", guid, bool(cached))
+        return cached
+
+    if not CONF.get("kugou_enabled", True):
+        return ""
+
     client = get_upstream_client(request.app)
-    meta_req = client.build_request(
-        "GET",
-        f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}",
-        headers=copy_incoming_headers(request),
+    title, artist, duration = await _local_audio_metadata(request, client, guid)
+
+    # 上游 metadata 常拿不到标签信息，回退到本地音频文件标签与文件名
+    audio_path = find_cache_file(guid)
+    if (not title or not artist) and audio_path:
+        tag_title, tag_artist = _tags_from_local_audio(audio_path)
+        title = title or tag_title
+        artist = artist or tag_artist
+    if audio_path and not duration:
+        try:
+            from mutagen import File as MutagenFile
+            audio = MutagenFile(audio_path, easy=False)
+            if audio is not None:
+                duration = float(getattr(audio.info, "length", 0) or 0)
+        except Exception:
+            pass
+
+    logger.warning(
+        "[STATIC_COVER] resolve guid=%s title=%r artist=%r duration=%s audio=%s",
+        guid, title, artist, duration, audio_path,
     )
-    meta_resp = await client.send(meta_req)
-    if meta_resp.status_code != 200:
+    if not (title and artist):
+        remember_local_cover_url(guid, "")
         return ""
-    try:
-        meta_payload = meta_resp.json()
-    except Exception:
-        return ""
-    title, artist, _ = _extract_local_lyric_meta(meta_payload)
-    if not title and not artist:
-        return ""
+
     keyword = " ".join(x for x in [title, artist] if x).strip()
-    if not keyword:
+    items = await _kugou_candidates(keyword, limit=10)
+    if not items:
+        remember_local_cover_url(guid, "")
         return ""
-    result = await fetch_kugou_search(keyword, 10, page=1)
-    if not isinstance(result, dict):
-        return ""
-    items = result.get("items") or []
-    if not isinstance(items, list) or not items:
-        return ""
-    first = items[0] if isinstance(items[0], dict) else {}
-    tp = first.get("trans_param") if isinstance(first.get("trans_param"), dict) else {}
-    cover = str(
-        tp.get("union_cover")
-        or first.get("union_cover")
-        or first.get("cover_url")
-        or ""
-    ).strip()
+
+    scored = [
+        (_kugou_item_matches_local(item, title, artist, duration), item)
+        for item in items
+    ]
+    scored.sort(key=lambda x: x[0][:3], reverse=True)
+    chosen = None
+    best_key = None
+    for key, item in scored:
+        score, _, _, matched, diff, cand_title, cand_artist = key
+        if not matched:
+            continue
+        # 必须真同款：时长差 ≤5s 才算版本一致，避免封面挂到别的首版本上
+        if duration > 0 and diff > 5.0:
+            continue
+        chosen = item
+        best_key = (score, diff, cand_title, cand_artist)
+        break
+
+    if chosen is None:
+        top = items[0]
+        cover = _cover_url_from_item(top)
+        logger.warning(
+            "[STATIC_COVER] no matched version, falling back to top search result guid=%s cand_title=%r cand_artist=%r cover=%s",
+            guid, top.get("title"), top.get("artist"), cover[:80] if cover else "",
+        )
+    else:
+        cover = _cover_url_from_item(chosen)
+        logger.warning(
+            "[STATIC_COVER] matched version guid=%s cand_title=%r cand_artist=%r dur_diff=%s cover=%s",
+            guid, best_key[2], best_key[3], best_key[1], cover[:80] if cover else "",
+        )
+
     if not cover:
+        remember_local_cover_url(guid, "")
         return ""
-    return _fill_cover_size(cover, request)
+    # 返回未替换 {size} 的原始模板，由路由层按本次请求尺寸填；缓存里也只存模板
+    return cover
 
 
 async def _resolve_static_cover_guid(request: Request, subpath: str) -> tuple[str, Response | None]:
@@ -2731,17 +2958,43 @@ async def static_cover(request: Request, subpath: str = ""):
     guid, auth_resp = await _resolve_static_cover_guid(request, subpath)
     if auth_resp is not None:
         return auth_resp
-    if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
+    if not guid:
         return await forward_to_upstream(request, get_upstream_client(request.app))
-    cover = await _fetch_cover_url_by_guid(request, guid)
+
+    # 本地曲目若同目录已有封面文件，直接同源返回，不必回源 metadata 与酷狗搜索
+    if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
+        sidecar = _local_sidecar_art_response(guid)
+        if sidecar is not None:
+            return sidecar
+
+    # 本地曲库的 coverId 就是本地 guid（无 online: / playlist: 前缀）。
+    # 之前这里一律透传上游，把本地封面兜底写成了死代码；改为先查进程内缓存再走兜底解析。
+    cached_tpl = remembered_local_cover_url(guid)
+    if cached_tpl is not None:
+        cover = _fill_cover_size(cached_tpl, request) if cached_tpl else ""
+        if cover:
+            logger.warning("[STATIC_COVER] local cache hit guid=%s cover=%s", guid, cover[:80])
+        else:
+            logger.warning("[STATIC_COVER] cached empty url, forwarding upstream guid=%s", guid)
+            return await forward_to_upstream(request, get_upstream_client(request.app))
+    else:
+        cover = await _fetch_cover_url_by_guid(request, guid)
+        if cover and not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
+            remember_local_cover_url(guid, cover)
+            cover = _fill_cover_size(cover, request)
     if not cover:
         logger.warning("[STATIC_COVER] missing cover guid=%s is_kugou=%s is_online=%s", guid, is_kugou_playlist_guid(guid), is_online_guid(guid))
-        return _static_cover_placeholder_response()
+        if is_online_guid(guid) or is_kugou_playlist_guid(guid):
+            return _static_cover_placeholder_response()
+        # 本地封面解析失败则透传上游，尽量拿到飞牛自己扫描到的封面
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     response = await _fetch_cover_image_response(cover)
     if response is not None:
         return response
     logger.warning("[STATIC_COVER] image proxy failed cover=%s", cover)
-    return _static_cover_placeholder_response()
+    if is_online_guid(guid) or is_kugou_playlist_guid(guid):
+        return _static_cover_placeholder_response()
+    return await forward_to_upstream(request, get_upstream_client(request.app))
 
 
 # === online favorites ===
