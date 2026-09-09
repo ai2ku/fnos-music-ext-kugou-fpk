@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
+import re
 from datetime import datetime
 from typing import Any
 
@@ -133,8 +134,13 @@ def _singers_from_any(it: dict) -> list[dict]:
     for key in ("author_name", "authorName", "AuthorName", "singername", "singerName", "SingerName", "singer", "SingName", "singName", "artist"):
         name = str(it.get(key) or "").strip()
         if name:
-            singer_id = str(it.get("SingerID") or it.get("singerId") or "").strip()
-            return [{"name": name, "id": singer_id}]
+            raw_id = it.get("SingerID") or it.get("singerId") or it.get("authorID") or it.get("authorId")
+            # key 不存在时 .get() 返回 None，直接 str() 会得到字符串 "None"，
+            # 下游会拼出 online:kugou:artist:None 的脏 guid
+            singer_id = str(raw_id).strip() if raw_id not in (None, "") else ""
+            # /artist/audios 的 author_name 常是多人："安苏羽、橙大蕾蕾" / "IN-K、安苏羽、傅梦彤"
+            parts = [p.strip() for p in re.split(r"[、,，/]", name) if p.strip()]
+            return [{"name": p, "id": singer_id} for p in parts]
     return []
 
 
@@ -199,6 +205,27 @@ def _cover_from_any(it: dict) -> str:
     return ""
 
 
+def _pick_ci(it: dict, *keys: str, default: str = "") -> str:
+    """大小写/命名不敏感取字段：先看精确 key，再按小写归一化匹配。
+
+    KuGouMusicApi 同一接口的回参在不同鉴权状态下字段风格不同
+    （filehash / fileHash / FileHash；songname / songName / OriSongName 等），
+    精确匹配会让整首歌被丢弃，所以映射统一走这里。
+    """
+    if not isinstance(it, dict):
+        return default
+    for key in keys:
+        value = it.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    lowered = {str(k).lower(): v for k, v in it.items()}
+    for key in keys:
+        value = lowered.get(key.lower())
+        if value not in (None, ""):
+            return str(value).strip()
+    return default
+
+
 def _size_bitrate_from_any(it: dict) -> tuple[int, int]:
     """统一大小/比特率：歌单 size/bitrate，搜索兼容 FileSize/Bitrate。"""
     size = _to_int(it.get("size") or it.get("FileSize") or it.get("fileSize") or it.get("filesize") or it.get("fileSize") or 0)
@@ -213,6 +240,64 @@ def search_item_to_raw(it: dict) -> dict:
     # 歌单 track/all 的真实字段完整，直接走精确路径。
     if isinstance(it.get("singerinfo"), list) or isinstance(it.get("albuminfo"), dict):
         return track_item_to_raw(it)
+
+    # /artist/audios 的真实回参（必须先于 /privilege/lite 判断！两者都有 hash 键，
+    # 先判 lite 会读不到字段导致标题/歌手/时长全空）。
+    # 真实字段：hash / audio_name / author_name(可多人，顿号分隔) / album_id / album_name /
+    # timelength(毫秒) / filesize / bitrate / extname / publish_date / songid / audio_id。
+    # 封面不在顶层，在 trans_param.union_cover（带 {size} 占位符）。
+    # 兼容另一种风格：filehash / songname / playTime(毫秒)。
+    if "audio_name" in it or (it.get("author_name") not in (None, "") and "timelength" in it):
+        sid = _pick_ci(it, "hash", "filehash", "hash_128", "FileHash")
+        if not sid:
+            return {}
+        singers = _singers_from_any(it)
+        # author_name 可能是多人："安苏羽、橙大蕾蕾" -> 拆成多个 artist
+        if len(singers) <= 1:
+            author_name = _pick_ci(it, "author_name", "authorName", "singername")
+            if author_name and (not singers or not singers[0].get("name")):
+                first_id = str(it.get("authorID") or it.get("authorId") or it.get("SingerID") or "").strip()
+                singers = [
+                    {"name": part.strip(), "id": first_id}
+                    for part in re.split(r"[、,，/]", author_name)
+                    if part.strip()
+                ]
+        singer_name = "、".join(
+            str(x.get("name") or "").strip() for x in singers if isinstance(x, dict) and str(x.get("name") or "").strip()
+        )
+        album_name = _pick_ci(it, "album_name", "albumName", "albumname")
+        raw_name = _pick_ci(it, "audio_name", "songname", "name", "OriSongName")
+        # 注意：_strip_singer_prefix_from_name 期望 list[str]，不是 dict 列表
+        title = _strip_singer_prefix_from_name(raw_name, [singer_name] if singer_name else [], album_name)
+        # timelength / playTime 都是毫秒
+        duration_ms = _to_int(it.get("timelength") or it.get("playTime") or it.get("timelength_128") or 0)
+        if not duration_ms:
+            duration_ms = _to_int(it.get("duration") or 0)
+        duration = duration_ms / 1000.0 if duration_ms > 1000 else _to_float(duration_ms)
+        ext = str(it.get("extname") or it.get("quality") or "mp3").strip().lower() or "mp3"
+        file_size = _to_int(it.get("filesize") or it.get("filesize_128") or 0)
+        bitrate = _to_int(it.get("bitrate") or 0)
+        if not duration and file_size and bitrate:
+            duration = file_size * 8 / (bitrate * 1000)
+        cover = _cover_from_any(it)
+        return {
+            "id": f"kugou:{sid}",
+            "source": "kugou",
+            "hash": sid,
+            "title": title,
+            "artist": singer_name,
+            "artists": singers,
+            "album": album_name,
+            "album_id": _pick_ci(it, "album_id", "albumId"),
+            "duration_s": duration,
+            "ext": ext,
+            "cover_url": cover,
+            "union_cover": cover,
+            "file_size": file_size,
+            "bitrate": bitrate,
+            "lyric": "",
+            "release_date": _pick_ci(it, "publish_date", "publishDate", "release_date"),
+        }
 
     # /privilege/lite 的真实回参按小写字段精确映射。
     if "hash" in it or "singername" in it or "albumname" in it:

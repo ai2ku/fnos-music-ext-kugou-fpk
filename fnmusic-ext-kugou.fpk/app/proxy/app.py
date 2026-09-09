@@ -1187,6 +1187,15 @@ def build_online_track(item: dict) -> dict:
     created_at = int(item.get("createdAt") or time.time())
     updated_at = int(item.get("updatedAt") or created_at)
     album_id = item.get("album_id") or ""
+    release_date = str(item.get("release_date") or "").strip() or None
+    year: int | None = None
+    if release_date:
+        try:
+            y = int(str(release_date)[:4])
+            if 1900 <= y <= 2100:
+                year = y
+        except (TypeError, ValueError):
+            year = None
 
     raw_artists = item.get("artists")
     artists_list: list[dict] = []
@@ -1216,11 +1225,14 @@ def build_online_track(item: dict) -> dict:
             }
         ]
 
+    # KuGouMusicApi 没有 album 详情接口，且 /static/cover 无法解析 kugou:album:<id>。
+    # 酷狗单曲 cover 本身就是专辑封面（album/v8/<albumid>_{size}.jpg），
+    # 复用曲目 guid 走 /static/cover 的 online:kugou:<hash> 解析链路。
     album_obj = {
-        "guid": f"kugou:album:{album_id}" if album_id not in ("", None) else album_guid,
+        "guid": f"online:kugou:album:{album_id}" if album_id not in ("", None) else album_guid,
         "name": album,
-        "coverId": f"kugou:album:{album_id}" if album_id not in ("", None) else None,
-        "releaseDate": None,
+        "coverId": guid,
+        "releaseDate": release_date,
         "barcode": None,
         "createdAt": created_at,
         "updatedAt": updated_at,
@@ -1243,7 +1255,7 @@ def build_online_track(item: dict) -> dict:
         "guid": guid,
         "title": title,
         "coverId": guid,
-        "year": None,
+        "year": year,
         "discNo": None,
         "trackNo": None,
         "isrc": None,
