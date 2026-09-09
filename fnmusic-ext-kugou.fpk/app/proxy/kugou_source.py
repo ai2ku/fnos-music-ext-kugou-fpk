@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -129,7 +130,7 @@ def _singers_from_any(it: dict) -> list[dict]:
                 if name:
                     artists.append({"name": name, "id": ""})
         return artists
-    for key in ("singername", "singerName", "SingerName", "singer", "SingName", "singName", "artist"):
+    for key in ("author_name", "authorName", "AuthorName", "singername", "singerName", "SingerName", "singer", "SingName", "singName", "artist"):
         name = str(it.get(key) or "").strip()
         if name:
             singer_id = str(it.get("SingerID") or it.get("singerId") or "").strip()
@@ -149,7 +150,7 @@ def _album_info_from_any(it: dict) -> dict:
             if it.get("AlbumName") or it.get("albumName") or it.get("albumname"):
                 album_info["name"] = str(it.get("AlbumName") or it.get("albumName") or it.get("albumname")).strip()
             return album_info
-    for key in ("AlbumName", "albumname", "albumName", "AlbumName", "album", "Album"):
+    for key in ("AlbumName", "albumname", "albumName", "album_name", "album", "Album"):
         value = it.get(key)
         if isinstance(value, dict):
             return value
@@ -160,9 +161,9 @@ def _album_info_from_any(it: dict) -> dict:
 
 
 def _duration_seconds_from_any(it: dict) -> float:
-    """统一时长：优先 timelen(ms)，搜索旧字段 duration/playTime 通常是秒。"""
-    if any(k in it for k in ("timelen", "timeLen", "TimeLen")):
-        return _timelen_to_seconds(it.get("timelen") or it.get("timeLen") or it.get("TimeLen"))
+    """统一时长：优先 timelen/timelength(ms)，搜索旧字段 duration/playTime 通常是秒。"""
+    if any(k in it for k in ("timelen", "timeLen", "TimeLen", "timelength", "timelength_ms", "timeLength", "TimeLength")):
+        return _timelen_to_seconds(it.get("timelen") or it.get("timeLen") or it.get("TimeLen") or it.get("timelength") or it.get("timelength_ms") or it.get("timeLength") or it.get("TimeLength"))
     value = it.get("duration") or it.get("Duration") or it.get("playTime") or it.get("PlayTime") or 0
     return _to_float(value)
 
@@ -185,7 +186,7 @@ def _format_from_any(it: dict) -> str:
 
 def _cover_from_any(it: dict) -> str:
     """统一封面：保留 {size} 占位符，供封面接口动态替换。"""
-    for key in ("cover", "Image", "image", "Img", "img", "AlbumImg", "albumImg", "AlbumImage", "albumImage", "PicUrl", "picUrl", "coverImg", "coverImgUrl"):
+    for key in ("cover", "Image", "image", "Img", "img", "AlbumImg", "albumImg", "AlbumImage", "albumImage", "PicUrl", "picUrl", "coverImg", "coverImgUrl", "AlbumImage", "albumImage", "albumImg", "albumimg", "album_img"):
         value = it.get(key)
         if value not in (None, ""):
             return str(value).strip()
@@ -200,7 +201,7 @@ def _cover_from_any(it: dict) -> str:
 
 def _size_bitrate_from_any(it: dict) -> tuple[int, int]:
     """统一大小/比特率：歌单 size/bitrate，搜索兼容 FileSize/Bitrate。"""
-    size = _to_int(it.get("size") or it.get("FileSize") or it.get("fileSize") or 0)
+    size = _to_int(it.get("size") or it.get("FileSize") or it.get("fileSize") or it.get("filesize") or it.get("fileSize") or 0)
     bitrate = _to_int(it.get("bitrate") or it.get("Bitrate") or it.get("BitRate") or it.get("bitRate") or 0)
     return size, bitrate
 
@@ -302,6 +303,58 @@ async def search(keyword: str, limit: int = 30, page: int = 1) -> dict:
         "page": page,
         "pagesize": limit,
     }
+
+
+async def get_artist_audios(artist_id: int | str, sort: str = "hot", page: int = 1, pagesize: int = 60) -> dict:
+    """调 KuGouMusicApi /artist/audios，返回统一结果对象。
+
+    接口：/artist/audios?id=3520&sort=hot&page=1&pagesize=60
+    回参：{"total": n, "error_code": 0, "data": [...]}。
+    """
+    aid = str(artist_id or "").strip()
+    if not aid:
+        return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+    try:
+        async with _client() as c:
+            r = await c.get(
+                "/artist/audios",
+                params={"id": aid, "sort": sort or "hot", "page": page, "pagesize": pagesize},
+            )
+            if r.status_code != 200:
+                logger.warning("[KUGOU] artist/audios http=%s aid=%s body=%r", r.status_code, aid, r.text[:200])
+                return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+            body = r.json()
+            if not isinstance(body, dict):
+                logger.warning("[KUGOU] artist/audios body type=%s aid=%s body=%r", type(body).__name__, aid, str(body)[:200])
+                return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+            data = body.get("data") or []
+            if isinstance(data, dict):
+                data = data.get("list") or data.get("items") or []
+            raw_items = data if isinstance(data, list) else []
+            items: list[dict] = []
+            for it in raw_items:
+                if not isinstance(it, dict):
+                    continue
+                raw_item = search_item_to_raw(it)
+                if not raw_item:
+                    continue
+                raw_item["release_date"] = str(it.get("publish_date") or it.get("publishDate") or "").strip()
+                items.append(raw_item)
+                _remember_song(raw_item)
+            try:
+                total = int(body.get("total") or 0)
+            except (TypeError, ValueError):
+                total = len(items)
+            return {
+                "items": items,
+                "total": max(total, len(items)),
+                "page": page,
+                "pagesize": pagesize,
+                "artist_id": aid,
+            }
+    except Exception as e:
+        logger.warning("[KUGOU] artist/audios error aid=%s: %s", aid, e)
+        return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
 
 
 def _field(it: dict, keys: tuple[str, ...], default: Any = "") -> Any:

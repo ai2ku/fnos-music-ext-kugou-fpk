@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote, urlencode, parse_qs
 from uuid import uuid4
+from datetime import datetime
 from pathlib import Path
 import tempfile
 
@@ -196,6 +198,121 @@ async def fetch_kugou_user_playlist_bundles() -> list[dict]:
         logger.warning("[KUGOU_PLAYLIST] fetch failed: %s", e)
         return []
     return [build_kugou_playlist_obj(x) for x in (res.get("items") or []) if isinstance(x, dict)]
+
+
+def stable_hash64(value: str) -> str:
+    """稳定生成 64 位小写 hex，用来给酷狗数字 ID 补齐飞牛 GUID。"""
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+    return digest[:64]
+
+
+def kugou_artist_guid(artist_id: int | str) -> str:
+    return stable_hash64(f"kugou:artist:{artist_id}")
+
+
+def kugou_album_guid(album_id: int | str) -> str:
+    return stable_hash64(f"kugou:album:{album_id}")
+
+
+def kugou_artist_cover_guid(artist_id: int | str) -> str:
+    return "artist_" + stable_hash64(f"kugou:artist:cover:{artist_id}")
+
+
+def kugou_album_cover_guid(album_id: int | str) -> str:
+    return "album_" + stable_hash64(f"kugou:album:cover:{album_id}")
+
+
+def parse_ts_to_unix(value: Any) -> int:
+    """把 KuGouMusicApi 时间字段转成 Unix 秒；已是秒级时间戳则直接返回。"""
+    if value in (None, ""):
+        return int(time.time())
+    if isinstance(value, (int, float)):
+        ts = int(value)
+        return ts if ts > 1000000000 else ts
+    text = str(value).strip().replace("T", " ").replace("Z", "")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+        try:
+            return int(datetime.strptime(text[:19], fmt).timestamp())
+        except (TypeError, ValueError):
+            continue
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return int(time.time())
+
+
+async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int = 1, size: int = 60) -> dict | None:
+    """酷狗歌手作品 -> 飞牛 album/artist-detail/list 的专辑列表。"""
+    artist_id = str(artist_guid or "").strip()
+    if not artist_id:
+        return None
+    if len(artist_id) == 64:
+        # 当前只接入酷狗数字 ID；稳定 hash GUID 没有反查表，不猜原 ID。
+        return None
+    try:
+        result = await kugou_source.get_artist_audios(artist_id, sort="hot", page=page, pagesize=size)
+    except Exception as e:
+        logger.warning("[KUGOU_ARTIST_ALBUM] artist_id=%s error=%s", artist_id, e)
+        return None
+    items = result.get("items") or []
+    seen: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        album_id = str(item.get("album_id") or item.get("albumId") or item.get("album_id") or "").strip()
+        album_name = str(item.get("album") or item.get("albumName") or item.get("album_name") or "").strip()
+        if not album_name:
+            continue
+        release_date = str(item.get("release_date") or "").strip() or None
+        track_count = seen.get(album_name, {}).get("trackCount", 0) + 1
+        album_guid = kugou_album_guid(album_id or album_name)
+        artist_name = str(item.get("artist") or "").strip()
+        ts = parse_ts_to_unix(item.get("release_date") or item.get("releaseDate") or item.get("publish_date"))
+        entry = seen.setdefault(album_name, {
+            "guid": album_guid,
+            "name": album_name,
+            "coverId": kugou_album_cover_guid(album_id or album_name),
+            "releaseDate": release_date,
+            "barcode": None,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "artists": [
+                {
+                    "guid": artist_id,
+                    "name": artist_name,
+                    "coverId": kugou_artist_cover_guid(artist_id),
+                    "createdAt": ts,
+                    "updatedAt": ts,
+                }
+            ],
+            "trackCount": track_count,
+        })
+        if release_date and not entry.get("releaseDate"):
+            entry["releaseDate"] = release_date
+        entry["trackCount"] = track_count
+        if artist_name and not (entry.get("artists") or [{}])[0].get("name"):
+            entry["artists"] = [
+                {
+                    "guid": artist_id,
+                    "name": artist_name,
+                    "coverId": kugou_artist_cover_guid(artist_id),
+                    "createdAt": ts,
+                    "updatedAt": ts,
+                }
+            ]
+    if not seen:
+        return {
+            "code": 0,
+            "msg": "",
+            "data": {"list": [], "total": 0, "sort": "newTrackAddedAt,desc"},
+        }
+    album_list = list(seen.values())
+    return {
+        "code": 0,
+        "msg": "",
+        "data": {"list": album_list, "total": len(album_list), "sort": "newTrackAddedAt,desc"},
+    }
 
 
 async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size: int = 50) -> dict:
@@ -2869,6 +2986,27 @@ async def favorite_track_list(request: Request):
 
 
 # === daily recommend + play history ===
+
+
+@app.get("/music/api/v1/album/artist-detail/list")
+@app.get("/music/api/v1/album/artist-detail/list/{subpath:path}")
+async def album_artist_detail_list(request: Request):
+    """/album/artist-detail/list：酷狗歌手作品聚合为飞牛专辑列表。"""
+    artist_guid = str(request.query_params.get("artistGUID") or request.query_params.get("artistGuid") or request.query_params.get("artist_id") or request.query_params.get("artistId") or "").strip()
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = min(500, max(1, int(request.query_params.get("size") or 60)))
+    except (TypeError, ValueError):
+        size = 60
+    if not artist_guid:
+        return JSONResponse(content={"code": 400, "msg": "artistGUID required", "data": None})
+    kugou_payload = await fetch_kugou_artist_album_list(request.app, artist_guid, page=page, size=size)
+    if isinstance(kugou_payload, dict):
+        return JSONResponse(content=kugou_payload, status_code=200)
+    return await forward_to_upstream(request, get_upstream_client(request.app))
 
 
 @app.get("/music/api/v1/playlist/list")
