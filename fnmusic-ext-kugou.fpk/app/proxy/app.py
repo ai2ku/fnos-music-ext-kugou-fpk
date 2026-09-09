@@ -229,8 +229,8 @@ def parse_kugou_artist_guid(raw_guid: str) -> tuple[str, str]:
     如果后续使用稳定 hash GUID，则原样返回，上层再决定是否反查上游。
     """
     s = str(raw_guid or "").strip()
-    if s.startswith("kugou:artist:"):
-        return s[len("kugou:artist:"):], "kugou_artist"
+    if s.startswith("online:kugou:artist:"):
+        return s[len("online:kugou:artist:"):], "kugou_artist"
     if len(s) == 64 and not s.isdigit():
         return s, "hash_guid"
     return s, "id"
@@ -357,13 +357,14 @@ async def fetch_kugou_artist_detail(app_state, artist_guid: str) -> dict | None:
             album_ids.add(aid or album_name)
     if not name:
         return None
+    guid = f"online:kugou:artist:{artist_id}"
     return {
         "code": 0,
         "msg": "",
         "data": {
-            "guid": kugou_artist_guid(artist_id),
+            "guid": guid,
             "name": name,
-            "coverId": kugou_artist_cover_guid(artist_id),
+            "coverId": guid,
             "createdAt": now,
             "updatedAt": now,
             "trackCount": len(items),
@@ -990,9 +991,9 @@ def build_online_track(item: dict) -> dict:
                 continue
             raw_id = str(raw_artist.get("id") or "").strip()
             artists_list.append({
-                "guid": f"kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
+                "guid": f"online:kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
                 "name": raw_name,
-                "coverId": f"kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
+                "coverId": f"online:kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
                 "createdAt": created_at,
                 "updatedAt": updated_at,
             })
