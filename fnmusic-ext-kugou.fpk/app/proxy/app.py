@@ -135,17 +135,23 @@ def stamp_kugou_playlist_tracks(items: list[dict], now: float | None = None) -> 
     for it in items:
         if not isinstance(it, dict):
             continue
-        title = str(_kugou_playlist_field(it, ("songName", "title", "fileName", "name")) or "").strip()
-        artist = str(_kugou_playlist_field(it, ("singerName", "artist", "singName", "singer")) or "").strip()
-        album = str(_kugou_playlist_field(it, ("albumName", "album", "albumName", "albumName")) or "").strip()
-        dur = _kugou_playlist_field(it, ("duration", "playTime", "Duration", "PlayTime"), 0)
+        # /playlist/track/all 的真实字段：FileName/SingerName/AlbumName/Duration/Image...
+        raw = kugou_source.track_item_to_raw(it)
+        title = str(raw.get("title") or "").strip()
+        artist = str(raw.get("artist") or "").strip()
+        album = str(raw.get("album") or "").strip()
+        dur = raw.get("duration_s") or 0
         try:
             dur_s = float(dur or 0)
         except (TypeError, ValueError):
             dur_s = 0.0
-        ext = str(_kugou_playlist_field(it, ("ExtName", "songType", "ext"), "mp3") or "mp3").strip().lower() or "mp3"
-        hashv = str(_kugou_playlist_field(it, ("hash", "songhash", "songHash", "FileHash", "fileHash", "id")) or "").strip()
+        ext = str(raw.get("ext") or "mp3").strip().lower() or "mp3"
+        hashv = str(raw.get("hash") or "").strip()
         guid = online_guid_from_item({"id": f"kugou:{hashv}", "source": "kugou"}) if hashv else ""
+        cover = str(raw.get("cover_url") or "").strip()
+        # 酷狗 URL 常见格式：.../Image/{size}x{size}/xxx.jpg；若缺少 size 则按前端尺寸补成 240x240
+        if cover and "{size}" in cover:
+            cover = cover.replace("{size}", "240")
         item = {
             "guid": guid,
             "id": guid,
@@ -159,14 +165,16 @@ def stamp_kugou_playlist_tracks(items: list[dict], now: float | None = None) -> 
                 "coverId": guid,
                 "artists": [{"name": artist, "guid": f"{guid}:artist"}] if artist else [],
             },
-            "albumName": album,
             "duration": int(dur_s * 1000),
             "duration_ms": int(dur_s * 1000),
             "durationMs": int(dur_s * 1000),
             "duration_s": dur_s,
             "ext": ext,
             "format": ext,
-            "coverId": guid or _kugou_playlist_field(it, ("pic", "cover", "image"), guid),
+            "coverId": guid,
+            "coverUrl": cover,
+            "cover_url": cover,
+            "union_cover": cover,
             "source": "kugou",
             "is_online": bool(guid),
             "createdAt": ts,
@@ -200,7 +208,7 @@ async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size:
         async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
             auth = kugou_source._auth_header()
             headers = {"Authorization": auth} if auth else {}
-            r = await c.get("/playlist", params={"id": pid, "page": page, "pagesize": size}, headers=headers)
+            r = await c.get("/playlist/track/all", params={"id": pid, "page": page, "pagesize": size}, headers=headers)
             if r.status_code != 200:
                 return {"items": [], "total": 0, "page": page, "pagesize": size}
             data = r.json()
@@ -211,12 +219,20 @@ async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size:
             if isinstance(payload, list):
                 payload = {"list": payload}
             raw_list = None
-            for key in ("list", "items", "lists", "data", "songs", "records"):
+            for key in ("list", "items", "lists", "data", "songs", "records", "info"):
                 v = payload.get(key)
                 if isinstance(v, list):
                     raw_list = v
                     break
+            if raw_list is None and isinstance(payload, dict):
+                for v in payload.values():
+                    if isinstance(v, list):
+                        raw_list = v
+                        break
             total = int(payload.get("total") or payload.get("count") or len(raw_list or []))
+            logger.warning("[KUGOU_PLAYLIST_TRACKS] guid=%s status=%s payload_keys=%s raw_len=%s first_keys=%s",
+                           guid, st, list(payload.keys())[:20] if isinstance(payload, dict) else type(payload).__name__,
+                           len(raw_list or []), list((raw_list[0].keys()) if raw_list and isinstance(raw_list[0], dict) else [])[:30])
             return {"items": raw_list or [], "total": total, "page": page, "pagesize": size}
     except Exception as e:
         logger.warning("[KUGOU_PLAYLIST_TRACKS] guid=%s err=%s", guid, e)
@@ -750,98 +766,113 @@ def source_from_online_guid(guid: str) -> str:
     return parts[1] if len(parts) >= 3 else ""
 
 def build_online_track(item: dict) -> dict:
-    """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
+    """对齐飞牛音乐列表标准格式：只返回飞牛标准字段。"""
     guid = online_guid_from_item(item)
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
+
     duration_s = item.get("duration_s") or 0
     try:
         duration_s = float(duration_s)
     except (TypeError, ValueError):
         duration_s = 0
     duration_ms = int(duration_s * 1000)
+
     ext = str(item.get("ext") or "mp3") or "mp3"
     play_format = play_format_from_ext(ext)
+
     file_size = item.get("file_size") or 0
     try:
         file_size = int(file_size or 0)
     except (TypeError, ValueError):
         file_size = 0
-    # bitrate：优先用 item 自带的 bitrate（Kugou API 返回，单位 bps）
+
     bitrate = item.get("bitrate") or 0
     try:
         bitrate = int(bitrate or 0)
     except (TypeError, ValueError):
         bitrate = 0
-    # 若 bitrate 为空则根据 format 选默认值；Kugou 128/320 直接乘 1000
     if not bitrate:
-        if play_format in ("flac", "wav", "ape", "wv"):
-            bitrate = 1411000
-        else:
-            bitrate = 320000
-    else:
-        # 如果单位是 kbps（小于 1000），转成 bps
-        if bitrate < 1000:
-            bitrate *= 1000
-    cover = str(item.get("cover_url") or "")
-    # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
-    spec_path = f"online/{src}/{guid}.{play_format}"
+        bitrate = 1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000
+    elif bitrate < 1000:
+        bitrate *= 1000
 
-    artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
-    # 飞牛前端搜索列表读 album.union_cover 作为封面
+    spec_path = f"online/{src}/{guid}.{play_format}"
+    album_guid = f"{guid}:album"
+    created_at = int(item.get("createdAt") or time.time())
+    updated_at = int(item.get("updatedAt") or created_at)
+    album_id = item.get("album_id") or ""
+
+    raw_artists = item.get("artists")
+    artists_list: list[dict] = []
+    if isinstance(raw_artists, list):
+        for idx, raw_artist in enumerate(raw_artists):
+            if not isinstance(raw_artist, dict):
+                continue
+            raw_name = str(raw_artist.get("name") or "").strip()
+            if not raw_name:
+                continue
+            raw_id = str(raw_artist.get("id") or "").strip()
+            artists_list.append({
+                "guid": f"kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
+                "name": raw_name,
+                "coverId": f"kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+            })
+    elif artist:
+        artists_list = [
+            {
+                "guid": f"{guid}:artist:1",
+                "name": artist,
+                "coverId": None,
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+            }
+        ]
+
     album_obj = {
+        "guid": f"kugou:album:{album_id}" if album_id not in ("", None) else album_guid,
         "name": album,
-        "guid": f"{guid}:album",
-        "artists": artists_list,
-        "coverId": guid,
+        "coverId": f"kugou:album:{album_id}" if album_id not in ("", None) else None,
+        "releaseDate": None,
+        "barcode": None,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
     }
+
     audio_spec = {
-        "path": spec_path,
-        "format": "酷狗源" if src == "kugou" else play_format,
-        "codec": play_format,
-        "container": play_format,
-        "duration": duration_ms,
-        "size": file_size,
-        "channel": 2,
+        "bitDepth": 16,
         "sampleRate": 44100,
-        "bitDepth": 16 if play_format in ("wav", "flac", "aiff") else None,
+        "channel": 2,
         "bitrate": bitrate,
+        "codec": "酷狗源" if src == "kugou" else play_format,
+        "container": "",
+        "duration": duration_ms,
+        "format": "酷狗源" if src == "kugou" else play_format,
+        "path": spec_path,
+        "size": file_size,
     }
-    audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
 
     return {
         "guid": guid,
-        "id": guid,
         "title": title,
-        "name": title,
-        "artist": artist,
-        "artists": artists_list,
-        "album": album_obj,
-        "albumName": album,
-        "audioSpec": audio_spec,
-        "duration": duration_ms,
-        "duration_ms": duration_ms,
-        "durationMs": duration_ms,
-        "duration_s": duration_s,
-        "codec": play_format,
-        "codecName": play_format,
-        "format": play_format,
-        "ext": ext,
-        "size": file_size,
-        "file_size": file_size,
-        "bitrate": bitrate,
-        "sizeStr": f"{file_size / 1024 / 1024:.1f} MB" if file_size else "",
-        "fileSizeStr": f"{file_size / 1024 / 1024:.1f} MB" if file_size else "",
-        "bitrateStr": f"{bitrate // 1000}kbps" if bitrate else "320kbps",
         "coverId": guid,
-        "source": src,
-        "is_online": True,
-        "isFavorite": False,
+        "year": None,
+        "discNo": None,
+        "trackNo": None,
+        "isrc": None,
+        "duration": duration_ms,
         "isCue": False,
-        "hasLyric": bool(item.get("lyric")),
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "album": album_obj,
+        "artists": artists_list,
         "genres": [],
+        "audioSpec": audio_spec,
+        "isFavorite": False,
         "accessStatus": 0,
     }
 
@@ -2578,7 +2609,7 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
         }
     ] if artist_name else []
 
-    album_name = vo.get("albumName") or (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
+    album_name = (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
     album_obj = {
         "guid": f"{guid}:album",
         "name": album_name,
@@ -3013,12 +3044,14 @@ async def playlist_track_list(request: Request):
     if size < 1:
         size = 50
     payload = await fetch_kugou_playlist_tracks(request.app, guid, page=page, size=size)
-    tracks = stamp_kugou_playlist_tracks(list(payload.get("items") or []))
+    raw_tracks = [kugou_source.track_item_to_raw(it) for it in (payload.get("items") or []) if isinstance(it, dict)]
+    raw_tracks = [x for x in raw_tracks if x]
+    tracks = [build_online_track(x) for x in raw_tracks]
     return JSONResponse(
         content={
             "code": 0,
             "msg": "ok",
-            "data": {"list": tracks, "total": int(payload.get("total") or len(tracks)), "sort": request.query_params.get("sort") or ""},
+            "data": {"list": tracks, "total": int(payload.get("total") or len(tracks))},
         }
     )
 

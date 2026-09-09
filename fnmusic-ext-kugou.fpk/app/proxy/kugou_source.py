@@ -102,6 +102,146 @@ def clear_index() -> None:
 # 搜索
 # ============================================================
 
+def _singers_from_any(it: dict) -> list[dict]:
+    """统一歌手数组提取：优先 singerinfo，搜索格式优先 data.lists[].Singers。"""
+    raw_singers = it.get("Singers") or it.get("singers") or it.get("singerinfo")
+    if isinstance(raw_singers, str):
+        name = raw_singers.strip()
+        return [{"name": name, "id": ""}] if name else []
+    if isinstance(it.get("singerinfo"), list):
+        artists = []
+        for singer in it.get("singerinfo"):
+            if isinstance(singer, dict):
+                name = str(singer.get("name") or "").strip()
+                if name:
+                    artists.append(singer)
+        return artists
+    if isinstance(raw_singers, list):
+        artists = []
+        for singer in raw_singers:
+            if isinstance(singer, dict):
+                name = str(singer.get("Name") or singer.get("name") or "").strip()
+                singer_id = str(singer.get("ID") or singer.get("id") or singer.get("SingerID") or singer.get("singerId") or "").strip()
+                if name:
+                    artists.append({"name": name, "id": singer_id})
+            else:
+                name = str(singer or "").strip()
+                if name:
+                    artists.append({"name": name, "id": ""})
+        return artists
+    for key in ("singername", "singerName", "SingerName", "singer", "SingName", "singName", "artist"):
+        name = str(it.get(key) or "").strip()
+        if name:
+            singer_id = str(it.get("SingerID") or it.get("singerId") or "").strip()
+            return [{"name": name, "id": singer_id}]
+    return []
+
+
+def _album_info_from_any(it: dict) -> dict:
+    """统一专辑信息提取：优先 albuminfo，搜索格式使用 AlbumID/AlbumName。"""
+    if isinstance(it.get("albuminfo"), dict):
+        return it.get("albuminfo") or {}
+    album_name = ""
+    for key in ("AlbumID", "albumID", "albumId", "AlbumId", "album_id"):
+        album_id = str(it.get(key) or "").strip()
+        if album_id:
+            album_info = {"id": album_id}
+            if it.get("AlbumName") or it.get("albumName") or it.get("albumname"):
+                album_info["name"] = str(it.get("AlbumName") or it.get("albumName") or it.get("albumname")).strip()
+            return album_info
+    for key in ("AlbumName", "albumname", "albumName", "AlbumName", "album", "Album"):
+        value = it.get(key)
+        if isinstance(value, dict):
+            return value
+        if value not in (None, ""):
+            album_name = str(value).strip()
+            break
+    return {"name": album_name, "id": str(it.get("AlbumID") or it.get("albumID") or it.get("albumId") or "")} if (album_name or str(it.get("AlbumID") or it.get("albumID") or it.get("albumId") or "")) else {}
+
+
+def _duration_seconds_from_any(it: dict) -> float:
+    """统一时长：优先 timelen(ms)，搜索旧字段 duration/playTime 通常是秒。"""
+    if any(k in it for k in ("timelen", "timeLen", "TimeLen")):
+        return _timelen_to_seconds(it.get("timelen") or it.get("timeLen") or it.get("TimeLen"))
+    value = it.get("duration") or it.get("Duration") or it.get("playTime") or it.get("PlayTime") or 0
+    return _to_float(value)
+
+
+def _song_name_from_any(it: dict, album_name: str) -> str:
+    """统一歌名：先按酷狗“歌手 - 歌名”去掉歌手前缀。"""
+    raw_name = it.get("name") or it.get("SongName") or it.get("songname") or it.get("songName") or it.get("FileName") or it.get("fileName") or it.get("OriSongName") or it.get("title") or it.get("song") or ""
+    singer_names = [str(x.get("name") or "").strip() for x in _singers_from_any(it) if isinstance(x, dict)]
+    return _strip_singer_prefix_from_name(str(raw_name), singer_names, album_name)
+
+
+def _format_from_any(it: dict) -> str:
+    """统一格式：优先 extname，兼容旧 ExtName/songType/format。"""
+    for key in ("extname", "extName", "ExtName", "songType", "format", "ext"):
+        value = it.get(key)
+        if value not in (None, ""):
+            return str(value).strip().lower() or "mp3"
+    return "mp3"
+
+
+def _cover_from_any(it: dict) -> str:
+    """统一封面：保留 {size} 占位符，供封面接口动态替换。"""
+    for key in ("cover", "Image", "image", "Img", "img", "AlbumImg", "albumImg", "AlbumImage", "albumImage", "PicUrl", "picUrl", "coverImg", "coverImgUrl"):
+        value = it.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    trans_param = it.get("trans_param")
+    if isinstance(trans_param, dict):
+        for key in ("union_cover", "UnionCover", "cover", "image"):
+            value = trans_param.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+    return ""
+
+
+def _size_bitrate_from_any(it: dict) -> tuple[int, int]:
+    """统一大小/比特率：歌单 size/bitrate，搜索兼容 FileSize/Bitrate。"""
+    size = _to_int(it.get("size") or it.get("FileSize") or it.get("fileSize") or 0)
+    bitrate = _to_int(it.get("bitrate") or it.get("Bitrate") or it.get("BitRate") or it.get("bitRate") or 0)
+    return size, bitrate
+
+
+def search_item_to_raw(it: dict) -> dict:
+    """把酷狗搜索/歌单歌曲对象都转成统一内部格式。"""
+    if not isinstance(it, dict):
+        return {}
+    # 歌单 track/all 的真实字段完整，直接走精确路径。
+    if isinstance(it.get("singerinfo"), list) or isinstance(it.get("albuminfo"), dict):
+        return track_item_to_raw(it)
+    sid = str(it.get("hash") or it.get("songhash") or it.get("songHash") or it.get("FileHash") or it.get("fileHash") or "").strip()
+    if not sid:
+        return {}
+    album_info = _album_info_from_any(it)
+    album_name = _album_name_from_albuminfo(album_info)
+    artists = _singers_from_any(it)
+    title = _song_name_from_any(it, album_name)
+    artist = "、".join(str(x.get("name") or "").strip() for x in artists)
+    ext = _format_from_any(it)
+    cover = _cover_from_any(it)
+    file_size, bitrate = _size_bitrate_from_any(it)
+    return {
+        "id": f"kugou:{sid}",
+        "source": "kugou",
+        "hash": sid,
+        "title": title,
+        "artist": artist,
+        "artists": artists,
+        "album": album_name,
+        "album_id": album_info.get("id", ""),
+        "duration_s": _duration_seconds_from_any(it),
+        "ext": ext,
+        "cover_url": cover,
+        "union_cover": cover,
+        "file_size": file_size,
+        "bitrate": bitrate,
+        "lyric": "",
+    }
+
+
 async def search(keyword: str, limit: int = 30, page: int = 1) -> dict:
     """调 KuGouMusicApi /search，返回统一结果对象，包含 items 和 total。"""
     if not keyword:
@@ -111,8 +251,8 @@ async def search(keyword: str, limit: int = 30, page: int = 1) -> dict:
                    keyword, limit, len(auth or ""))
     try:
         async with _client() as c:
-            lists = []
-            raw = {}
+            lists: list[dict] = []
+            raw: dict = {}
             last_body = ""
             for attempt in range(5):  # 5 次重试，应对 data:null
                 r = await c.get(
@@ -145,80 +285,11 @@ async def search(keyword: str, limit: int = 30, page: int = 1) -> dict:
     for it in lists:
         if not isinstance(it, dict):
             continue
-        # 兼容多种字段名(旧小写 + 官方 FileName/SingerName 等驼峰)
-        sid = str(
-            it.get("hash") or it.get("songhash") or it.get("songHash")
-            or it.get("FileHash") or it.get("fileHash") or ""
-        ).strip()
-        title = str(
-            it.get("songname") or it.get("songName") or it.get("FileName")
-            or it.get("fileName") or it.get("OriSongName") or it.get("OriSongName")
-            or ""
-        ).strip()
-        artist = str(
-            it.get("singername") or it.get("singerName") or it.get("SingerName")
-            or it.get("singer") or it.get("singName") or ""
-        ).strip()
-        album = str(
-            it.get("albumname") or it.get("albumName") or it.get("AlbumName")
-            or it.get("album") or it.get("albumName") or ""
-        ).strip()
-        duration_raw = (
-            it.get("duration") or it.get("playTime") or it.get("Duration")
-            or it.get("PlayTime") or 0
-        )
-        try:
-            duration_s = float(duration_raw)
-        except (TypeError, ValueError):
-            duration_s = 0.0
-        ext = "mp3"
-        # songType 字段在 KugouMusicApi 中通常是 ExtName 或 songType
-        if it.get("ExtName") in ("flac", "ape", "wv", "ogg", "m4a"):
-            ext = str(it.get("ExtName")).lower()
-        elif it.get("songType") in ("flac", "ape", "wv", "ogg", "m4a"):
-            ext = str(it.get("songType")).lower()
-        cover = str(
-            it.get("Image") or it.get("Img") or it.get("img")
-            or it.get("AlbumImg") or it.get("albumImg")
-            or it.get("albumimg") or it.get("album_img")
-            or it.get("AlbumImage") or it.get("albumImage")
-            or it.get("PicUrl") or it.get("picUrl")
-            or it.get("coverImg") or it.get("coverImgUrl")
-            or it.get("trans_param", {}).get("union_cover")
-            or ""
-        )
-        # Kugou 封面 URL 带 {size} 占位符，保留占位符供 static_cover 按请求 size 替换
-        cover = str(cover or "")
-        # FileSize 字节数
-        file_size = 0
-        try:
-            file_size = int(it.get("FileSize") or it.get("fileSize") or 0)
-        except (TypeError, ValueError):
-            file_size = 0
-        #  bitrate 用于 audioSpec 的 bitrate 字段
-        bitrate = 0
-        try:
-            bitrate = int(it.get("Bitrate") or it.get("bitrate") or 0)
-        except (TypeError, ValueError):
-            bitrate = 0
-        if not sid:
+        raw_item = search_item_to_raw(it)
+        if not raw_item:
             continue
-        item = {
-            "id": f"kugou:{sid}",
-            "source": "kugou",
-            "title": title,
-            "artist": artist,
-            "album": album,
-            "duration_s": duration_s,
-            "ext": ext,
-            "cover_url": cover,
-            "union_cover": cover,
-            "file_size": file_size,
-            "bitrate": bitrate,
-            "lyric": "",
-        }
-        items.append(item)
-        _remember_song(item)
+        items.append(raw_item)
+        _remember_song(raw_item)
 
     try:
         kugou_total = int(raw.get("total") or 0)
@@ -232,6 +303,169 @@ async def search(keyword: str, limit: int = 30, page: int = 1) -> dict:
         "pagesize": limit,
     }
 
+
+def _field(it: dict, keys: tuple[str, ...], default: Any = "") -> Any:
+    """按 KuGouMusicApi 常见大小写/命名兼容取字段。"""
+    for k in keys:
+        if it.get(k) not in (None, ""):
+            return it.get(k)
+    return default
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def track_item_hash(it: dict) -> str:
+    """从 KuGouMusicApi 歌曲对象中取 hash；兼容 hash/songhash/FileHash。"""
+    return str(
+        _field(
+            it,
+            (
+                "hash",
+                "songhash",
+                "songHash",
+                "filehash",
+                "fileHash",
+                "FileHash",
+                "Id",
+                "id",
+            ),
+            "",
+        )
+    ).strip()
+
+
+def _singer_name_from_singerinfo(singerinfo: Any) -> str:
+    """酷狗歌单 track/all 正确格式：singerinfo[].name 用 - 连接。"""
+    names: list[str] = []
+    if isinstance(singerinfo, list):
+        for item in singerinfo:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    names.append(name)
+    return "、".join(names)
+
+
+def _album_info_id(albuminfo: Any) -> str:
+    """酷狗歌单 track/all 正确格式：albuminfo.id。"""
+    if isinstance(albuminfo, dict):
+        return str(albuminfo.get("id") or albuminfo.get("albumid") or albuminfo.get("albumId") or "").strip()
+    return ""
+
+
+def _album_name_from_albuminfo(albuminfo: Any) -> str:
+    """酷狗歌单 track/all 正确格式：albuminfo.name。"""
+    if isinstance(albuminfo, dict):
+        return str(albuminfo.get("name") or "").strip()
+    return ""
+
+
+def _timelen_to_seconds(value: Any) -> float:
+    """酷狗 timelen 是毫秒；兼容已是秒数的旧数据。"""
+    ms = _to_int(value)
+    if ms <= 0:
+        return 0.0
+    # 若数值明显是毫秒（大于 1000），按毫秒转秒；否则按秒处理。
+    return ms / 1000 if ms > 1000 else float(ms)
+
+
+
+
+def _strip_singer_prefix_from_name(name: str, singer_names: list[str], album_name: str) -> str:
+    """去掉酷狗 song name 里的歌手前缀：例如 "球球、白小白 - 宠爱吖" -> "宠爱吖"。"""
+    title = str(name or "").strip()
+    if not title:
+        return title
+    # 酷狗常见格式：歌手、歌手 - 歌名；先按最后一个 " - " 切分，右侧通常就是歌名。
+    if " - " in title:
+        right = title.rsplit(" - ", 1)[1].strip()
+        left = title.rsplit(" - ", 1)[0].strip()
+        if right and (not left or left == left):  # 只要右侧非空，优先采用右侧歌名
+            return right
+    names = [str(x or "").strip() for x in singer_names if str(x or "").strip()]
+    if not names:
+        return title
+    joined = "、".join(names)
+    prefixes = {
+        joined,
+        "/".join(names),
+        ",".join(names),
+        "，".join(names),
+        " - ".join(names),
+        f"{joined} - {album_name}",
+        f"{joined}-{album_name}",
+    }
+    for sep in (" - ", "-", "_", "–", "—", "|", ";", "；"):
+        for prefix in prefixes:
+            if title.startswith(prefix + sep) or title.startswith(prefix):
+                cleaned = title[len(prefix):].lstrip(sep).lstrip("-_|;； ").strip()
+                if cleaned:
+                    return cleaned
+    return title
+
+
+def track_item_to_raw(it: dict) -> dict:
+    """按酷狗 /playlist/track/all 的真实返回格式精确映射。
+
+    真实字段：hash/name/singerinfo[]/albuminfo/timelen/extname/size/cover/bitrate。
+    """
+    if not isinstance(it, dict):
+        return {}
+
+    sid = str(it.get("hash") or "").strip()
+    if not sid:
+        return {}
+
+    artists = []
+    if isinstance(it.get("singerinfo"), list):
+        for singer in it.get("singerinfo"):
+            if isinstance(singer, dict):
+                singer_name = str(singer.get("name") or "").strip()
+                if singer_name:
+                    artists.append(singer)
+    singer_names = [str(x.get("name") or "").strip() for x in artists]
+    album = _album_name_from_albuminfo(it.get("albuminfo"))
+    artist = "、".join(singer_names)
+    title = _strip_singer_prefix_from_name(str(it.get("name") or ""), singer_names, album)
+    duration_s = _timelen_to_seconds(it.get("timelen"))
+    ext = _format_from_any(it)
+    cover = str(it.get("cover") or "").strip()
+    if not cover:
+        trans_param = it.get("trans_param")
+        if isinstance(trans_param, dict):
+            cover = str(trans_param.get("union_cover") or "").strip()
+    file_size = _to_int(it.get("size"))
+    bitrate = _to_int(it.get("bitrate"))
+
+    return {
+        "id": f"kugou:{sid}",
+        "source": "kugou",
+        "hash": sid,
+        "title": title,
+        "artist": artist,
+        "artists": artists,
+        "album": album,
+        "album_id": _album_info_id(it.get("albuminfo")),
+        "duration_s": duration_s,
+        "ext": ext,
+        "cover_url": cover,
+        "union_cover": cover,
+        "file_size": file_size,
+        "bitrate": bitrate,
+        "lyric": "",
+    }
 
 # ============================================================
 # 音频流 URL
