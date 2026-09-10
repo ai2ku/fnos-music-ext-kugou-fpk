@@ -290,8 +290,8 @@ async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int =
 
         release_date = str(item.get("publish_date") or "").strip() or None
         ts = parse_ts_to_unix(release_date or time.time())
-        # /artist/albums 回参没有专辑曲目数字段，没有就不编。
-        track_count = 0
+        # /artist/albums 回参没有专辑曲目数字段；前端该列展示为来源标识。
+        track_count = "酷狗源"
 
         artists: list[dict[str, Any]] = []
         for art in item.get("artists") or []:
