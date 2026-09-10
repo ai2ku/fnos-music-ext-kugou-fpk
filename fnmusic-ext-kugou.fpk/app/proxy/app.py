@@ -50,7 +50,7 @@ CONF = {
     "kugou_token": os.environ.get("FNMUSIC_KUGOU_TOKEN", ""),
     "kugou_userid": os.environ.get("FNMUSIC_KUGOU_USERID", ""),
     "kugou_dfid": os.environ.get("FNMUSIC_KUGOU_DFID", ""),
-    "kugou_t1": os.environ.get("FNMUSIC_KUGOU_T1", ""),
+    "kugou_t1": os.environ.get("FNMUSIC_KUGOU_/track/", ""),
     "kugou_mid": os.environ.get("FNMUSIC_KUGOU_MID", ""),
     "kugou_guid": os.environ.get("FNMUSIC_KUGOU_GUID", ""),
     "kugou_dev": os.environ.get("FNMUSIC_KUGOU_DEV", ""),
@@ -488,7 +488,7 @@ if _ENV_FILE.exists():
             "FNMUSIC_KUGOU_TOKEN": ("kugou_token", "str"),
             "FNMUSIC_KUGOU_USERID": ("kugou_userid", "str"),
             "FNMUSIC_KUGOU_DFID": ("kugou_dfid", "str"),
-            "FNMUSIC_KUGOU_T1": ("kugou_t1", "str"),
+            "FNMUSIC_KUGOU_/track/": ("kugou_t1", "str"),
             "FNMUSIC_KUGOU_MID": ("kugou_mid", "str"),
             "FNMUSIC_KUGOU_GUID": ("kugou_guid", "str"),
             "FNMUSIC_KUGOU_DEV": ("kugou_dev", "str"),
@@ -1175,6 +1175,140 @@ def is_online_guid(guid: str) -> bool:
 def source_from_online_guid(guid: str) -> str:
     parts = (guid or "").split(":")
     return parts[1] if len(parts) >= 3 else ""
+
+async def fetch_kugou_album_detail(app_state, album_guid: str) -> dict | None:
+    """酷狗专辑详情 -> 飞牛 /music/api/v1/album/detail。
+
+    两步串行（keywords 依赖 detail 结果，无法并行）：
+      1. /album/detail?id=<album_id> → album_name + author_name（keywords 必需，
+         不能靠外部传入）+ sizable_cover + publish_date + type + language。
+      2. /search?keywords=<歌手名+专辑名>&type=album → 按 albumid 精确匹配拿
+         singers[{name,id}]（带真实歌手 ID）、songcount、publish_time、intro、company。
+
+    只搜专辑名不行：keywords=小心思 → total=500 且首位是别的同名专辑。
+    非 online:kugou:album: GUID 返回 None，由调用方转飞牛上游。
+    """
+    s = str(album_guid or "").strip()
+    if not s.startswith("online:kugou:album:"):
+        return None
+    album_id = s[len("online:kugou:album:"):].strip()
+    if not album_id:
+        return None
+
+    try:
+        bundle = await kugou_source.get_album_detail_bundle(album_id)
+    except Exception as e:
+        logger.warning("[KUGOU_ALBUM_DETAIL] bundle error album_id=%s err=%s", album_id, e)
+        return None
+
+    detail = bundle.get("detail") or {}
+    match = bundle.get("match") or {}
+    logger.warning("[KUGOU_ALBUM_DETAIL] album_id=%s detail=%s match=%s",
+                   album_id, bool(detail), bool(match))
+    if not detail and not match:
+        return None
+
+    # 字段合并：search 命中优先（singers 带真实 ID、intro/company 更完整），
+    # 落空时用 detail 字段。
+    name = str(match.get("albumname") or detail.get("album_name")
+               or detail.get("albumName") or detail.get("album") or "").strip()
+    release_date = str(match.get("publish_time") or detail.get("publish_date")
+                       or detail.get("publishDate") or "").strip() or None
+    ts = parse_ts_to_unix(release_date or time.time())
+
+    # 歌手：search 的 singers[] 直接带 name+id；没命中时回退 detail.authors[]。
+    artists: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sg in match.get("singers") or []:
+        if not isinstance(sg, dict):
+            continue
+        aname = str(sg.get("name") or "").strip()
+        if not aname or aname in seen:
+            continue
+        aid = str(sg.get("id") or "").strip()
+        if aid in ("0", ""):
+            aid = ""
+        artists.append({
+            "guid": f"online:kugou:artist:{aid}" if aid else kugou_artist_guid(album_id),
+            "name": aname,
+            "coverId": kugou_artist_cover_guid(aid) if aid else kugou_artist_cover_guid(album_id),
+            "createdAt": ts,
+            "updatedAt": ts,
+        })
+        seen.add(aname)
+    if not artists:
+        for au in detail.get("authors") or []:
+            if not isinstance(au, dict):
+                continue
+            aname = str(au.get("author_name") or au.get("authorName") or au.get("name") or "").strip()
+            if not aname or aname in seen:
+                continue
+            aid = str(au.get("author_id") or au.get("authorId") or "").strip()
+            if aid in ("0", ""):
+                aid = ""
+            artists.append({
+                "guid": f"online:kugou:artist:{aid}" if aid else kugou_artist_guid(album_id),
+                "name": aname,
+                "coverId": kugou_artist_cover_guid(aid) if aid else kugou_artist_cover_guid(album_id),
+                "createdAt": ts,
+                "updatedAt": ts,
+            })
+            seen.add(aname)
+
+    # songcount 取 search 命中值；缺失时用 0 而不是编造数字。
+    try:
+        track_count = int(match.get("songcount") or 0)
+    except (TypeError, ValueError):
+        track_count = 0
+
+    intro = str(match.get("intro") or match.get("short_intro")
+                or detail.get("intro") or "").strip() or None
+    company = str(match.get("company") or detail.get("publish_company") or "").strip() or None
+    language = str(match.get("language") or detail.get("language") or "").strip() or None
+    album_type = str(detail.get("type") or detail.get("album_type") or "").strip() or None
+
+    payload = {
+        "code": 0,
+        "msg": "",
+        "data": {
+            "guid": kugou_album_guid(album_id),
+            "name": name,
+            "coverId": kugou_album_cover_guid(album_id),
+            "releaseDate": release_date,
+            "barcode": None,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "artists": artists,
+            "trackCount": track_count,
+            "language": language,
+            "albumType": album_type,
+            "publishCompany": company,
+            "intro": intro,
+        },
+    }
+    return payload
+
+
+async def fetch_kugou_album_tracks(app_state, album_guid: str, page: int = 1, size: int = 50) -> dict:
+    """酷狗专辑歌曲列表 -> 飞牛 /track/album-detail/list。
+
+    数据源：KuGouMusicApi /album/songs?id=<album_id>&page=&pagesize=。
+    返回结构对齐 fetch_kugou_artist_tracks：{"items":[raw...], "total":n,...}。
+    非 online:kugou:album: GUID 返回 None，由调用方转飞牛上游。
+    """
+    s = str(album_guid or "").strip()
+    if not s.startswith("online:kugou:album:"):
+        return None
+    album_id = s[len("online:kugou:album:"):].strip()
+    if not album_id:
+        return None
+    try:
+        result = await kugou_source.get_album_songs(album_id, page=page, pagesize=size)
+    except Exception as e:
+        logger.warning("[KUGOU_ALBUM_TRACKS] album/songs error album=%s err=%s", album_id, e)
+        return {"items": [], "total": 0, "page": page, "pagesize": size, "album_id": album_id}
+    return result
+
 
 def build_online_track(item: dict) -> dict:
     """对齐飞牛音乐列表标准格式：只返回飞牛标准字段。"""
@@ -3450,6 +3584,78 @@ async def artist_detail(request: Request):
     return await forward_to_upstream(request, get_upstream_client(request.app))
 
 
+@app.get("/music/api/v1/album/detail")
+@app.get("/music/api/v1/album/detail/{subpath:path}")
+async def album_detail(request: Request):
+    """/album/detail：酷狗专辑详情；非酷狗 GUID 走飞牛上游。
+
+    飞牛请求形如
+    /music/api/v1/album/detail?guid=online%3Akugou%3Aalbum%3A36547917
+    （guid 里 %3A 即 ':'）。返回结构与飞牛原生 /album/detail 一致。
+    """
+    album_guid = str(
+        request.query_params.get("guid")
+        or request.query_params.get("GUID")
+        or request.query_params.get("albumGuid")
+        or ""
+    ).strip()
+    if not album_guid:
+        return JSONResponse(content={"code": 400, "msg": "guid required", "data": None})
+    kugou_payload = await fetch_kugou_album_detail(request.app, album_guid)
+    if isinstance(kugou_payload, dict):
+        return JSONResponse(content=kugou_payload, status_code=200)
+    return await forward_to_upstream(request, get_upstream_client(request.app))
+
+
+@app.get("/music/api/v1/track/album-detail/list")
+@app.get("/music/api/v1/track/album-detail/list/{subpath=path}")
+async def track_album_detail_list(request: Request):
+    """/track/album-detail/list：酷狗专辑歌曲列表；非酷狗 GUID 走飞牛上游。
+
+    参数映射参考 /track/artist-detail/list 与 /track/playlist-detail/list：
+    page/size + albumGUID，返回 {"code":0,"data":{"list":[...],"total":n}}，
+    track 项结构与 build_online_track 一致。
+    """
+    album_guid = str(
+        request.query_params.get("albumGUID")
+        or request.query_params.get("albumGuid")
+        or request.query_params.get("album_id")
+        or request.query_params.get("albumId")
+        or request.query_params.get("guid")
+        or ""
+    ).strip()
+    if not album_guid:
+        return JSONResponse(content={"code": 400, "msg": "albumGUID required", "data": None})
+    if not album_guid.startswith("online:kugou:album:"):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 50)
+    except (TypeError, ValueError):
+        size = 50
+    if size < 1:
+        size = 50
+    payload = await fetch_kugou_album_tracks(request.app, album_guid, page=page, size=size)
+    # get_album_songs 内部已归一化为内部格式（timelength 秒口径）；
+    # 不要再套 track_item_to_raw，否则会把 title 清空。
+    raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
+    tracks = [build_online_track(x) for x in raw_tracks if x.get("hash") or x.get("id")]
+    return JSONResponse(
+        content={
+            "code": 0,
+            "msg": "",
+            "data": {
+                "list": tracks,
+                "total": int(payload.get("total") or len(tracks)),
+            },
+        },
+        status_code=200,
+    )
+
+
 @app.get("/music/api/v1/track/artist-detail/list")
 @app.get("/music/api/v1/track/artist-detail/list/{subpath:path}")
 async def track_artist_detail_list(request: Request):
@@ -3787,7 +3993,7 @@ async def login_qr_check(key: str):
                 "FNMUSIC_KUGOU_TOKEN": credentials["token"],
                 "FNMUSIC_KUGOU_USERID": credentials["userid"],
                 "FNMUSIC_KUGOU_DFID": credentials["dfid"],
-                "FNMUSIC_KUGOU_T1": credentials["t1"],
+                "FNMUSIC_KUGOU_/track/": credentials["t1"],
                 "FNMUSIC_KUGOU_MID": credentials["mid"],
                 "FNMUSIC_KUGOU_GUID": credentials["guid"],
                 "FNMUSIC_KUGOU_DEV": credentials["dev"],
@@ -3901,7 +4107,7 @@ async def login_logout():
                         env_content[k.strip()] = v.strip()
             # 清除凭证字段
             for key in ["FNMUSIC_KUGOU_TOKEN", "FNMUSIC_KUGOU_USERID", "FNMUSIC_KUGOU_DFID",
-                       "FNMUSIC_KUGOU_T1", "FNMUSIC_KUGOU_MID", "FNMUSIC_KUGOU_GUID",
+                       "FNMUSIC_KUGOU_/track/", "FNMUSIC_KUGOU_MID", "FNMUSIC_KUGOU_GUID",
                        "FNMUSIC_KUGOU_DEV", "FNMUSIC_KUGOU_MAC"]:
                 env_content[key] = ""
             with open(env_path, "w") as f:
