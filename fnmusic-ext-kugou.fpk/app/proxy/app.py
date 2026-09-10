@@ -1138,7 +1138,14 @@ def fill_local_metadata_cover_id(payload: dict, guid: str) -> None:
 
 
 def fill_local_track_list_cover_ids(payload: dict) -> None:
-    """只补 music/api/v1/track/list 路径 data.list[] 下的空 coverId。"""
+    """补 data.list[] 下空的 coverId，填为本项自身的 guid。
+
+    track/list 与 play-history/list 共用。本地曲目没有专辑封面/内嵌
+    封面标签时上游标 coverId=null，前端按 coverId 取封面会拿不到；
+    用歌曲自身 guid 兜底（本地封面链路本就按 guid 解析）。线上曲目
+    guid 形如 online:kugou:track:<id>，同样能被封面路由识别，故不分
+    线上/线下统一兜底。已有非空 coverId 时不覆盖。
+    """
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
         return
@@ -4732,7 +4739,14 @@ async def event_report(request: Request):
 
 
 @app.get("/music/api/v1/play-history/list")
+@app.get("/music/api/v1/play-history/list/{subpath:path}")
 async def play_history_list(request: Request):
+    """播放历史列表：透传飞牛上游，补全本地歌曲的空 coverId。
+
+    上游对无专辑封面/无内嵌封面标签的本地曲目标 coverId=null，
+    前端按 track.coverId 取封面时拿不到，封面位空白；
+    用歌曲自身 guid 兜底，与 /track/list、/track/metadata 的补法一致。
+    """
     upstream_client = get_upstream_client(request.app)
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):
@@ -4745,6 +4759,9 @@ async def play_history_list(request: Request):
     if not isinstance(data, dict):
         data = {"list": [], "total": 0}
         envelope["data"] = data
+
+    # 本地歌曲 coverId=null -> 兜底为歌曲自身 guid
+    fill_local_track_list_cover_ids(envelope)
 
     # 酷狗歌单里的在线播放历史暂时不注入
     return JSONResponse(content=envelope, headers=headers)
