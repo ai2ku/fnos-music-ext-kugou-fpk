@@ -2496,6 +2496,36 @@ def _static_cover_placeholder_response() -> Response:
     )
 
 
+# 兜底封面：酷狗官方无封面图，所有解析不到的封面统一走这张。
+# 通过 /music/api/v1/static/cover 同源输出，避免 COEP 跨域拦截。
+_STATIC_COVER_FALLBACK_URL = "https://singerimg.kugou.com/uploadpic/softhead/none.jpg"
+_COVER_FALLBACK_CACHE: dict[str, tuple[bytes, str]] = {}
+
+
+async def _fetch_cover_fallback_response() -> Response:
+    """兜底封面响应：优先内存缓存，回源一次后常驻；拉取失败退回 1x1 透明 PNG。
+
+    进程生命周期内只回源一次，避免每个 guid 的兜底请求都打一次网络。
+    """
+    hit = _COVER_FALLBACK_CACHE.get("resp")
+    if hit is not None:
+        body, ct = hit
+        return Response(
+            content=body,
+            status_code=200,
+            media_type=ct,
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            },
+        )
+    resp = await _fetch_cover_image_response(_STATIC_COVER_FALLBACK_URL)
+    if resp is not None:
+        _COVER_FALLBACK_CACHE["resp"] = (resp.body, resp.media_type or "image/jpeg")
+        return resp
+    return _static_cover_placeholder_response()
+
+
 def build_lyric_list_payload(guid: str, lyric_text: str) -> dict:
     """对齐飞牛 $n.lyric.list → xr(list, preferred)。
 
@@ -3092,8 +3122,10 @@ async def search_suggest(request: Request):
         它解析 data 的假设。同 guid 或同名视为已有，不重复追加。
         """
         slot = data_field.get(type_key) if isinstance(data_field, dict) else None
+        # total_key 必须在三个分支都赋值，否则裸数组分支会 NameError。
+        total_key = "total"
         if isinstance(slot, list):
-            arr, holder, total_key = slot, data_field, "total"
+            arr, holder = slot, data_field
         elif isinstance(slot, dict):
             if isinstance(slot.get("items"), list):
                 arr, holder = slot["items"], slot
@@ -3138,11 +3170,6 @@ async def search_suggest(request: Request):
     logger.warning("[SUGGEST] kugou groups keyword=%r merged=%s data_keys=%s",
                    keyword, merged_counts,
                    list(data_field.keys())[:15] if isinstance(data_field, dict) else 'N/A')
-
-    # 同时注入 kugou_songs 字段作为兼容入口
-    if isinstance(data_field, dict) and kugou_list:
-        data_field["kugou_songs"] = [build_online_track(it) for it in kugou_list]
-        data_field["kugouSongs"] = data_field["kugou_songs"]
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
@@ -3718,7 +3745,7 @@ async def static_cover(request: Request, subpath: str = ""):
     if not cover:
         logger.warning("[STATIC_COVER] missing cover guid=%s is_kugou=%s is_online=%s", guid, is_kugou_playlist_guid(guid), is_online_guid(guid))
         if is_online_guid(guid) or is_kugou_playlist_guid(guid):
-            return _static_cover_placeholder_response()
+            return await _fetch_cover_fallback_response()
         # 本地封面解析失败则透传上游，尽量拿到飞牛自己扫描到的封面
         return await forward_to_upstream(request, get_upstream_client(request.app))
     # 歌单封面模板带 {size} 占位，回源前必须替换成具体尺寸
@@ -3729,7 +3756,7 @@ async def static_cover(request: Request, subpath: str = ""):
         return response
     logger.warning("[STATIC_COVER] image proxy failed cover=%s", cover)
     if is_online_guid(guid) or is_kugou_playlist_guid(guid):
-        return _static_cover_placeholder_response()
+        return await _fetch_cover_fallback_response()
     return await forward_to_upstream(request, get_upstream_client(request.app))
 
 
