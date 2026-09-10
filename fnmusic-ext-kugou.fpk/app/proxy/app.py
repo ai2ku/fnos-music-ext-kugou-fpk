@@ -1176,6 +1176,103 @@ def source_from_online_guid(guid: str) -> str:
     parts = (guid or "").split(":")
     return parts[1] if len(parts) >= 3 else ""
 
+async def fetch_kugou_artist_search(app_state, keyword: str, page: int = 1, size: int = 24) -> dict:
+    """酷狗歌手搜索 -> 飞牛 /music/api/v1/search/artist。
+
+    数据源：KuGouMusicApi /search?keywords=<keyword>&page=&pagesize=&type=author。
+
+    字段映射（实测 q=本兮 total=10；本接口字段是**大写首字母**风格，
+    和 type=album 的小写字段完全不同，不能复用 search_albums_raw）：
+      AuthorId     -> guid = online:kugou:artist:<id>
+      AuthorName   -> name
+      Avatar(240)  -> 不使用；coverId = guid，封面走 /static/cover 的
+                     online:kugou:artist:<id> 解析链
+      AudioCount   -> trackCount（歌曲数）
+      AlbumCount   -> albumCount（专辑数）
+
+    Heat/FansNum 不作为评分依据：飞牛的 score 是 0~10 的相关度分（例 9.74），
+    Heat 是千万级热度、FansNum 是百万级粉丝数，直接归一会失真。
+    改用「精确匹配加权 + 递减」的合成分，保证结果在 0~10 区间且单调不升。
+    """
+    kw = str(keyword or "").strip()
+    if not kw:
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+    try:
+        async with kugou_source._client() as c:
+            r = await c.get(
+                "/search",
+                params={"keywords": kw, "page": page, "pagesize": size, "type": "author"},
+            )
+            if r.status_code != 200:
+                logger.warning("[KUGOU_ARTIST_SEARCH] http=%s kw=%r body=%r",
+                               r.status_code, kw, r.text[:200])
+                return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+            body = r.json()
+            status = body.get("status", body.get("error_code"))
+            if status not in (1, 0, 200, None):
+                logger.warning("[KUGOU_ARTIST_SEARCH] status=%s kw=%r errmsg=%r",
+                               status, kw, body.get("error_msg"))
+                return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+            data = body.get("data") or {}
+            lists = data.get("lists") or [] if isinstance(data, dict) else []
+            lists = [x for x in lists if isinstance(x, dict)] if isinstance(lists, list) else []
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+    except Exception as e:
+        logger.warning("[KUGOU_ARTIST_SEARCH] error kw=%r err=%s", kw, e)
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+
+    artist_list: list[dict[str, Any]] = []
+    for idx, it in enumerate(lists):
+        artist_id = str(it.get("AuthorId") or it.get("author_id")
+                        or it.get("AuthorID") or "").strip()
+        if not artist_id or artist_id == "0":
+            continue
+        name = str(it.get("AuthorName") or it.get("author_name") or "").strip()
+        if not name:
+            continue
+
+        ts = int(time.time())
+        try:
+            track_count = int(it.get("AudioCount") or 0)
+        except (TypeError, ValueError):
+            track_count = 0
+        try:
+            album_count = int(it.get("AlbumCount") or 0)
+        except (TypeError, ValueError):
+            album_count = 0
+
+        # 评分：精确同名满分 10.0；其余按位置递减，保留酷狗原始排序。
+        # 前缀命中与无关命中不分支：idx=21 时 8.0-21*0.05=6.95 会与更高 idx 的
+        # 8.0 分支产生交错，反而打乱位置顺序，故只用一条递减公式。
+        score = 10.0 if name == kw else round(10.0 - (idx + 1) * 0.05, 6)
+        score = round(max(0.1, min(10.0, score)), 6)
+
+        artist_list.append({
+            "guid": kugou_artist_guid(artist_id),
+            "name": name,
+            "coverId": kugou_artist_cover_guid(artist_id),
+            "createdAt": ts,
+            "updatedAt": ts,
+            "trackCount": track_count,
+            "albumCount": album_count,
+            "score": score,
+        })
+
+    logger.warning("[KUGOU_ARTIST_SEARCH] kw=%r page=%d got=%d total=%d",
+                   kw, page, len(artist_list), total)
+    return {
+        "code": 0,
+        "msg": "",
+        "data": {
+            "list": artist_list,
+            "total": total if total > 0 else len(artist_list),
+        },
+    }
+
+
 async def fetch_kugou_album_search(app_state, keyword: str, page: int = 1, size: int = 24) -> dict:
     """酷狗专辑搜索 -> 飞牛 /music/api/v1/search/album。
 
@@ -2604,6 +2701,36 @@ async def search_track(request: Request):
     merged = merge_online_tracks(upstream_json, online_all, page=page, size=size)
     return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
 
+
+@app.get("/music/api/v1/search/artist")
+@app.get("/music/api/v1/search/artist/{subpath=path}")
+async def search_artist(request: Request):
+    """/search/artist：酷狗歌手搜索；空关键词走飞牛上游。
+
+    飞牛请求形如 /music/api/v1/search/artist?q=%E6%9C%AC%E5%85%AE&page=1&size=24。
+    数据源：KuGouMusicApi /search?keywords=<kw>&page=&pagesize=&type=author。
+
+    响应结构对齐飞牛原生 /search/artist（{"code":0,"data":{"list":[...],"total":n}}），
+    artist 项字段：guid/name/coverId/createdAt/updatedAt/trackCount/albumCount/score。
+    """
+    keyword = extract_keyword(request)
+    if not keyword:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        # 同 search/album：/search 未观察到 pagesize 硬上限，50 是响应体积保护。
+        size = max(1, int(request.query_params.get("size") or 24))
+    except (TypeError, ValueError):
+        size = 24
+    if size > 50:
+        size = 50
+    kugou_payload = await fetch_kugou_artist_search(request.app, keyword, page=page, size=size)
+    if isinstance(kugou_payload, dict):
+        return JSONResponse(content=kugou_payload, status_code=200)
+    return await forward_to_upstream(request, get_upstream_client(request.app))
 
 @app.get("/music/api/v1/search/album")
 @app.get("/music/api/v1/search/album/{subpath=path}")
