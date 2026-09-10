@@ -4523,6 +4523,8 @@ async def playlist_list(request: Request):
             "coverId": p.get("coverId") or p.get("guid"),
             "createdAt": now_ts,
             "updatedAt": now_ts,
+            # 与 detail / batch-detail 一致：trackCount 映射自酷狗 count
+            "trackCount": int(p.get("trackCount") or 0),
         }
         for p in kugou_playlists
     ]
@@ -4593,6 +4595,8 @@ async def playlist_detail(request: Request):
                     "coverId": b.get("coverId"),
                     "createdAt": now_ts,
                     "updatedAt": now_ts,
+                    # 歌曲数：b 由 build_kugou_playlist_obj 生成，trackCount 已映射自酷狗 count
+                    "trackCount": int(b.get("trackCount") or 0),
                 }
             })
 
