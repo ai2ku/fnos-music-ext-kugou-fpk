@@ -123,11 +123,14 @@ def build_kugou_playlist_obj(it: dict) -> dict:
     key = coll_id or pid
     name = str(_kugou_playlist_field(it, ("name", "title", "playlistName", "playlist_name")) or "").strip()
     guid = kugou_playlist_guid(key, name)
+    # 歌曲数: 酷狗 /user/playlist 的 data.info[] 每项顶层 count 字段（即 data.info.count）
+    track_count = int(_kugou_playlist_field(it, ("count", "trackCount", "track_count", "num", "playlist_num")) or 0)
     return {
         "guid": guid,
         "name": name or ("酷狗歌单" if key else ""),
         "coverId": guid,
         "collectionId": coll_id,
+        "trackCount": track_count,
     }
 
 
