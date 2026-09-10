@@ -2450,17 +2450,6 @@ def merge_online_tracks(
     return upstream_json
 
 
-# 名称去重键：去空白 + 全角空格/不可见字符清除 + 大小写归一。
-# 歌手名带空格（"周杰伦 Live"）、专辑名带括号（"1988（1988复刻）"）、
-# 中英混写都会让裸 strip().lower() 判重失败，导致同一实体本地/线上双出。
-_NAME_INVIS_RE = re.compile(r"[\s\u3000\u00a0\ufeff]+")
-
-
-def _search_name_key(name: Any) -> str:
-    s = _NAME_INVIS_RE.sub("", str(name or "")).lower()
-    return s
-
-
 def merge_search_meta(
     upstream_json: dict,
     kugou_payload: dict | None,
@@ -2472,8 +2461,9 @@ def merge_search_meta(
     整包返回 kugou_payload，官方搜索结果被整个替换掉（本地歌手被覆盖）；
     且请求上游的这一步从未发生过。
 
-    - 仅按「规范化名称」去重：酷狗侧名称已被官方侧命中时剔除，
-      避免同一歌手/专辑双出；guid/coverId 不同不视为重复
+    - 不去重：本地/飞牛线上与酷狗是不同数据源，同名歌手/专辑/歌单是
+      不同的可播放对象，全部保留，官方在前、酷狗在后；由用户自行选择
+      点哪一个（与 /search/track 的行为一致）
     - 空 coverId 一律兜底为本项自身 guid（本地/线上均同）：
       本地曲目无专辑封面时上游标 coverId=null；酷狗侧 guid 形如
       online:kugou:{artist|album|playlist}:<id>，封面路由本身就该按
@@ -2517,23 +2507,10 @@ def merge_search_meta(
         )
         return upstream_json
 
-    existing_keys = set()
-    for item in target_list:
-        if isinstance(item, dict):
-            k = _search_name_key(item.get("name") or item.get("title") or "")
-            if k:
-                existing_keys.add(k)
-
+    # 酷狗项按原序全部追加（不去重）
     merged = []
-    dup = 0
     for item in kugou_list:
-        k = _search_name_key(item.get("name") or item.get("title") or "")
-        if k and k in existing_keys:
-            dup += 1
-            continue
         _fill_cover(item)
-        if k:
-            existing_keys.add(k)
         merged.append(item)
 
     target_list.extend(merged)
@@ -2542,9 +2519,9 @@ def merge_search_meta(
         _search_data_root(upstream_json)["total"] = total
 
     logger.warning(
-        "[SEARCH_%s] official_count=%d official_total=%d kugou_items=%d dup_skipped=%d merged=%d total=%d",
+        "[SEARCH_%s] official_count=%d official_total=%d kugou_items=%d merged=%d total=%d",
         tag.upper(), len(target_list) - len(merged), official_total,
-        len(kugou_list), dup, len(target_list), total,
+        len(kugou_list), len(target_list), total,
     )
     return upstream_json
 
