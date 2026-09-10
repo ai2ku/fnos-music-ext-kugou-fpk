@@ -1176,6 +1176,108 @@ def source_from_online_guid(guid: str) -> str:
     parts = (guid or "").split(":")
     return parts[1] if len(parts) >= 3 else ""
 
+async def fetch_kugou_album_search(app_state, keyword: str, page: int = 1, size: int = 24) -> dict:
+    """酷狗专辑搜索 -> 飞牛 /music/api/v1/search/album。
+
+    数据源：KuGouMusicApi /search?keywords=<keyword>&page=&pagesize=&type=album。
+    字段映射（实测 张杰 total=500）：
+      albumid      -> guid = online:kugou:album:<id>
+      albumname    -> name
+      img(240 URL) -> 不使用；coverId = guid，封面走 /static/cover 的
+                     online:kugou:album:<id> 解析链（/album/detail sizable_cover）
+      publish_time -> releaseDate（已是 YYYY-MM-DD）+ createdAt/updatedAt
+      songcount    -> trackCount
+      singers[]    -> artists[]（带真实歌手 ID）
+
+    score：酷狗搜索不回传相关度分。给一个递减值，保证按 score 降序排序时
+    酷狗自身的结果顺序不被打乱（前端若依赖 score 排序不至于跳序）。
+
+    barcode：酷狗无 ISBN，固定 null（飞牛格式允许 null）。
+    """
+    try:
+        result = await kugou_source.search_albums_raw(keyword, limit=size, page=page)
+    except Exception as e:
+        logger.warning("[KUGOU_ALBUM_SEARCH] search/type=album error kw=%r err=%s", keyword, e)
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+
+    lists = result.get("lists") or []
+    album_list: list[dict[str, Any]] = []
+    for idx, it in enumerate(lists):
+        if not isinstance(it, dict):
+            continue
+        album_id = str(it.get("albumid") or it.get("album_id") or "").strip()
+        if not album_id:
+            continue
+        name = str(it.get("albumname") or it.get("album_name") or "").strip()
+        if not name:
+            continue
+
+        release_date = str(it.get("publish_time") or it.get("publish_date") or "").strip() or None
+        ts = parse_ts_to_unix(release_date or time.time())
+
+        artists: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for sg in (it.get("singers") or it.get("Singers") or []):
+            if not isinstance(sg, dict):
+                continue
+            aname = str(sg.get("name") or "").strip()
+            if not aname or aname in seen:
+                continue
+            aid = str(sg.get("id") or "").strip()
+            if aid in ("0", ""):
+                aid = ""
+            if aid:
+                artists.append({
+                    "guid": kugou_artist_guid(aid),
+                    "name": aname,
+                    "coverId": kugou_artist_cover_guid(aid),
+                    "createdAt": ts,
+                    "updatedAt": ts,
+                })
+            seen.add(aname)
+        if not artists:
+            singer_name = str(it.get("singer") or it.get("singername") or "").strip()
+            if singer_name:
+                artists = [{
+                    "guid": "",
+                    "name": singer_name,
+                    "coverId": None,
+                    "createdAt": ts,
+                    "updatedAt": ts,
+                }]
+
+        try:
+            track_count = int(it.get("songcount") or 0)
+        except (TypeError, ValueError):
+            track_count = 0
+
+        album_list.append({
+            "guid": kugou_album_guid(album_id),
+            "name": name,
+            "coverId": kugou_album_cover_guid(album_id),
+            "releaseDate": release_date,
+            "barcode": None,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "artists": artists,
+            "trackCount": track_count,
+            # 递减相关度分：idx=0 -> 1.0，缓慢衰减，保留酷狗原始排序。
+            "score": round(1.0 / (1.0 + idx * 0.05), 6),
+        })
+
+    total = int(result.get("total") or 0)
+    logger.warning("[KUGOU_ALBUM_SEARCH] kw=%r page=%d got=%d total=%d",
+                   keyword, page, len(album_list), total)
+    return {
+        "code": 0,
+        "msg": "",
+        "data": {
+            "list": album_list,
+            "total": total if total > 0 else len(album_list),
+        },
+    }
+
+
 async def fetch_kugou_album_detail(app_state, album_guid: str) -> dict | None:
     """酷狗专辑详情 -> 飞牛 /music/api/v1/album/detail。
 
@@ -2502,6 +2604,38 @@ async def search_track(request: Request):
     merged = merge_online_tracks(upstream_json, online_all, page=page, size=size)
     return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
 
+
+@app.get("/music/api/v1/search/album")
+@app.get("/music/api/v1/search/album/{subpath=path}")
+async def search_album(request: Request):
+    """/search/album：酷狗专辑搜索；空关键词走飞牛上游。
+
+    飞牛请求形如 /music/api/v1/search/album?q=%E5%BC%A0%E6%9D%B0&page=1&size=24。
+    数据源：KuGouMusicApi /search?keywords=<kw>&page=&pagesize=&type=album。
+
+    响应结构对齐飞牛原生 /search/album（{"code":0,"data":{"list":[...],"total":n}}），
+    album 项字段：guid/name/coverId/releaseDate/barcode/createdAt/updatedAt/
+    artists/trackCount/score。
+    """
+    keyword = extract_keyword(request)
+    if not keyword:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        # 酷狗 /search 未观察到 pagesize 硬上限（51 仍正常返回），但飞牛侧
+        # 常见传法不超过 100，超 50 时压回 50 以控制单次响应体积与耗时。
+        size = max(1, int(request.query_params.get("size") or 24))
+    except (TypeError, ValueError):
+        size = 24
+    if size > 50:
+        size = 50
+    kugou_payload = await fetch_kugou_album_search(request.app, keyword, page=page, size=size)
+    if isinstance(kugou_payload, dict):
+        return JSONResponse(content=kugou_payload, status_code=200)
+    return await forward_to_upstream(request, get_upstream_client(request.app))
 
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
