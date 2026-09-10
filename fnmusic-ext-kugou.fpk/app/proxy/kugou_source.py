@@ -543,20 +543,32 @@ async def search_albums_raw(keyword: str, limit: int = 30, page: int = 1) -> dic
 async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50) -> dict:
     """调 KuGouMusicApi /album/songs?id=<album_id>&page=&pagesize=。
 
-    回参 data.songList[] 真实字段：name / singername(可多人，顿号分隔) /
-    albumid / albumname / timelength(秒) / quality / filetype / bitrate / size /
-    filesize(= bitrate 字符串) / lyric / publish_time / hash(32 位 filehash) /
-    image(完整封面 URL) / image180~image720 / id(= albumid)。
+    pagesize 上限 50：超过即返回 {"errmsg":"invalid param","status":0} 空结果，
+    是硬上限不是截断。这里主动封顶，避免飞牛侧传 size=120 触发无效请求。
 
-    与 /artist/audios 不同：这里的 timelength 是**秒**（182443696 回参全部在
-    1~2000 范围），且封面在顶层 image、不需要 {size} 占位符填充。所以不能
-    直接复用 search_item_to_raw——它会按毫秒处理 duration 并把 455 秒判成
-    0.455 秒。这里自己映射成 /artist/audios 口径的统一内部格式，
-    再交给 build_online_track。
+    回参 data 真实字段（实测 12799221 / 182443696 一致）：
+      { "songs": [嵌套结构], "total": n }
+    songs[] 元素是嵌套结构，不是扁平字段：
+      base.audio_name / base.author_name / base.album_id / base.audio_id
+      authors[]: {author_name, author_id}   <- 带真实歌手 ID
+      audio_info.duration(ms) / .bitrate / .filesize / .extname / .hash
+                / .hash_320 / .hash_128 / .hash_flac
+      album_info.album_name / album_info.cover(带 {size} 占位符)
+      trans_param.union_cover(带 {size} 占位符) / trans_param.songname_suffix(如 "(伴奏)")
+      extend.disc / extend.sort
+
+    不能复用 search_item_to_raw：它按扁平字段读（name/singername/timelength/albumid），
+    嵌套结构全读空；字段名与口径也不同。这里自己映射成 /artist/audios 口径的统一
+    内部格式，再交给 build_online_track。
+
+    兼容其他可能形态：data.songList / data.list / data.lists / 扁平字段兜底。
     """
     aid = str(album_id or "").strip()
     if not aid:
         return {"items": [], "total": 0, "page": page, "pagesize": pagesize, "album_id": ""}
+    if pagesize > 50:
+        pagesize = 50
+    empty = {"items": [], "total": 0, "page": page, "pagesize": pagesize, "album_id": aid}
     try:
         async with _client() as c:
             r = await c.get("/album/songs",
@@ -564,49 +576,94 @@ async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50
             if r.status_code != 200:
                 logger.warning("[KUGOU] album/songs http=%s album=%s body=%r",
                                r.status_code, aid, r.text[:200])
-                return {"items": [], "total": 0, "page": page, "pagesize": pagesize, "album_id": aid}
+                return empty
             body = r.json()
             status = body.get("status", body.get("error_code"))
+            errmsg = body.get("errmsg") or body.get("error_msg") or ""
             if status not in (1, 0, 200, None):
                 logger.warning("[KUGOU] album/songs status=%s album=%s errmsg=%r",
-                               status, aid, body.get("error_msg"))
-                return {"items": [], "total": 0, "page": page, "pagesize": pagesize, "album_id": aid}
+                               status, aid, errmsg)
+                return empty
             data = body.get("data") or {}
-            song_list = data.get("songList") or data.get("songlist") or data.get("lists") or []
+            # 嵌套结构：data.songs / data.songList / data.list / data.lists
+            song_list = data.get("songs") or data.get("songList") or data.get("songlist") or []
+            if not isinstance(song_list, list) or not song_list:
+                song_list = data.get("list") or data.get("lists") or []
             song_list = [x for x in song_list if isinstance(x, dict)] if isinstance(song_list, list) else []
             total = _to_int(data.get("total") or 0)
-            # total 缺省/为 0 时用本页条数（酷狗这个接口常不返 total）。
             if total <= 0:
                 total = len(song_list)
-            logger.warning("[KUGOU] album/songs album=%s got=%d total=%d",
-                           aid, len(song_list), total)
+            # pagesize 超限时酷狗返 errmsg="invalid param" 并空结果。
+            if not song_list and errmsg:
+                logger.warning("[KUGOU] album/songs empty errmsg=%r album=%s pagesize=%d",
+                               errmsg, aid, pagesize)
+            logger.warning("[KUGOU] album/songs album=%s got=%d total=%d errmsg=%r",
+                           aid, len(song_list), total, errmsg)
     except Exception as e:
         logger.warning("[KUGOU] album/songs error album=%s: %s", aid, e)
-        return {"items": [], "total": 0, "page": page, "pagesize": pagesize, "album_id": aid}
+        return empty
 
     items: list[dict] = []
     for it in song_list:
-        sid = str(it.get("hash") or it.get("filehash") or "").strip()
+        # 嵌套结构优先：base / audio_info / album_info / authors / trans_param / extend
+        base = it.get("base") or {}
+        audio_info = it.get("audio_info") or {}
+        album_info = it.get("album_info") or {}
+        tp = it.get("trans_param") or {}
+        sid = str(audio_info.get("hash") or audio_info.get("hash_320")
+                  or audio_info.get("hash_128") or base.get("audio_id")
+                  or it.get("hash") or it.get("filehash") or "").strip()
         if not sid:
             continue
-        singer_name = str(it.get("singername") or "").strip()
-        singers = [
-            {"name": part.strip(), "id": ""}
-            for part in re.split(r"[、,，/]", singer_name) if part.strip()
-        ] if singer_name else []
-        raw_name = str(it.get("name") or "").strip()
-        album_name = str(it.get("albumname") or it.get("album_name") or "").strip()
+
+        # 歌手：authors[] 带真实 author_id，可直接生成 artist guid。
+        authors_raw = it.get("authors") or []
+        singers: list[dict] = []
+        if isinstance(authors_raw, list) and authors_raw:
+            for a in authors_raw:
+                if not isinstance(a, dict):
+                    continue
+                nm = str(a.get("author_name") or a.get("name") or "").strip()
+                if not nm:
+                    continue
+                ai_s = str(a.get("author_id") or a.get("id") or "").strip()
+                singers.append({"name": nm, "id": ai_s})
+        if not singers:
+            singer_name = str(it.get("singername") or base.get("author_name") or "").strip()
+            singers = [
+                {"name": part.strip(), "id": ""}
+                for part in re.split(r"[、,，/]", singer_name) if part.strip()
+            ]
+        singer_name = "、".join(str(s.get("name") or "").strip() for s in singers
+                                if str(s.get("name") or "").strip())
+
+        raw_name = str(base.get("audio_name") or it.get("name") or "").strip()
+        album_name = str(album_info.get("album_name") or it.get("albumname")
+                         or it.get("album_name") or "").strip()
         title = _strip_singer_prefix_from_name(raw_name, [singer_name] if singer_name else [], album_name)
-        # timelength 是秒；异常大值（>10000）才当毫秒处理。
-        duration = _to_float(it.get("timelength") or 0)
-        if duration > 10000:
-            duration = duration / 1000.0
-        bitrate = _to_int(it.get("bitrate") or 0)
-        file_size = _to_int(it.get("size") or it.get("filesize") or 0)
+        # 曲名后缀（如 "(伴奏)"）拼在曲名后，供伴奏版本区分。
+        suffix = str(tp.get("songname_suffix") or "").strip()
+        if suffix and suffix not in title:
+            title = f"{title} {suffix}"
+
+        # audio_info.duration 是毫秒；兜底扁平 timelength 时 >10000 才当毫秒。
+        duration_ms = _to_int(audio_info.get("duration") or audio_info.get("duration_320")
+                              or audio_info.get("duration_128") or 0)
+        if duration_ms <= 0:
+            raw_tl = _to_int(it.get("timelength") or 0)
+            duration_ms = raw_tl if raw_tl > 1000 else int(raw_tl * 1000)
+        duration = duration_ms / 1000.0
+
+        bitrate = _to_int(audio_info.get("bitrate") or it.get("bitrate") or 0)
+        file_size = _to_int(audio_info.get("filesize_320") or audio_info.get("filesize")
+                            or it.get("size") or it.get("filesize") or 0)
         if not duration and file_size and bitrate:
             duration = file_size * 8 / (bitrate * 1000)
-        ext = str(it.get("filetype") or it.get("quality") or it.get("extname") or "mp3").strip().lower() or "mp3"
-        cover = str(it.get("image") or it.get("img") or it.get("image240") or "").strip()
+        ext = str(audio_info.get("extname") or it.get("extname") or it.get("filetype")
+                  or "mp3").strip().lower() or "mp3"
+        cover = str(album_info.get("cover") or tp.get("union_cover")
+                    or it.get("image") or "").strip()
+
         items.append({
             "id": f"kugou:{sid}",
             "source": "kugou",
@@ -615,7 +672,7 @@ async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50
             "artist": singer_name,
             "artists": singers,
             "album": album_name,
-            "album_id": str(it.get("albumid") or it.get("id") or aid).strip(),
+            "album_id": str(base.get("album_id") or it.get("albumid") or aid).strip(),
             "duration_s": duration,
             "ext": ext,
             "cover_url": cover,
@@ -624,9 +681,10 @@ async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50
             "bitrate": bitrate,
             "lyric": str(it.get("lyric") or "").strip(),
             "release_date": str(it.get("publish_time") or it.get("publish_date") or "").strip(),
+            "disc_no": _to_int((it.get("extend") or {}).get("disc") or 0) or None,
+            "track_no": _to_int((it.get("extend") or {}).get("sort") or 0) or None,
         })
     return {"items": items, "total": total, "page": page, "pagesize": pagesize, "album_id": aid}
-
 
 async def get_album_detail_bundle(album_id: int | str) -> dict:
     """/album/detail 聚合：detail 拿歌手名+专辑名 → search?type=album → 按 albumid 匹配。

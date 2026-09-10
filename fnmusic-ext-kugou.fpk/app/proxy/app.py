@@ -1310,6 +1310,20 @@ async def fetch_kugou_album_tracks(app_state, album_guid: str, page: int = 1, si
     return result
 
 
+def _safe_int_or_none(v: Any) -> int | None:
+    """把 discNo/trackNo 之类的可选序号字段转成 int 或 None。
+
+    0/空值/非数字都视为无值（飞牛对 discNo/trackNo 接受 null）。
+    """
+    if v is None or v == "":
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def build_online_track(item: dict) -> dict:
     """对齐飞牛音乐列表标准格式：只返回飞牛标准字段。"""
     guid = online_guid_from_item(item)
@@ -1418,8 +1432,8 @@ def build_online_track(item: dict) -> dict:
         "title": title,
         "coverId": guid,
         "year": year,
-        "discNo": None,
-        "trackNo": None,
+        "discNo": _safe_int_or_none(item.get("disc_no") or item.get("discNo")),
+        "trackNo": _safe_int_or_none(item.get("track_no") or item.get("trackNo")),
         "isrc": None,
         "duration": duration_ms,
         "isCue": False,
@@ -3633,13 +3647,12 @@ async def track_album_detail_list(request: Request):
     except (TypeError, ValueError):
         page = 1
     try:
-        size = int(request.query_params.get("size") or 50)
+        # 酷狗 /album/songs pagesize 硬上限 50，超过返 errmsg="invalid param" 空结果。
+        size = min(50, max(1, int(request.query_params.get("size") or 50)))
     except (TypeError, ValueError):
         size = 50
-    if size < 1:
-        size = 50
     payload = await fetch_kugou_album_tracks(request.app, album_guid, page=page, size=size)
-    # get_album_songs 内部已归一化为内部格式（timelength 秒口径）；
+    # get_album_songs 内部已按嵌套结构（base/audio_info/authors）归一化；
     # 不要再套 track_item_to_raw，否则会把 title 清空。
     raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
     tracks = [build_online_track(x) for x in raw_tracks if x.get("hash") or x.get("id")]
