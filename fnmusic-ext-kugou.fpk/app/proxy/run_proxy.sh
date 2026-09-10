@@ -13,8 +13,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-LOG_FILE="${FNMUSIC_RUN_LOG:-/tmp/fnmusic-ext-run.log}"
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+# 日志落在安装目录自带的 log/ 下（程序以 root 运行，可直接写）。
+# 写不进安装目录时退回 /tmp，避免启动脚本直接死掉。
+LOG_FILE="${FNMUSIC_RUN_LOG:-${BASE_DIR}/log/proxy.log}"
+if ! mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null; then
+    LOG_FILE="/tmp/fnmusic-ext-run.log"
+fi
+# 超过 10MB 滚动一次，避免安装目录被日志撑爆。
+if [ -f "$LOG_FILE" ] && [ "$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 10485760 ]; then
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+fi
 
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
@@ -42,7 +50,7 @@ probe_sock() {
 }
 
 echo "[run_proxy] 等待 trim-music 在 ${TARGET_SOCK} 或 ${UPSTREAM_SOCK} 上就绪..."
-exec > >(tee -a "$LOG_FILE") 2>&1
+exec >> "$LOG_FILE" 2>&1
 echo "===== run_proxy 启动 @ $(date '+%Y-%m-%d %H:%M:%S') ====="
 echo "BASE_DIR=${BASE_DIR}"
 FOUND_TRIM=0
