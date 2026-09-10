@@ -2260,7 +2260,6 @@ def get_upstream_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
-
 async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Response:
     url_path = request.url.path
     if request.url.query:
@@ -2501,11 +2500,52 @@ def _static_cover_placeholder_response() -> Response:
 _STATIC_COVER_FALLBACK_URL = "https://singerimg.kugou.com/uploadpic/softhead/none.jpg"
 _COVER_FALLBACK_CACHE: dict[str, tuple[bytes, str]] = {}
 
+# P1: 共享连接池。原来每个封面请求都新建 AsyncClient —— DNS + TCP + TLS
+# 握手每次重做，这是日志里耗时从 p50 0.5s 拉到 max 16.8s 的主因之一。
+# 复用后 keepalive 连接在池里挂着，同域后续请求直接命中热连接。
+# asyncio.Lock 防止并发首次创建出多个 client 实例（泄漏连接池）。
+_COVER_HTTP_TIMEOUT = httpx.Timeout(
+    connect=3.0,    # 原来 10s 共用。连不上就等满 10 秒才退兜底，白等
+    read=8.0,       # 图最大 500KB，慢网络仍给足
+    write=5.0,
+    pool=3.0,
+)
+_COVER_HTTP_LIMITS = httpx.Limits(
+    max_connections=50,
+    max_keepalive_connections=20,
+    keepalive_expiry=30.0,
+)
+_COVER_HTTP: httpx.AsyncClient | None = None
+_COVER_HTTP_LOCK = asyncio.Lock()
+
+
+async def _cover_http() -> httpx.AsyncClient:
+    """进程内共享的封面下载 client；关闭/异常后按请求重建。"""
+    global _COVER_HTTP
+    if _COVER_HTTP is not None and not _COVER_HTTP.is_closed:
+        return _COVER_HTTP
+    async with _COVER_HTTP_LOCK:
+        if _COVER_HTTP is None or _COVER_HTTP.is_closed:
+            _COVER_HTTP = httpx.AsyncClient(
+                timeout=_COVER_HTTP_TIMEOUT,
+                limits=_COVER_HTTP_LIMITS,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.kugou.com/"},
+            )
+    return _COVER_HTTP
+
+
+# 同一 URL 的并发兜底请求只让第一个真回源，其余等它 —— singleflight。
+# 冷启动时 N 个封面同时失败，会同时触发 N 个兜底回源，而缓存要等第一个
+# 回源成功后才写入；日志实锤 7 个并发各自回源、全超时、全退 1x1。
+_COVER_FALLBACK_LOCK = asyncio.Lock()
+
 
 async def _fetch_cover_fallback_response() -> Response:
     """兜底封面响应：优先内存缓存，回源一次后常驻；拉取失败退回 1x1 透明 PNG。
 
     进程生命周期内只回源一次，避免每个 guid 的兜底请求都打一次网络。
+    并发请求共用同一次回源结果，避免冷启动时重复打同一个 URL。
     """
     hit = _COVER_FALLBACK_CACHE.get("resp")
     if hit is not None:
@@ -2520,15 +2560,30 @@ async def _fetch_cover_fallback_response() -> Response:
                 "Cross-Origin-Resource-Policy": "same-origin",
             },
         )
-    resp = await _fetch_cover_image_response(_STATIC_COVER_FALLBACK_URL)
-    if resp is not None:
-        _COVER_FALLBACK_CACHE["resp"] = (resp.body, resp.media_type or "image/jpeg")
-        logger.warning("[COVERFALLBACK] origin-ok bytes=%d ct=%s url=%s",
-                       len(resp.body), resp.media_type, _STATIC_COVER_FALLBACK_URL)
-        return resp
-    # 兜底图本身也拉不下来，退回 1x1 透明 PNG —— 用户看到的 1x1 就是这一路
-    logger.warning("[COVERFALLBACK] origin-FAILED -> 1x1 PLACEHOLDER url=%s", _STATIC_COVER_FALLBACK_URL)
-    return _static_cover_placeholder_response()
+    async with _COVER_FALLBACK_LOCK:
+        # 抢到锁后再查一次：可能前一个持有者刚写入缓存
+        hit = _COVER_FALLBACK_CACHE.get("resp")
+        if hit is not None:
+            body, ct = hit
+            logger.warning("[COVERFALLBACK] cache-hit-after-wait bytes=%d ct=%s", len(body), ct)
+            return Response(
+                content=body,
+                status_code=200,
+                media_type=ct,
+                headers={
+                    "Cache-Control": "public, max-age=86400",
+                    "Cross-Origin-Resource-Policy": "same-origin",
+                },
+            )
+        resp = await _fetch_cover_image_response(_STATIC_COVER_FALLBACK_URL)
+        if resp is not None:
+            _COVER_FALLBACK_CACHE["resp"] = (resp.body, resp.media_type or "image/jpeg")
+            logger.warning("[COVERFALLBACK] origin-ok bytes=%d ct=%s url=%s",
+                           len(resp.body), resp.media_type, _STATIC_COVER_FALLBACK_URL)
+            return resp
+        # 兜底图本身也拉不下来，退回 1x1 透明 PNG —— 用户看到的 1x1 就是这一路
+        logger.warning("[COVERFALLBACK] origin-FAILED -> 1x1 PLACEHOLDER url=%s", _STATIC_COVER_FALLBACK_URL)
+        return _static_cover_placeholder_response()
 
 
 def build_lyric_list_payload(guid: str, lyric_text: str) -> dict:
@@ -3626,38 +3681,29 @@ async def _resolve_static_cover_guid(request: Request, subpath: str) -> tuple[st
 async def _fetch_cover_image_response(url: str) -> Response | None:
     """COEP 拦截 302 跨域跳转，改为服务端代理拉取图片后同源流式返回。
 
-    所有失败路径都带 [COVERIMG] 前缀并记录 elapsed，便于定位耗时/超时。
+    P0: connect 3s / read 8s，超时只重试一次（0.3s 间隔）
+    P1: 复用共享连接池 _cover_http()，不再每次新建 AsyncClient
     """
     t0 = time.monotonic()
+    cr = None
     try:
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.kugou.com/"},
-        ) as c:
-            cr = await c.get(url)
-            if cr.status_code == 200 and cr.content:
-                ct = cr.headers.get("content-type") or "image/jpeg"
+        c = await _cover_http()
+        for attempt in range(2):
+            try:
+                cr = await c.get(url)
+                break
+            except httpx.TimeoutException as te:
+                if attempt == 0:
+                    # P0: 重试一次。日志里 21:07:22 那批同域同路径全超时，
+                    # 但 21:07:26 同域一张就成功了 —— 是瞬时拥塞不是 CDN 挂。
+                    await asyncio.sleep(0.3)
+                    continue
                 logger.warning(
-                    "[COVERIMG] step7-fetch http=200 ok bytes=%d ct=%s elapsed=%.2fs url=%s",
-                    len(cr.content), ct, time.monotonic() - t0, url,
+                    "[COVERIMG] step7-fetch TIMEOUT %s:%s elapsed=%.2fs url=%s",
+                    type(te).__name__, te, time.monotonic() - t0, url,
                 )
-                return Response(
-                    content=cr.content,
-                    status_code=200,
-                    media_type=ct,
-                    headers={
-                        "Cache-Control": "public, max-age=86400",
-                        "Cross-Origin-Resource-Policy": "same-origin",
-                    },
-                )
-            logger.warning(
-                "[COVERIMG] step7-fetch NOT200 http=%d len=%d elapsed=%.2fs url=%s",
-                cr.status_code, len(cr.content), time.monotonic() - t0, url,
-            )
-            return None
+                return None
     except httpx.TimeoutException as e:
-        # 单独识别超时：timeout 是 10s，撞上就会走到 1x1 兜底图
         logger.warning(
             "[COVERIMG] step7-fetch TIMEOUT %s:%s elapsed=%.2fs url=%s",
             type(e).__name__, e, time.monotonic() - t0, url,
@@ -3669,6 +3715,29 @@ async def _fetch_cover_image_response(url: str) -> Response | None:
             type(e).__name__, e, time.monotonic() - t0, url,
         )
         return None
+
+    if cr is None or cr.status_code != 200 or not cr.content:
+        logger.warning(
+            "[COVERIMG] step7-fetch NOT200 http=%s len=%s elapsed=%.2fs url=%s",
+            getattr(cr, "status_code", None), len(getattr(cr, "content", b"") or b""),
+            time.monotonic() - t0, url,
+        )
+        return None
+
+    ct = cr.headers.get("content-type") or "image/jpeg"
+    logger.warning(
+        "[COVERIMG] step7-fetch http=200 ok bytes=%d ct=%s elapsed=%.2fs url=%s",
+        len(cr.content), ct, time.monotonic() - t0, url,
+    )
+    return Response(
+        content=cr.content,
+        status_code=200,
+        media_type=ct,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
 
 
 @app.get("/music/api/v1/lyric/list")
