@@ -3045,20 +3045,104 @@ async def search_suggest(request: Request):
         logger.warning("[SUGGEST] keyword=%r merged added=%d target=%s len=%d elem=%s",
                        keyword, added, target_type_key or 'list', len(target_list), elem_type)
 
+    # ---- 酷狗 专辑/歌手/歌单 注入 ----
+    # 飞牛 suggest 的 data 是分组结构 {track, album, artist, playlist}，此前只注入了
+    # track 这一组；客户端在其余三组拿到空列表，下拉建议就只剩歌曲。
+    # 数据源与 /search/album、/search/artist、/search/playlist 三个路由同接口同字段，
+    # 直接复用各自的 fetch 函数，避免映射逻辑出现第二份。
+    # 每项截 6 条：suggest 是下拉补全场景，给 track 留位置。
+    SUGGEST_KUGOU_PER_TYPE = 6
+    SUGGEST_KUGOU_TIMEOUT_S = 15.0
+
+    async def _fetch_kugou_suggest_all():
+        if not CONF.get("kugou_enabled", True):
+            return {}
+        results: dict[str, Any] = {}
+        pending = [
+            asyncio.create_task(
+                fetch_kugou_album_search(request.app, keyword, page=1, size=SUGGEST_KUGOU_PER_TYPE)),
+            asyncio.create_task(
+                fetch_kugou_artist_search(request.app, keyword, page=1, size=SUGGEST_KUGOU_PER_TYPE)),
+            asyncio.create_task(
+                fetch_kugou_playlist_search(request.app, keyword, page=1, size=SUGGEST_KUGOU_PER_TYPE)),
+        ]
+        names = ("album", "artist", "playlist")
+        try:
+            done = await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True),
+                                           timeout=SUGGEST_KUGOU_TIMEOUT_S)
+            for name, res in zip(names, done):
+                if isinstance(res, Exception):
+                    logger.warning("[SUGGEST] kugou %s error keyword=%r err=%s",
+                                   name, keyword, res)
+                    continue
+                lst = (res or {}).get("data", {}).get("list") or []
+                results[name] = lst[:SUGGEST_KUGOU_PER_TYPE]
+        except asyncio.TimeoutError:
+            logger.warning("[SUGGEST] kugou album/artist/playlist timeout keyword=%r", keyword)
+            for t in pending:
+                t.cancel()
+        return results
+
+    kugou_grouped = await _fetch_kugou_suggest_all()
+
+    def _merge_kugou_group(type_key: str, items: list[Any]) -> int:
+        """把酷狗结果并进 data[type_key]，兼容 {total,items[]} / {total,list[]} / 数组三种形态。
+
+        只合并已存在的组，不新建：客户端不请求该类型时，凭空加字段反而可能改变
+        它解析 data 的假设。同 guid 或同名视为已有，不重复追加。
+        """
+        slot = data_field.get(type_key) if isinstance(data_field, dict) else None
+        if isinstance(slot, list):
+            arr, holder, total_key = slot, data_field, "total"
+        elif isinstance(slot, dict):
+            if isinstance(slot.get("items"), list):
+                arr, holder = slot["items"], slot
+            elif isinstance(slot.get("list"), list):
+                arr, holder = slot["list"], slot
+            else:
+                return 0
+        else:
+            return 0
+        seen = set()
+        for x in arr:
+            if isinstance(x, str):
+                seen.add(x.strip().lower())
+            elif isinstance(x, dict):
+                g = str(x.get("guid") or "").strip().lower()
+                if g:
+                    seen.add(g)
+                n = str(x.get("name") or x.get("title") or "").strip().lower()
+                if n:
+                    seen.add(n)
+        merged = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            g = str(it.get("guid") or "").strip().lower()
+            n = str(it.get("name") or "").strip().lower()
+            if (g and g in seen) or (n and n in seen):
+                continue
+            arr.append(it)
+            if g:
+                seen.add(g)
+            if n:
+                seen.add(n)
+            merged += 1
+        try:
+            holder[total_key] = int(holder.get(total_key) or 0) + merged
+        except (TypeError, ValueError):
+            holder[total_key] = len(arr)
+        return merged
+
+    merged_counts = {n: _merge_kugou_group(n, v) for n, v in kugou_grouped.items()}
+    logger.warning("[SUGGEST] kugou groups keyword=%r merged=%s data_keys=%s",
+                   keyword, merged_counts,
+                   list(data_field.keys())[:15] if isinstance(data_field, dict) else 'N/A')
+
     # 同时注入 kugou_songs 字段作为兼容入口
     if isinstance(data_field, dict) and kugou_list:
         data_field["kugou_songs"] = [build_online_track(it) for it in kugou_list]
         data_field["kugouSongs"] = data_field["kugou_songs"]
-
-    # 注入 _debug
-    upstream_json["_debug"] = {
-        "keyword": keyword,
-        "upstream_data_type": type(data_field).__name__,
-        "upstream_data_keys": list(data_field.keys())[:15] if isinstance(data_field, dict) else (len(data_field) if isinstance(data_field, list) else 'N/A'),
-        "kugou_items": len(kugou_list),
-        "kugou_first_3": [(k.get('title'), k.get('artist')) for k in kugou_list[:3]],
-        "target_type_key": target_type_key,
-    }
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
