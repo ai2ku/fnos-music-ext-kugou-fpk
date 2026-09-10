@@ -2793,8 +2793,28 @@ async def _fetch_kugou_artist_cover_url(request: Request, artist_id: str) -> str
     return ""
 
 
+async def _fetch_kugou_album_cover_url(request: Request, album_id: str) -> str:
+    """用专辑 ID 直接调酷狗 /album/detail 取 sizable_cover。"""
+    if not album_id:
+        return ""
+    try:
+        detail = await kugou_source.get_album_detail(album_id)
+    except Exception as e:
+        logger.warning("[KUGOU_ALBUM_COVER] album/detail error album_id=%s err=%s", album_id, e)
+        return ""
+    if not detail:
+        logger.warning("[KUGOU_ALBUM_COVER] album/detail empty album_id=%s", album_id)
+        return ""
+    cover = str(detail.get("sizable_cover") or detail.get("coverUrl") or detail.get("Image") or "").strip()
+    if cover:
+        return _fill_cover_size(cover, request)
+    logger.warning("[KUGOU_ALBUM_COVER] no cover field album_id=%s keys=%s",
+                   album_id, sorted(detail.keys()))
+    return ""
+
+
 async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
-    """按 GUID 取封面：在线直取在线信息，酷狗歌单取 pic，本地回退到酷狗搜索。"""
+    """按 GUID 取封面：在线直取在线信息，酷狗歌单取 pic，酷狗专辑查详情，本地回退到酷狗搜索。"""
     if not guid:
         return ""
     if is_kugou_playlist_guid(guid):
@@ -2803,6 +2823,8 @@ async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
         if coll_id:
             return await _fetch_kugou_playlist_cover_url(request, coll_id)
         return ""
+    if isinstance(guid, str) and guid.startswith("online:kugou:album:"):
+        return await _fetch_kugou_album_cover_url(request, guid[len("online:kugou:album:"):])
     if isinstance(guid, str) and guid.startswith("online:kugou:artist:"):
         return await _fetch_kugou_artist_cover_url(request, guid[len("online:kugou:artist:"):])
     if is_online_guid(guid):

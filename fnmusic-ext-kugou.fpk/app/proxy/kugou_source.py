@@ -484,6 +484,50 @@ async def get_artist_audios(artist_id: int | str, sort: str = "hot", page: int =
         return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
 
 
+async def get_album_detail(album_id: int | str) -> dict:
+    """调 KuGouMusicApi /album/detail，返回专辑详情。
+
+    接口：/album/detail?id=180668003
+    回参：{"status": 1, "error_code": 0, "errmsg": "", "data": [ {...} ]}
+
+    data[] 单条字段（酷狗原始输出）：
+      album_id / album_name / sizable_cover(带 {size} 占位符)
+      cover(仅文件名，不能用) / author_name / authors[]
+      publish_date / language / type / publish_company / heat / category / intro
+    """
+    aid = str(album_id or "").strip()
+    if not aid:
+        return {}
+    try:
+        async with _client() as c:
+            r = await c.get("/album/detail", params={"id": aid})
+            if r.status_code != 200:
+                logger.warning("[KUGOU] album/detail http=%s album_id=%s body=%r",
+                               r.status_code, aid, r.text[:200])
+                return {}
+            body = r.json()
+            if not isinstance(body, dict):
+                logger.warning("[KUGOU] album/detail body type=%s album_id=%s body=%r",
+                               type(body).__name__, aid, str(body)[:200])
+                return {}
+            status = body.get("status", body.get("error_code"))
+            if status not in (1, 0, 200, None):
+                logger.warning("[KUGOU] album/detail status=%s album_id=%s errmsg=%r",
+                               status, aid, body.get("errmsg"))
+                return {}
+            data = body.get("data") or []
+            if isinstance(data, dict):
+                data = data.get("list") or data.get("items") or []
+            if not isinstance(data, list) or not data:
+                logger.warning("[KUGOU] album/detail empty data album_id=%s body=%r", aid, str(body)[:200])
+                return {}
+            first = data[0]
+            return first if isinstance(first, dict) else {}
+    except Exception as e:
+        logger.warning("[KUGOU] album/detail error album_id=%s: %s", aid, e)
+        return {}
+
+
 async def get_artist_albums(artist_id: int | str, page: int = 1, pagesize: int = 60) -> dict:
     """调 KuGouMusicApi /artist/albums，返回该歌手真实专辑列表。
 
