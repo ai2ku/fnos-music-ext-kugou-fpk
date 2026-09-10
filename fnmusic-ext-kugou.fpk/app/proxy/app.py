@@ -309,6 +309,11 @@ async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int =
                 "createdAt": ts,
                 "updatedAt": ts,
             })
+        # /artist/albums 的 authors 按酷狗自身顺序返回，当前歌手可能排在中间
+        # （如「讯号」里郁可唯在第 6 位）。列表是「该歌手的专辑」，把当前歌手
+        # 稳定排到最前，其余保持酷狗原始相对顺序。
+        self_guid = f"online:kugou:artist:{artist_id}"
+        artists.sort(key=lambda a: 0 if a.get("guid") == self_guid else 1)
         if not artists:
             continue
 
