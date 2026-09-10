@@ -1183,7 +1183,7 @@ async def fetch_kugou_artist_search(app_state, keyword: str, page: int = 1, size
 
     字段映射（实测 q=本兮 total=10；本接口字段是**大写首字母**风格，
     和 type=album 的小写字段完全不同，不能复用 search_albums_raw）：
-      AuthorId     -> guid = online:kugou:artist:<id>
+      AuthorId     -> guid = online:kugou:artist:<id>（拼接格式，不用 kugou_artist_guid 的 hash）
       AuthorName   -> name
       Avatar(240)  -> 不使用；coverId = guid，封面走 /static/cover 的
                      online:kugou:artist:<id> 解析链
@@ -1251,7 +1251,9 @@ async def fetch_kugou_artist_search(app_state, keyword: str, page: int = 1, size
         score = round(max(0.1, min(10.0, score)), 6)
 
         artist_list.append({
-            "guid": kugou_artist_guid(artist_id),
+            # 拼接格式，与 coverId 同值。不用 kugou_artist_guid()——那个返 hash，
+            # 会导致 guid 与 coverId 不一致，飞牛侧无法用 coverId 反查同一歌手。
+            "guid": kugou_artist_cover_guid(artist_id),
             "name": name,
             "coverId": kugou_artist_cover_guid(artist_id),
             "createdAt": ts,
