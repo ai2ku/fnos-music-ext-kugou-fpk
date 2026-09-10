@@ -2521,6 +2521,89 @@ _COVER_HTTP_LIMITS = httpx.Limits(
 _COVER_HTTP: httpx.AsyncClient | None = None
 _COVER_HTTP_LOCK = asyncio.Lock()
 
+# 磁盘缓存：酷狗图片 URL 对同一歌曲恒定不变（stdmusic/160/...），同一张图
+# 被反复下载十几次，批量刷列表时 10+ 并发同刷又把连接池顶爆 -> 超时 ->
+# fallback 默认图。缓存后首次回源，后续全走本地。
+_COVER_DISK_TTL = 24 * 3600
+_COVER_DISK_MAX_FILES = 500
+
+
+def _cover_disk_dir() -> str:
+    return CONF["cache_dir"]
+
+
+def _cover_disk_file(url: str) -> str:
+    return os.path.join(
+        _cover_disk_dir(),
+        hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] + ".cover",
+    )
+
+
+def _cover_disk_get(url: str) -> Response | None:
+    """读磁盘缓存；不存在/过期/读失败均返回 None。"""
+    path = _cover_disk_file(url)
+    try:
+        st = os.stat(path)
+        if time.time() - st.st_mtime > _COVER_DISK_TTL:
+            return None
+        with open(path, "rb") as f:
+            body = f.read()
+        if not body:
+            return None
+    except (FileNotFoundError, OSError):
+        return None
+    except Exception as e:
+        logger.warning("[COVERCACHE] read-fail path=%s err=%s", path, e)
+        return None
+    return Response(
+        content=body,
+        status_code=200,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=86400",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
+
+
+def _cover_disk_put(url: str, body: bytes) -> None:
+    """写磁盘缓存。tmp + os.replace 原子替换，防并发写半截文件。"""
+    path = _cover_disk_file(url)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(_cover_disk_dir(), exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("[COVERCACHE] write-fail path=%s err=%s", path, e)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _cover_disk_cleanup() -> None:
+    """超限时按 mtime 清旧，避免缓存无限增长。"""
+    try:
+        files = [
+            (os.stat(p).st_mtime, p)
+            for p in (
+                os.path.join(_cover_disk_dir(), n)
+                for n in os.listdir(_cover_disk_dir())
+                if n.endswith(".cover")
+            )
+        ]
+        if len(files) <= _COVER_DISK_MAX_FILES:
+            return
+        for _, p in sorted(files)[: len(files) - _COVER_DISK_MAX_FILES]:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning("[COVERCACHE] cleanup-fail err=%s", e)
+
 
 async def _cover_http() -> httpx.AsyncClient:
     """进程内共享的封面下载 client；关闭/异常后按请求重建。"""
@@ -3684,11 +3767,22 @@ async def _resolve_static_cover_guid(request: Request, subpath: str) -> tuple[st
 async def _fetch_cover_image_response(url: str) -> Response | None:
     """COEP 拦截 302 跨域跳转，改为服务端代理拉取图片后同源流式返回。
 
-    P0: connect 3s / read 8s，超时只重试一次（0.3s 间隔）
-    P1: 复用共享连接池 _cover_http()，不再每次新建 AsyncClient
+    磁盘缓存：cache/<sha256(url)[:32]>.cover，24h TTL，回源成功后落盘。
+    同一张列表缩略图 URL 对同一歌曲恒定不变，无缓存时被下载十几次；
+    缓存后只让首次请求打网络，后续全走本地，批量刷新时的并发超时消失。
     """
     t0 = time.monotonic()
-    cr = None
+    cached = _cover_disk_get(url)
+    if cached is not None:
+        return cached
+    return await _fetch_cover_image_origin(url, t0)
+
+
+async def _fetch_cover_image_origin(url: str, t0: float) -> Response | None:
+    """纯网络回源：共享连接池 + connect 3s / read 8s + 超时重试一次。
+
+    成功后写磁盘缓存；失败返回 None，由上层决定兜底。
+    """
     try:
         c = await _cover_http()
         for attempt in range(2):
@@ -3728,6 +3822,8 @@ async def _fetch_cover_image_response(url: str) -> Response | None:
         return None
 
     ct = cr.headers.get("content-type") or "image/jpeg"
+    _cover_disk_put(url, cr.content)
+    _cover_disk_cleanup()
     logger.warning(
         "[COVERIMG] step7-fetch http=200 ok bytes=%d ct=%s elapsed=%.2fs url=%s",
         len(cr.content), ct, time.monotonic() - t0, url,
