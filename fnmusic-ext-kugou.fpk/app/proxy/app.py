@@ -20,7 +20,7 @@ import shutil
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Callable, Coroutine
+from typing import Any, AsyncGenerator, Awaitable, Callable, Coroutine
 from urllib.parse import quote, urlencode, parse_qs
 from uuid import uuid4
 from datetime import datetime
@@ -69,6 +69,7 @@ CONF = {
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "true").lower() in ("true", "1", "yes"),
+    "merge_search_meta": os.environ.get("FNMUSIC_MERGE_SEARCH_META", "true").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
@@ -2449,6 +2450,177 @@ def merge_online_tracks(
     return upstream_json
 
 
+# 名称去重键：去空白 + 全角空格/不可见字符清除 + 大小写归一。
+# 歌手名带空格（"周杰伦 Live"）、专辑名带括号（"1988（1988复刻）"）、
+# 中英混写都会让裸 strip().lower() 判重失败，导致同一实体本地/线上双出。
+_NAME_INVIS_RE = re.compile(r"[\s\u3000\u00a0\ufeff]+")
+
+
+def _search_name_key(name: Any) -> str:
+    s = _NAME_INVIS_RE.sub("", str(name or "")).lower()
+    return s
+
+
+def merge_search_meta(
+    upstream_json: dict,
+    kugou_payload: dict | None,
+    tag: str = "meta",
+) -> dict:
+    """歌手 / 歌单 / 专辑搜索：官方（本地+飞牛线上）结果在前，酷狗结果在后。
+
+    此前三个 /search/{artist,playlist,album} 路由只要有酷狗结果就直接
+    整包返回 kugou_payload，官方搜索结果被整个替换掉（本地歌手被覆盖）；
+    且请求上游的这一步从未发生过。
+
+    - 仅按「规范化名称」去重：酷狗侧名称已被官方侧命中时剔除，
+      避免同一歌手/专辑双出；guid/coverId 不同不视为重复
+    - 空 coverId 一律兜底为本项自身 guid（本地/线上均同）：
+      本地曲目无专辑封面时上游标 coverId=null；酷狗侧 guid 形如
+      online:kugou:{artist|album|playlist}:<id>，封面路由本身就该按
+      guid 解析，不能因带 online: 前缀就跳过
+    - 酷狗侧失败/为空时原样返回官方结果；total 取两边相加
+    """
+    target_list = ensure_search_list(upstream_json)
+
+    def _fill_cover(item: dict) -> None:
+        """空 coverId 兜底为本项自身 guid（本地/线上/酷狗项均适用）。
+
+        酷狗 item 的 guid 形如 online:kugou:{artist|album|playlist}:<id>，
+        封面路由本就按 guid 解析，不能因带 online: 前缀就跳过。
+        """
+        guid = str(item.get("guid") or "").strip()
+        if guid and item.get("coverId") in (None, ""):
+            item["coverId"] = guid
+
+    # 官方（本地+飞牛线上）项先补一遍；酷狗项在 append 时补。
+    for item in target_list:
+        if isinstance(item, dict):
+            _fill_cover(item)
+
+    kugou_list: list[dict] = []
+    kugou_total = 0
+    if isinstance(kugou_payload, dict):
+        if isinstance(kugou_payload.get("code"), int) and kugou_payload.get("code") != 0:
+            kugou_list = []
+        else:
+            kd = kugou_payload.get("data")
+            if isinstance(kd, dict) and isinstance(kd.get("list"), list):
+                kugou_list = [x for x in kd["list"] if isinstance(x, dict)]
+                kugou_total = _read_int(kd.get("total"), len(kugou_list))
+
+    official_total = _read_int(_search_data_root(upstream_json).get("total"), len(target_list))
+
+    if not kugou_list:
+        logger.warning(
+            "[SEARCH_%s] official_count=%d official_total=%d kugou_items=0 merged=%d",
+            tag.upper(), len(target_list), official_total, len(target_list),
+        )
+        return upstream_json
+
+    existing_keys = set()
+    for item in target_list:
+        if isinstance(item, dict):
+            k = _search_name_key(item.get("name") or item.get("title") or "")
+            if k:
+                existing_keys.add(k)
+
+    merged = []
+    dup = 0
+    for item in kugou_list:
+        k = _search_name_key(item.get("name") or item.get("title") or "")
+        if k and k in existing_keys:
+            dup += 1
+            continue
+        _fill_cover(item)
+        if k:
+            existing_keys.add(k)
+        merged.append(item)
+
+    target_list.extend(merged)
+    total = official_total + kugou_total
+    if total > 0:
+        _search_data_root(upstream_json)["total"] = total
+
+    logger.warning(
+        "[SEARCH_%s] official_count=%d official_total=%d kugou_items=%d dup_skipped=%d merged=%d total=%d",
+        tag.upper(), len(target_list) - len(merged), official_total,
+        len(kugou_list), dup, len(target_list), total,
+    )
+    return upstream_json
+
+
+async def _upstream_search_envelope(
+    request: Request, client: httpx.AsyncClient
+) -> dict | None:
+    """拉取官方搜索结果；非 200 / 非 JSON / code!=0 一律返回 None。
+
+    返回 None 时调用方决定回退（用酷狗结果或再透传一次上游响应）。
+    """
+    url_path = request.url.path
+    if request.url.query:
+        url_path = f"{url_path}?{request.url.query}"
+    headers = copy_incoming_headers(request)
+    req = client.build_request("GET", url_path, headers=headers)
+    resp = await client.send(req)
+    if resp.status_code != 200:
+        logger.warning("[SEARCH_META_UPSTREAM] http=%s path=%s", resp.status_code, request.url.path)
+        return None
+    try:
+        payload = resp.json()
+    except Exception:
+        logger.warning("[SEARCH_META_UPSTREAM] non-json path=%s", request.url.path)
+        return None
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        logger.warning(
+            "[SEARCH_META_UPSTREAM] bad envelope path=%s code=%r",
+            request.url.path, payload.get("code") if isinstance(payload, dict) else None,
+        )
+        return None
+    return payload
+
+
+async def merged_search_meta(
+    request: Request,
+    fetcher: Callable[..., Awaitable[dict | None]],
+    tag: str,
+) -> Response:
+    """歌手/歌单/专辑搜索的统一处理：官方在前，酷狗在后。
+
+    空关键词原样透传上游（官方默认列表），不发酷狗请求。
+    酷狗侧失败时不影响官方结果；上游侧失败时用酷狗结果兜底，
+    两者都拿不到则再透传上游原始响应。
+    """
+    if not CONF.get("merge_search_meta", True):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    upstream_client = get_upstream_client(request.app)
+    keyword = extract_keyword(request)
+    if not keyword:
+        return await forward_to_upstream(request, upstream_client)
+
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        # 酷狗 /search 未观察到 pagesize 硬上限，50 是响应体积保护。
+        size = max(1, int(request.query_params.get("size") or 24))
+    except (TypeError, ValueError):
+        size = 24
+    if size > 50:
+        size = 50
+
+    upstream_json = await _upstream_search_envelope(request, upstream_client)
+    kugou_payload = await fetcher(request.app, keyword, page=page, size=size)
+
+    if not isinstance(upstream_json, dict):
+        if isinstance(kugou_payload, dict):
+            return JSONResponse(content=kugou_payload, status_code=200)
+        return await forward_to_upstream(request, upstream_client)
+
+    return JSONResponse(content=merge_search_meta(upstream_json, kugou_payload, tag=tag))
+
+
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
     if path_guid:
         return path_guid
@@ -3020,25 +3192,9 @@ async def search_artist(request: Request):
 
     响应结构对齐飞牛原生 /search/artist（{"code":0,"data":{"list":[...],"total":n}}），
     artist 项字段：guid/name/coverId/createdAt/updatedAt/trackCount/albumCount/score。
+    本地与酷狗结果合并，官方在前、酷狗在后（见 merged_search_meta）。
     """
-    keyword = extract_keyword(request)
-    if not keyword:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
-    try:
-        page = max(1, int(request.query_params.get("page") or 1))
-    except (TypeError, ValueError):
-        page = 1
-    try:
-        # 同 search/album：/search 未观察到 pagesize 硬上限，50 是响应体积保护。
-        size = max(1, int(request.query_params.get("size") or 24))
-    except (TypeError, ValueError):
-        size = 24
-    if size > 50:
-        size = 50
-    kugou_payload = await fetch_kugou_artist_search(request.app, keyword, page=page, size=size)
-    if isinstance(kugou_payload, dict):
-        return JSONResponse(content=kugou_payload, status_code=200)
-    return await forward_to_upstream(request, get_upstream_client(request.app))
+    return await merged_search_meta(request, fetch_kugou_artist_search, tag="artist")
 
 @app.get("/music/api/v1/search/album")
 @app.get("/music/api/v1/search/album/{subpath=path}")
@@ -3050,27 +3206,9 @@ async def search_album(request: Request):
 
     响应结构对齐飞牛原生 /search/album（{"code":0,"data":{"list":[...],"total":n}}），
     album 项字段：guid/name/coverId/releaseDate/barcode/createdAt/updatedAt/
-    artists/trackCount/score。
+    artists/trackCount/score。本地与酷狗结果合并，官方在前、酷狗在后。
     """
-    keyword = extract_keyword(request)
-    if not keyword:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
-    try:
-        page = max(1, int(request.query_params.get("page") or 1))
-    except (TypeError, ValueError):
-        page = 1
-    try:
-        # 酷狗 /search 未观察到 pagesize 硬上限（51 仍正常返回），但飞牛侧
-        # 常见传法不超过 100，超 50 时压回 50 以控制单次响应体积与耗时。
-        size = max(1, int(request.query_params.get("size") or 24))
-    except (TypeError, ValueError):
-        size = 24
-    if size > 50:
-        size = 50
-    kugou_payload = await fetch_kugou_album_search(request.app, keyword, page=page, size=size)
-    if isinstance(kugou_payload, dict):
-        return JSONResponse(content=kugou_payload, status_code=200)
-    return await forward_to_upstream(request, get_upstream_client(request.app))
+    return await merged_search_meta(request, fetch_kugou_album_search, tag="album")
 
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
@@ -3935,24 +4073,9 @@ async def search_playlist(request: Request):
 
     响应结构对齐飞牛原生 /search/playlist（{"code":0,"data":{"list":[...],"total":n}}），
     playlist 项字段：guid/name/coverId/createdAt/updatedAt/trackCount/score。
+    本地与酷狗结果合并，官方在前、酷狗在后。
     """
-    keyword = extract_keyword(request)
-    if not keyword:
-        return await forward_to_upstream(request, get_upstream_client(request.app))
-    try:
-        page = max(1, int(request.query_params.get("page") or 1))
-    except (TypeError, ValueError):
-        page = 1
-    try:
-        size = max(1, int(request.query_params.get("size") or 24))
-    except (TypeError, ValueError):
-        size = 24
-    if size > 50:
-        size = 50
-    kugou_payload = await fetch_kugou_playlist_search(request.app, keyword, page=page, size=size)
-    if isinstance(kugou_payload, dict):
-        return JSONResponse(content=kugou_payload, status_code=200)
-    return await forward_to_upstream(request, get_upstream_client(request.app))
+    return await merged_search_meta(request, fetch_kugou_playlist_search, tag="playlist")
 
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
