@@ -342,13 +342,13 @@ async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int =
         return {
             "code": 0,
             "msg": "",
-            "data": {"list": [], "total": 0, "sort": "publishDate,desc"},
+            "data": {"list": [], "total": int(result.get("total") or 0), "sort": "publishDate,desc"},
         }
     album_list = [seen[k] for k in order]
     return {
         "code": 0,
         "msg": "",
-        "data": {"list": album_list, "total": len(album_list), "sort": "publishDate,desc"},
+        "data": {"list": album_list, "total": int(result.get("total") or len(album_list)), "sort": "publishDate,desc"},
     }
 
 
