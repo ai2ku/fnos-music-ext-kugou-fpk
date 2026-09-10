@@ -211,15 +211,18 @@ def kugou_artist_guid(artist_id: int | str) -> str:
 
 
 def kugou_album_guid(album_id: int | str) -> str:
-    return stable_hash64(f"kugou:album:{album_id}")
+    """专辑 GUID：online:kugou:album:<album_id>。封面解析由对应路由自己负责。"""
+    return f"online:kugou:album:{album_id}"
 
 
 def kugou_artist_cover_guid(artist_id: int | str) -> str:
-    return "artist_" + stable_hash64(f"kugou:artist:cover:{artist_id}")
+    """歌手封面 ID 与歌手 GUID 同值，由封面解析路由自己识别。"""
+    return f"online:kugou:artist:{artist_id}"
 
 
 def kugou_album_cover_guid(album_id: int | str) -> str:
-    return "album_" + stable_hash64(f"kugou:album:cover:{album_id}")
+    """专辑封面 ID 与专辑 GUID 同值，由封面解析路由自己识别。"""
+    return f"online:kugou:album:{album_id}"
 
 
 def parse_kugou_artist_guid(raw_guid: str) -> tuple[str, str]:
@@ -256,76 +259,96 @@ def parse_ts_to_unix(value: Any) -> int:
 
 
 async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int = 1, size: int = 60) -> dict | None:
-    """酷狗歌手作品 -> 飞牛 album/artist-detail/list 的专辑列表。"""
-    artist_id = str(artist_guid or "").strip()
-    if not artist_id:
+    """酷狗歌手专辑 -> 飞牛 album/artist-detail/list 的专辑列表。
+
+    数据源：KuGouMusicApi /artist/albums?id=<artist_id>
+    （不再从 /artist/audios 聚合——那个接口拿不到真实专辑元数据，
+      多歌手专辑也无法归集，trackCount 更是靠数本页歌曲凑出来的假数。）
+    """
+    parsed_artist_id, artist_kind = parse_kugou_artist_guid(artist_guid)
+    if not parsed_artist_id or artist_kind != "kugou_artist":
         return None
-    if len(artist_id) == 64:
-        # 当前只接入酷狗数字 ID；稳定 hash GUID 没有反查表，不猜原 ID。
-        return None
+    artist_id = parsed_artist_id
     try:
-        result = await kugou_source.get_artist_audios(artist_id, sort="hot", page=page, pagesize=size)
+        result = await kugou_source.get_artist_albums(artist_id, page=page, pagesize=size)
     except Exception as e:
         logger.warning("[KUGOU_ARTIST_ALBUM] artist_id=%s error=%s", artist_id, e)
         return None
     items = result.get("items") or []
+    logger.warning("[KUGOU_ARTIST_ALBUM] artist_id=%s page=%s size=%s got=%s total=%s",
+                   artist_id, page, size, len(items), result.get("total"))
+
     seen: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        album_id = str(item.get("album_id") or item.get("albumId") or item.get("album_id") or "").strip()
-        album_name = str(item.get("album") or item.get("albumName") or item.get("album_name") or "").strip()
-        if not album_name:
+        album_id = str(item.get("album_id") or "").strip()
+        album_name = str(item.get("album_name") or item.get("album") or "").strip()
+        if not album_id and not album_name:
             continue
-        release_date = str(item.get("release_date") or "").strip() or None
-        track_count = seen.get(album_name, {}).get("trackCount", 0) + 1
-        album_guid = kugou_album_guid(album_id or album_name)
-        artist_name = str(item.get("artist") or "").strip()
-        ts = parse_ts_to_unix(item.get("release_date") or item.get("releaseDate") or item.get("publish_date"))
-        entry = seen.setdefault(album_name, {
-            "guid": album_guid,
-            "name": album_name,
-            "coverId": kugou_album_cover_guid(album_id or album_name),
-            "releaseDate": release_date,
-            "barcode": None,
-            "createdAt": ts,
-            "updatedAt": ts,
-            "artists": [
-                {
-                    "guid": artist_id,
-                    "name": artist_name,
-                    "coverId": kugou_artist_cover_guid(artist_id),
-                    "createdAt": ts,
-                    "updatedAt": ts,
-                }
-            ],
-            "trackCount": track_count,
-        })
-        if release_date and not entry.get("releaseDate"):
-            entry["releaseDate"] = release_date
+
+        release_date = str(item.get("publish_date") or "").strip() or None
+        ts = parse_ts_to_unix(release_date or time.time())
+        # /artist/albums 回参没有专辑曲目数字段，没有就不编。
+        track_count = 0
+
+        artists: list[dict[str, Any]] = []
+        for art in item.get("artists") or []:
+            if not isinstance(art, dict):
+                continue
+            name = str(art.get("name") or "").strip()
+            if not name:
+                continue
+            aid = str(art.get("id") or "").strip()
+            artists.append({
+                # 有真实 author_id 用数字 ID，没有（仅 author_name 拆分而来）回退到当前歌手。
+                "guid": f"online:kugou:artist:{aid}" if aid else f"online:kugou:artist:{artist_id}",
+                "name": name,
+                "coverId": kugou_artist_cover_guid(aid) if aid else kugou_artist_cover_guid(artist_id),
+                "createdAt": ts,
+                "updatedAt": ts,
+            })
+        if not artists:
+            continue
+
+        key = album_id or album_name
+        if key not in seen:
+            seen[key] = {
+                "guid": kugou_album_guid(album_id or album_name),
+                "name": album_name,
+                "coverId": kugou_album_cover_guid(album_id or album_name),
+                "releaseDate": release_date,
+                "barcode": None,
+                "createdAt": ts,
+                "updatedAt": ts,
+                "artists": artists,
+                "trackCount": track_count,
+                "language": str(item.get("language") or "").strip() or None,
+                "albumType": str(item.get("album_type") or "").strip() or None,
+                "publishCompany": str(item.get("publish_company") or "").strip() or None,
+            }
+            order.append(key)
+        entry = seen[key]
         entry["trackCount"] = track_count
-        if artist_name and not (entry.get("artists") or [{}])[0].get("name"):
-            entry["artists"] = [
-                {
-                    "guid": artist_id,
-                    "name": artist_name,
-                    "coverId": kugou_artist_cover_guid(artist_id),
-                    "createdAt": ts,
-                    "updatedAt": ts,
-                }
-            ]
+        if not entry.get("releaseDate") and release_date:
+            entry["releaseDate"] = release_date
+        if not entry.get("language") and item.get("language"):
+            entry["language"] = str(item.get("language") or "").strip() or None
+        if not entry.get("albumType") and item.get("album_type"):
+            entry["albumType"] = str(item.get("album_type") or "").strip() or None
+
     if not seen:
         return {
             "code": 0,
             "msg": "",
-            "data": {"list": [], "total": 0, "sort": "newTrackAddedAt,desc"},
+            "data": {"list": [], "total": 0, "sort": "publishDate,desc"},
         }
-    album_list = list(seen.values())
+    album_list = [seen[k] for k in order]
     return {
         "code": 0,
         "msg": "",
-        "data": {"list": album_list, "total": len(album_list), "sort": "newTrackAddedAt,desc"},
+        "data": {"list": album_list, "total": len(album_list), "sort": "publishDate,desc"},
     }
 
 

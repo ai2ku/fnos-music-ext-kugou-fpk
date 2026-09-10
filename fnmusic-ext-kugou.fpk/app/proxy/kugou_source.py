@@ -484,6 +484,147 @@ async def get_artist_audios(artist_id: int | str, sort: str = "hot", page: int =
         return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
 
 
+async def get_artist_albums(artist_id: int | str, page: int = 1, pagesize: int = 60) -> dict:
+    """调 KuGouMusicApi /artist/albums，返回该歌手真实专辑列表。
+
+    接口：/artist/albums?id=6539&page=1&pagesize=60
+    回参：{"total": n, "error_code": 0, "status": 1, "data": [...],
+           "extra": {"page_total": n}, "errmsg": "success"}
+
+    data[] 真实字段（酷狗原始输出，与 /artist/audios 不同）：
+      album_id / album_name / author_name(可能多人，顿号分隔)
+      authors: [{"author_name": 名, "author_id": 数字ID}]  ← 带真实歌手 ID
+      sizable_cover(带 {size} 占位符) / cover(文件名)
+      publish_date(YYYY-MM-DD) / language / type(单曲专辑|原声带|录音室专辑|...)
+      heat / category / grade / quality / is_publish / publish_company / intro
+    """
+    aid = str(artist_id or "").strip()
+    if not aid:
+        return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+    try:
+        async with _client() as c:
+            r = await c.get(
+                "/artist/albums",
+                params={"id": aid, "page": page, "pagesize": pagesize},
+            )
+            if r.status_code != 200:
+                logger.warning("[KUGOU] artist/albums http=%s aid=%s body=%r", r.status_code, aid, r.text[:200])
+                return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+            body = r.json()
+            if not isinstance(body, dict):
+                logger.warning("[KUGOU] artist/albums body type=%s aid=%s body=%r", type(body).__name__, aid, str(body)[:200])
+                return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+            status = body.get("status", body.get("error_code"))
+            if status not in (1, 0, 200, None):
+                logger.warning("[KUGOU] artist/albums status=%s aid=%s errmsg=%r", status, aid, body.get("errmsg"))
+                return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+            data = body.get("data") or []
+            if isinstance(data, dict):
+                data = data.get("list") or data.get("items") or []
+            raw_items = data if isinstance(data, list) else []
+            items: list[dict] = []
+            for it in raw_items:
+                if not isinstance(it, dict):
+                    continue
+                item = album_item_to_raw(it)
+                if not item:
+                    continue
+                items.append(item)
+            try:
+                total = int(body.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if not total:
+                extra = body.get("extra") or {}
+                if isinstance(extra, dict):
+                    try:
+                        total = int(extra.get("page_total") or 0)
+                    except (TypeError, ValueError):
+                        total = 0
+            return {
+                "items": items,
+                "total": max(total, len(items)),
+                "page": page,
+                "pagesize": pagesize,
+                "artist_id": aid,
+            }
+    except Exception as e:
+        logger.warning("[KUGOU] artist/albums error aid=%s: %s", aid, e)
+        return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+
+
+def album_item_to_raw(it: dict) -> dict:
+    """把 /artist/albums 单条专辑映射为内部统一格式。
+
+    与 track_item_to_raw 不同：这里 authors 是数组且带真实 author_id，
+    歌手 ID 不用再反查。
+    """
+    if not isinstance(it, dict):
+        return {}
+    album_id = _pick_ci(it, "album_id", "albumId", "AlbumID", "albumID")
+    album_name = _pick_ci(it, "album_name", "albumName", "albumname", "AlbumName")
+    if not album_id and not album_name:
+        return {}
+
+    # authors 数组优先（带 author_id）；回退到 author_name 字符串拆分。
+    artists: list[dict] = []
+    seen_names: set[str] = set()
+    authors = it.get("authors")
+    if isinstance(authors, list):
+        for au in authors:
+            if not isinstance(au, dict):
+                continue
+            name = str(au.get("author_name") or au.get("authorName") or au.get("name") or "").strip()
+            if not name or name in seen_names:
+                continue
+            author_id = str(au.get("author_id") or au.get("authorId") or au.get("AuthorID") or "").strip()
+            artists.append({"name": name, "id": author_id})
+            seen_names.add(name)
+    if not artists:
+        singer_text = _pick_ci(it, "author_name", "authorName", "singername", "singername",
+                               "SingerName", "artist", "author")
+        for name in _split_singers(singer_text):
+            if name and name not in seen_names:
+                artists.append({"name": name, "id": ""})
+                seen_names.add(name)
+
+    # 封面：sizable_cover 带 {size} 占位符；顶层 cover 只是文件名，不能用。
+    cover_url = _pick_ci(it, "sizable_cover", "sizableCover", "SizableCover",
+                         "sizable_cover_url", "coverUrl", "Image", "Image_300x300")
+    if not cover_url:
+        cover_url = _pick_ci(it, "cover", "pic", "avatar")
+
+    return {
+        "id": f"kugou:album:{album_id}" if album_id else "",
+        "source": "kugou",
+        "album_id": album_id,
+        "album": album_name,
+        "album_name": album_name,
+        "artists": artists,
+        "artist": "、".join(a["name"] for a in artists if a["name"]),
+        "cover_url": cover_url,
+        "union_cover": cover_url,
+        "publish_date": _pick_ci(it, "publish_date", "publishDate", "PublishDate", "pub_date"),
+        "language": _pick_ci(it, "language", "Language"),
+        "album_type": _pick_ci(it, "type", "album_type", "albumType"),
+        "publish_company": _pick_ci(it, "publish_company", "publishCompany", "company"),
+        "heat": _to_int(it.get("heat") or 0),
+        "category": _to_int(it.get("category") or 0),
+        "intro": _pick_ci(it, "intro", "album_intro", "desc", "description"),
+        "is_publish": _to_int(it.get("is_publish") if it.get("is_publish") is not None else 1),
+    }
+
+
+def _split_singers(text: str) -> list[str]:
+    """拆分酷狗顿号/逗号分隔的多歌手字符串。"""
+    out: list[str] = []
+    for part in re.split(r"[、,，/]+", str(text or "")):
+        name = part.strip()
+        if name:
+            out.append(name)
+    return out
+
+
 def _field(it: dict, keys: tuple[str, ...], default: Any = "") -> Any:
     """按 KuGouMusicApi 常见大小写/命名兼容取字段。"""
     for k in keys:
