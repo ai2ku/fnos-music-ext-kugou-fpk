@@ -1087,8 +1087,16 @@ def _existing_local_lyric(payload: dict) -> str:
     return ""
 
 
-async def forward_upstream_with_local_lyric_fallback(request: Request, client: httpx.AsyncClient) -> Response:
-    """透传上游；本地歌 metadata 强制 hasLyric=True，避免前端首次播放不请求歌词。"""
+async def forward_upstream_with_local_lyric_fallback(
+    request: Request,
+    client: httpx.AsyncClient,
+    local_cover_guid: str = "",
+) -> Response:
+    """透传上游；本地歌 metadata 强制 hasLyric=True，避免前端首次播放不请求歌词。
+
+    local_cover_guid 非空时（本地曲目）同步补 data.track.coverId = 该 guid；
+    歌词路由不传，行为不变。
+    """
     payload_or_resp = await fetch_upstream_envelope(request, client)
     if isinstance(payload_or_resp, Response):
         return payload_or_resp
@@ -1097,12 +1105,33 @@ async def forward_upstream_with_local_lyric_fallback(request: Request, client: h
     if not isinstance(payload, dict) or payload.get("code") != 0:
         return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
     force_has_lyric_true(payload)
+    if local_cover_guid:
+        fill_local_metadata_cover_id(payload, local_cover_guid)
     return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
 
 
 def force_has_lyric_true(payload: dict) -> None:
     """把 metadata/lyric 上游响应里所有可能的 hasLyric 字段强制置为 true。"""
     payload["data"]["track"]["hasLyric"] = True
+
+
+def fill_local_metadata_cover_id(payload: dict, guid: str) -> None:
+    """本地曲目透传飞牛后补 data.track.coverId。
+
+    本地 guid 无 online: 前缀，track_metadata 走上游分支；上游的
+    data.track 不保证带 coverId，前端按 track.coverId 取封面时会拿不到，
+    因此用歌曲自身 guid 兜底（本地封面链路本就按 guid 解析）。
+    已有非空 coverId 时不覆盖，避免改掉上游返回的有效值。
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return
+    track = data.get("track")
+    if not isinstance(track, dict):
+        return
+    if str(track.get("coverId") or "").strip():
+        return
+    track["coverId"] = guid
 
 
 def fill_local_track_list_cover_ids(payload: dict) -> None:
@@ -1373,6 +1402,100 @@ async def fetch_kugou_album_search(app_state, keyword: str, page: int = 1, size:
         "data": {
             "list": album_list,
             "total": total if total > 0 else len(album_list),
+        },
+    }
+
+
+async def fetch_kugou_playlist_search(app_state, keyword: str, page: int = 1, size: int = 24) -> dict:
+    """酷狗专题歌单搜索 -> 飞牛 /music/api/v1/search/playlist。
+
+    数据源：KuGouMusicApi /search?keywords=<kw>&page=&pagesize=&type=special。
+
+    字段映射（实测 q=测试 total=480）：
+      gid / suid   -> guid = online:kugou:playlist:<gid>
+      specialid    -> 仅兜底 gid 为空时用
+      specialname  -> name
+      img(150)     -> 不使用；coverId = guid，封面走 /static/cover 的
+                     online:kugou:playlist:<gid> 解析链（/playlist/detail pic）
+      song_count   -> trackCount（字符串，需转 int）
+      publish_time -> createdAt / updatedAt（"YYYY-MM-DD HH:MM:SS"）
+
+    guid 必须取 gid 而不是 specialid：实测 /playlist/track/all 与 /playlist/detail
+    传 specialid 均报 20010 "get other list file fail" 或返回空 data，只有传 gid
+    （形如 collection_3_408871768_26_0，含 userid 与 listid）才能拿到歌曲与封面。
+    gid 本身是下划线连接的安全字符串，直接当 guid 用不必再 sanitize。
+
+    score：与 search/album 同一套递减公式，保证按 score 降序排序时不打乱酷狗原始顺序。
+    """
+    kw = str(keyword or "").strip()
+    if not kw:
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+    try:
+        async with kugou_source._client() as c:
+            r = await c.get(
+                "/search",
+                params={"keywords": kw, "page": page, "pagesize": size, "type": "special"},
+            )
+            if r.status_code != 200:
+                logger.warning("[KUGOU_PLAYLIST_SEARCH] http=%s kw=%r body=%r",
+                               r.status_code, kw, r.text[:200])
+                return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+            body = r.json()
+            status = body.get("status", body.get("error_code"))
+            if status not in (1, 0, 200, None):
+                logger.warning("[KUGOU_PLAYLIST_SEARCH] status=%s kw=%r errmsg=%r",
+                               status, kw, body.get("error_msg"))
+                return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+            data = body.get("data") or {}
+            lists = data.get("lists") or [] if isinstance(data, dict) else []
+            lists = [x for x in lists if isinstance(x, dict)] if isinstance(lists, list) else []
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST_SEARCH] error kw=%r err=%s", kw, e)
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+
+    playlist_list: list[dict[str, Any]] = []
+    for idx, it in enumerate(lists):
+        gid = str(it.get("gid") or "").strip()
+        specialid = str(it.get("specialid") or it.get("special_id") or "").strip()
+        suid = str(it.get("suid") or "").strip()
+        if not gid and not specialid and not suid:
+            continue
+        name = str(it.get("specialname") or it.get("name") or "").strip()
+        if not name:
+            continue
+
+        # 优先 gid；缺失时回退 specialid/suid（旧格式，track/detail 会拿不到数据但 guid 仍可用）
+        key = gid or specialid or suid
+        guid = kugou_playlist_guid(key)
+
+        release_ts = parse_ts_to_unix(it.get("publish_time") or it.get("create_time"))
+        try:
+            track_count = int(it.get("song_count") or 0)
+        except (TypeError, ValueError):
+            track_count = 0
+
+        playlist_list.append({
+            "guid": guid,
+            "name": name,
+            "coverId": guid,
+            "createdAt": release_ts,
+            "updatedAt": release_ts,
+            "trackCount": track_count,
+            "score": round(1.0 / (1.0 + idx * 0.05), 6),
+        })
+
+    logger.warning("[KUGOU_PLAYLIST_SEARCH] kw=%r page=%d got=%d total=%d",
+                   kw, page, len(playlist_list), total)
+    return {
+        "code": 0,
+        "msg": "",
+        "data": {
+            "list": playlist_list,
+            "total": total if total > 0 else len(playlist_list),
         },
     }
 
@@ -3430,7 +3553,10 @@ async def track_lyrics(request: Request, subpath: str = ""):
 async def track_metadata(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
-        return await forward_upstream_with_local_lyric_fallback(request, get_upstream_client(request.app))
+        # 本地曲目：透传后补 data.track.coverId = 歌曲 guid
+        return await forward_upstream_with_local_lyric_fallback(
+            request, get_upstream_client(request.app), local_cover_guid=guid
+        )
 
     data = await _online_info(request, guid) or stub_online_info(guid)
     cached_lyric = read_lyric_cache(guid)
@@ -3445,6 +3571,35 @@ async def track_metadata(request: Request, subpath: str = ""):
         )
     return JSONResponse(content=build_metadata_payload(guid, data))
 
+
+@app.get("/music/api/v1/search/playlist")
+@app.get("/music/api/v1/search/playlist/{subpath:path}")
+async def search_playlist(request: Request):
+    """/search/playlist：酷狗专题歌单搜索；空关键词走飞牛上游。
+
+    飞牛请求形如 /music/api/v1/search/playlist?q=%E6%B5%8B%E8%AF%95&page=1&size=24。
+    数据源：KuGouMusicApi /search?keywords=<kw>&page=&pagesize=&type=special。
+
+    响应结构对齐飞牛原生 /search/playlist（{"code":0,"data":{"list":[...],"total":n}}），
+    playlist 项字段：guid/name/coverId/createdAt/updatedAt/trackCount/score。
+    """
+    keyword = extract_keyword(request)
+    if not keyword:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        page = max(1, int(request.query_params.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = max(1, int(request.query_params.get("size") or 24))
+    except (TypeError, ValueError):
+        size = 24
+    if size > 50:
+        size = 50
+    kugou_payload = await fetch_kugou_playlist_search(request.app, keyword, page=page, size=size)
+    if isinstance(kugou_payload, dict):
+        return JSONResponse(content=kugou_payload, status_code=200)
+    return await forward_to_upstream(request, get_upstream_client(request.app))
 
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
@@ -3482,6 +3637,9 @@ async def static_cover(request: Request, subpath: str = ""):
             return _static_cover_placeholder_response()
         # 本地封面解析失败则透传上游，尽量拿到飞牛自己扫描到的封面
         return await forward_to_upstream(request, get_upstream_client(request.app))
+    # 歌单封面模板带 {size} 占位，回源前必须替换成具体尺寸
+    if is_kugou_playlist_guid(guid):
+        cover = _fill_cover_size(cover, request)
     response = await _fetch_cover_image_response(cover)
     if response is not None:
         return response
