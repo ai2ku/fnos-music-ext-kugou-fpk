@@ -2510,6 +2510,7 @@ async def _fetch_cover_fallback_response() -> Response:
     hit = _COVER_FALLBACK_CACHE.get("resp")
     if hit is not None:
         body, ct = hit
+        logger.warning("[COVERFALLBACK] cache-hit bytes=%d ct=%s", len(body), ct)
         return Response(
             content=body,
             status_code=200,
@@ -2522,7 +2523,11 @@ async def _fetch_cover_fallback_response() -> Response:
     resp = await _fetch_cover_image_response(_STATIC_COVER_FALLBACK_URL)
     if resp is not None:
         _COVER_FALLBACK_CACHE["resp"] = (resp.body, resp.media_type or "image/jpeg")
+        logger.warning("[COVERFALLBACK] origin-ok bytes=%d ct=%s url=%s",
+                       len(resp.body), resp.media_type, _STATIC_COVER_FALLBACK_URL)
         return resp
+    # 兜底图本身也拉不下来，退回 1x1 透明 PNG —— 用户看到的 1x1 就是这一路
+    logger.warning("[COVERFALLBACK] origin-FAILED -> 1x1 PLACEHOLDER url=%s", _STATIC_COVER_FALLBACK_URL)
     return _static_cover_placeholder_response()
 
 
@@ -3393,27 +3398,45 @@ def _fill_cover_size(cover: str, request: Request) -> str:
 
 
 async def _fetch_kugou_playlist_cover_url(request: Request, coll_id: str) -> str:
-    """用歌单 ID 回源酷狗，取歌单详情里的 pic 封面。"""
+    """用歌单 ID 回源酷狗，取歌单详情里的 pic 封面。
+
+    [KUGOU_PLCOVER] 诊断日志：记录请求耗时、HTTP 状态、items 数量与 pic 原值，
+    用于区分“接口没数据”“有数据但 pic 字段为空”两种情况。
+    """
     if not coll_id:
+        logger.warning("[KUGOU_PLCOVER] step6.5 detail coll_id=EMPTY")
         return ""
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
             auth = kugou_source._auth_header()
             headers = {"Authorization": auth} if auth else {}
             r = await c.get("/playlist/detail", params={"ids": coll_id}, headers=headers)
             if r.status_code != 200:
-                logger.warning("[KUGOU_PLAYLIST] detail http=%s coll_id=%s", r.status_code, coll_id)
+                logger.warning("[KUGOU_PLCOVER] step6.5 detail NOT200 http=%s elapsed=%.2fs coll_id=%s",
+                               r.status_code, time.monotonic() - t0, coll_id)
                 return ""
             data = r.json()
             items = data.get("data") or []
+            logger.warning("[KUGOU_PLCOVER] step6.5 detail OK status=%s error_code=%s items=%s elapsed=%.2fs coll_id=%s",
+                           data.get("status"), data.get("error_code"),
+                           len(items) if isinstance(items, list) else type(items).__name__,
+                           time.monotonic() - t0, coll_id)
             if isinstance(items, list) and items:
                 first = items[0] if isinstance(items[0], dict) else {}
                 pic = str(first.get("pic") or first.get("cover") or "").strip()
+                logger.warning("[KUGOU_PLCOVER] step6.5 pic name=%s pic=%s", first.get("name"), pic[:120])
                 if pic:
                     return _fill_cover_size(pic, request)
-            logger.warning("[KUGOU_PLAYLIST] detail empty coll_id=%s data=%r", coll_id, data)
+                logger.warning("[KUGOU_PLCOVER] step6.5 pic EMPTY keys=%s", sorted(first.keys()))
+            else:
+                logger.warning("[KUGOU_PLCOVER] step6.5 detail EMPTY_DATA coll_id=%s data=%r", coll_id, data)
+    except httpx.TimeoutException as e:
+        logger.warning("[KUGOU_PLCOVER] step6.5 detail TIMEOUT %s elapsed=%.2fs coll_id=%s",
+                       type(e).__name__, time.monotonic() - t0, coll_id)
     except Exception as e:
-        logger.warning("[KUGOU_PLAYLIST] detail error coll_id=%s err=%s", coll_id, e)
+        logger.warning("[KUGOU_PLCOVER] step6.5 detail EXCEPTION %s:%s elapsed=%.2fs coll_id=%s",
+                       type(e).__name__, e, time.monotonic() - t0, coll_id)
     return ""
 
 
@@ -3467,20 +3490,42 @@ async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
     """按 GUID 取封面：在线直取在线信息，酷狗歌单取 pic，酷狗专辑查详情，本地回退到酷狗搜索。"""
     if not guid:
         return ""
+    # [COVERURL] 诊断日志：step6 解析封面 URL，先记录走了哪个分支再拿结果
     if is_kugou_playlist_guid(guid):
-        # 酷狗歌单：从 /playlist/detail 接口取 pic URL
         coll_id = kugou_playlist_id_from_guid(guid)
         if coll_id:
-            return await _fetch_kugou_playlist_cover_url(request, coll_id)
+            t0 = time.monotonic()
+            url = await _fetch_kugou_playlist_cover_url(request, coll_id)
+            logger.warning("[COVERURL] step6 branch=kugou_playlist coll_id=%s got=%s elapsed=%.2fs guid=%s",
+                           coll_id, "yes" if url else "NO", time.monotonic() - t0, guid)
+            return url
+        logger.warning("[COVERURL] step6 branch=kugou_playlist coll_id=EMPTY guid=%s", guid)
         return ""
     if isinstance(guid, str) and guid.startswith("online:kugou:album:"):
-        return await _fetch_kugou_album_cover_url(request, guid[len("online:kugou:album:"):])
+        t0 = time.monotonic()
+        url = await _fetch_kugou_album_cover_url(request, guid[len("online:kugou:album:"):])
+        logger.warning("[COVERURL] step6 branch=kugou_album id=%s got=%s elapsed=%.2fs",
+                       guid[len("online:kugou:album:"):], "yes" if url else "NO", time.monotonic() - t0)
+        return url
     if isinstance(guid, str) and guid.startswith("online:kugou:artist:"):
-        return await _fetch_kugou_artist_cover_url(request, guid[len("online:kugou:artist:"):])
+        t0 = time.monotonic()
+        url = await _fetch_kugou_artist_cover_url(request, guid[len("online:kugou:artist:"):])
+        logger.warning("[COVERURL] step6 branch=kugou_artist id=%s got=%s elapsed=%.2fs",
+                       guid[len("online:kugou:artist:"):], "yes" if url else "NO", time.monotonic() - t0)
+        return url
     if is_online_guid(guid):
+        t0 = time.monotonic()
         data = await _online_info(request, guid)
-        return _fill_cover_size(str((data or {}).get("cover_url") or ""), request)
-    return await _resolve_local_static_cover_url(request, guid)
+        raw = str((data or {}).get("cover_url") or "")
+        url = _fill_cover_size(raw, request)
+        logger.warning("[COVERURL] step6 branch=online cover_url=%s filled=%s elapsed=%.2fs guid=%s",
+                       raw[:80], "yes" if url else "NO", time.monotonic() - t0, guid)
+        return url
+    t0 = time.monotonic()
+    url = await _resolve_local_static_cover_url(request, guid)
+    logger.warning("[COVERURL] step6 branch=local got=%s elapsed=%.2fs guid=%s",
+                   "yes" if url else "NO", time.monotonic() - t0, guid)
+    return url
 
 
 async def _resolve_local_static_cover_url(request: Request, guid: str) -> str:
@@ -3579,7 +3624,11 @@ async def _resolve_static_cover_guid(request: Request, subpath: str) -> tuple[st
 
 
 async def _fetch_cover_image_response(url: str) -> Response | None:
-    """COEP 拦截 302 跨域跳转，改为服务端代理拉取图片后同源流式返回。"""
+    """COEP 拦截 302 跨域跳转，改为服务端代理拉取图片后同源流式返回。
+
+    所有失败路径都带 [COVERIMG] 前缀并记录 elapsed，便于定位耗时/超时。
+    """
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(
             timeout=10.0,
@@ -3589,6 +3638,10 @@ async def _fetch_cover_image_response(url: str) -> Response | None:
             cr = await c.get(url)
             if cr.status_code == 200 and cr.content:
                 ct = cr.headers.get("content-type") or "image/jpeg"
+                logger.warning(
+                    "[COVERIMG] step7-fetch http=200 ok bytes=%d ct=%s elapsed=%.2fs url=%s",
+                    len(cr.content), ct, time.monotonic() - t0, url,
+                )
                 return Response(
                     content=cr.content,
                     status_code=200,
@@ -3598,10 +3651,24 @@ async def _fetch_cover_image_response(url: str) -> Response | None:
                         "Cross-Origin-Resource-Policy": "same-origin",
                     },
                 )
-            logger.warning("static_cover fetch %s -> http=%d len=%d", url, cr.status_code, len(cr.content))
+            logger.warning(
+                "[COVERIMG] step7-fetch NOT200 http=%d len=%d elapsed=%.2fs url=%s",
+                cr.status_code, len(cr.content), time.monotonic() - t0, url,
+            )
+            return None
+    except httpx.TimeoutException as e:
+        # 单独识别超时：timeout 是 10s，撞上就会走到 1x1 兜底图
+        logger.warning(
+            "[COVERIMG] step7-fetch TIMEOUT %s:%s elapsed=%.2fs url=%s",
+            type(e).__name__, e, time.monotonic() - t0, url,
+        )
+        return None
     except Exception as e:
-        logger.warning("static_cover fetch %s err=%s", url, e)
-    return None
+        logger.warning(
+            "[COVERIMG] step7-fetch EXCEPTION %s:%s elapsed=%.2fs url=%s",
+            type(e).__name__, e, time.monotonic() - t0, url,
+        )
+        return None
 
 
 @app.get("/music/api/v1/lyric/list")
@@ -3715,16 +3782,27 @@ async def search_playlist(request: Request):
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
+    # [COVCDB] 封面链路诊断日志。同一个 rid 串起一次请求的所有步骤。
+    # 排查完后整体删除即可（搜索 COVCDB / COVERURL / COVERIMG / COVERFALLBACK）。
+    rid = uuid4().hex[:8]
+    t_all = time.monotonic()
+    logger.warning("[COVCDB] step0-req rid=%s path=%s query=%s", rid, request.url.path, dict(request.query_params))
     guid, auth_resp = await _resolve_static_cover_guid(request, subpath)
     if auth_resp is not None:
+        logger.warning("[COVCDB] step1-auth rid=%s AUTH_FAILED", rid)
         return auth_resp
     if not guid:
+        logger.warning("[COVCDB] step1-guid rid=%s GUID_EMPTY -> upstream", rid)
         return await forward_to_upstream(request, get_upstream_client(request.app))
+    logger.warning("[COVCDB] step1-guid rid=%s guid=%s is_online=%s is_kugou_playlist=%s",
+                   rid, guid, is_online_guid(guid), is_kugou_playlist_guid(guid))
 
     # 本地曲目若同目录已有封面文件，直接同源返回，不必回源 metadata 与酷狗搜索
     if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
         sidecar = _local_sidecar_art_response(guid)
         if sidecar is not None:
+            logger.warning("[COVCDB] step2-sidecar rid=%s HIT guid=%s bytes=%d",
+                           rid, guid, len(sidecar.body))
             return sidecar
 
     # 本地曲库的 coverId 就是本地 guid（无 online: / playlist: 前缀）。
@@ -3733,9 +3811,10 @@ async def static_cover(request: Request, subpath: str = ""):
     if cached_tpl is not None:
         cover = _fill_cover_size(cached_tpl, request) if cached_tpl else ""
         if cover:
-            logger.warning("[STATIC_COVER] local cache hit guid=%s cover=%s", guid, cover[:80])
+            logger.warning("[COVCDB] step3-cache rid=%s HIT url=%s elapsed=%.2fs",
+                           rid, cover[:90], time.monotonic() - t_all)
         else:
-            logger.warning("[STATIC_COVER] cached empty url, forwarding upstream guid=%s", guid)
+            logger.warning("[COVCDB] step3-cache rid=%s EMPTY_URL -> upstream", rid)
             return await forward_to_upstream(request, get_upstream_client(request.app))
     else:
         cover = await _fetch_cover_url_by_guid(request, guid)
@@ -3743,20 +3822,30 @@ async def static_cover(request: Request, subpath: str = ""):
             remember_local_cover_url(guid, cover)
             cover = _fill_cover_size(cover, request)
     if not cover:
-        logger.warning("[STATIC_COVER] missing cover guid=%s is_kugou=%s is_online=%s", guid, is_kugou_playlist_guid(guid), is_online_guid(guid))
+        logger.warning("[COVCDB] step5-nourl rid=%s NO_URL guid=%s is_online=%s is_kugou_playlist=%s elapsed=%.2fs",
+                       rid, guid, is_online_guid(guid), is_kugou_playlist_guid(guid), time.monotonic() - t_all)
         if is_online_guid(guid) or is_kugou_playlist_guid(guid):
+            logger.warning("[COVCDB] step6-fallback rid=%s -> fallback(online/kugou_playlist)", rid)
             return await _fetch_cover_fallback_response()
         # 本地封面解析失败则透传上游，尽量拿到飞牛自己扫描到的封面
+        logger.warning("[COVCDB] step6-upstream rid=%s -> upstream(local)", rid)
         return await forward_to_upstream(request, get_upstream_client(request.app))
     # 歌单封面模板带 {size} 占位，回源前必须替换成具体尺寸
     if is_kugou_playlist_guid(guid):
         cover = _fill_cover_size(cover, request)
+    logger.warning("[COVCDB] step4-url rid=%s url=%s size=%s elapsed=%.2fs",
+                   rid, cover[:100], request.query_params.get("size"), time.monotonic() - t_all)
     response = await _fetch_cover_image_response(cover)
     if response is not None:
+        logger.warning("[COVCDB] step7-ok rid=%s bytes=%d total=%.2fs",
+                       rid, len(response.body), time.monotonic() - t_all)
         return response
-    logger.warning("[STATIC_COVER] image proxy failed cover=%s", cover)
+    logger.warning("[COVCDB] step7-fail rid=%s NO_IMAGE url=%s total=%.2fs -> fallback/upstream",
+                   rid, cover[:100], time.monotonic() - t_all)
     if is_online_guid(guid) or is_kugou_playlist_guid(guid):
+        logger.warning("[COVCDB] step8-fallback rid=%s -> fallback(online/kugou_playlist)", rid)
         return await _fetch_cover_fallback_response()
+    logger.warning("[COVCDB] step8-upstream rid=%s -> upstream(local)", rid)
     return await forward_to_upstream(request, get_upstream_client(request.app))
 
 
