@@ -1202,6 +1202,26 @@ def fill_detail_cover_id(payload: dict, kind: str = "track") -> None:
                 _fill_cover_id(item)
 
 
+def fill_artist_list_cover_ids(payload: dict) -> None:
+    """补 /artist/list 的 data.list[] 空 coverId，填为 artist:<guid>。
+
+    歌手列表项的实体 guid 与本地曲目 guid 都是 32 位 hex，格式同构。
+    补成裸 guid 会让 /static/cover 按曲目链路解析（音频目录找封面，必空）；
+    必须写 artist: 前缀，封面路由才能进 step2-entity 取歌手头像。
+    已有非空 coverId 不覆盖（上游 10.7+ 自带 artist: 前缀时保持原样，
+    也不会双重前缀，因为 _fill_cover_id 只在空值时写入）。
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return
+    list_obj = data.get("list")
+    if not isinstance(list_obj, list):
+        return
+    for item in list_obj:
+        if isinstance(item, dict):
+            _fill_cover_id(item, prefix=_LOCAL_ARTIST_COVER_PREFIX)
+
+
 def payload_or_resp_status(payload: dict) -> int:
     return int(payload.get("_ext_status") or 200)
 
@@ -4886,8 +4906,28 @@ async def artist_detail(request: Request):
         return JSONResponse(content=kugou_payload, status_code=200)
 
 
+@app.get("/music/api/v1/artist/list")
+@app.get("/music/api/v1/artist/list/{subpath=path}")
+async def artist_list(request: Request, subpath: str = ""):
+    """/artist/list：本地歌手列表；转上游后补空 coverId 为 artist:<guid>。
+
+    上游对无头像的本地歌手表 coverId=null，前端歌手列表卡片头像位空白。
+    补成裸 guid 不够——歌手实体 guid 与曲目 guid 同构（32 位 hex），
+    /static/cover 会按曲目链路解析，必须带 artist: 前缀才走 step2-entity。
+    酷狗歌手列表走 /search/artist，不经本路由。
+    """
+    envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {})
+    if envelope.get("code") != 0:
+        return JSONResponse(content=envelope, headers=headers)
+    fill_artist_list_cover_ids(envelope)
+    return JSONResponse(content=envelope, headers=headers)
+
+
 @app.get("/music/api/v1/album/detail")
-@app.get("/music/api/v1/album/detail/{subpath:path}")
+@app.get("/music/api/v1/album/detail/{subpath=path}")
 async def album_detail(request: Request):
     """/album/detail：酷狗专辑详情；非酷狗 GUID 走飞牛上游。
 
