@@ -4537,7 +4537,15 @@ async def track_album_detail_list(request: Request):
     if not album_guid:
         return JSONResponse(content={"code": 400, "msg": "albumGUID required", "data": None})
     if not album_guid.startswith("online:kugou:album:"):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 本地专辑：同上，转上游后把空的 coverId 兜底为歌曲自身 guid。
+        envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        if envelope.get("code") != 0:
+            return JSONResponse(content=envelope, headers=headers)
+        fill_local_track_list_cover_ids(envelope)
+        return JSONResponse(content=envelope, headers=headers)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
@@ -4572,6 +4580,12 @@ async def track_artist_detail_list(request: Request):
 
     参数映射参考 /track/playlist-detail/list：page/size + artistGUID，返回
     {"code":0,"data":{"list":[...],"total":n}}，track 项结构与 build_online_track 一致。
+
+    非酷狗 GUID（飞牛原生本地歌手，如 32 位 hex GUID）转上游后补 coverId：
+    上游对无专辑封面/无内嵌封面标签的本地曲目标 coverId=null，前端按
+    track.coverId 取封面拿不到，封面位空白；用歌曲自身 guid 兜底，与
+    /track/list、/track/play-history/list 的补法一致。酷狗分支由
+    build_online_track 自行填 coverId，不需补。
     """
     artist_guid = str(
         request.query_params.get("artistGUID")
@@ -4585,7 +4599,16 @@ async def track_artist_detail_list(request: Request):
         return JSONResponse(content={"code": 400, "msg": "artistGUID required", "data": None})
     parsed_artist_id, artist_kind = parse_kugou_artist_guid(artist_guid)
     if artist_kind != "kugou_artist":
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # 本地歌手：转上游后补 coverId（fill_local_track_list_cover_ids 对线上
+        # guid 也安全，酷狗项本身 coverId 非空不会被覆盖）。
+        envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        if envelope.get("code") != 0:
+            return JSONResponse(content=envelope, headers=headers)
+        fill_local_track_list_cover_ids(envelope)
+        return JSONResponse(content=envelope, headers=headers)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
