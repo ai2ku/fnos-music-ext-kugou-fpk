@@ -86,6 +86,10 @@ CONF = {
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "300")),
+    # 歌手/专辑/歌单全量拉取（手机端不传 page/size 时触发）的分页参数
+    "meta_full_poll_page_size": int(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_SIZE", "50")),
+    "meta_full_poll_max_pages": int(os.environ.get("FNMUSIC_META_FULL_POLL_MAX_PAGES", "10")),
+    "meta_full_poll_page_timeout": float(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_TIMEOUT", "8")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5")),
     "fav_dir": os.environ.get(
         "FNMUSIC_FAV_DIR", os.path.join(_HOME, "online_favorites")
@@ -2769,13 +2773,18 @@ async def merged_search_meta(
     request: Request,
     fetcher: Callable[..., Awaitable[dict | None]],
     tag: str,
-    kugou_only: bool = False,
 ) -> Response:
     """歌手/歌单/专辑搜索的统一处理：官方在前，酷狗在后。
 
     空关键词原样透传上游（官方默认列表），不发酷狗请求。
     酷狗侧失败时不影响官方结果；上游侧失败时用酷狗结果兜底，
     两者都拿不到则再透传上游原始响应。
+
+    分页口径按客户端是否传 page/size 区分：
+    - 传了 page/size（PC 网页）：酷狗按该页取，走原有单页合并
+    - 未传 page/size（手机端）：酷狗按 50 条/页轮询全部结果再合并，
+      一次返回完整列表，客户端不需要翻页
+      （酷狗 /search 不支持一次全量，只能循环翻页）
     """
     if not CONF.get("merge_search_meta", True):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -2784,26 +2793,27 @@ async def merged_search_meta(
     keyword = extract_keyword(request)
     if not keyword:
         return await forward_to_upstream(request, upstream_client)
-    try:
-        page = max(1, int(request.query_params.get("page") or 1))
-    except (TypeError, ValueError):
-        page = 1
-    try:
-        # 酷狗 /search 未观察到 pagesize 硬上限，50 是响应体积保护。
-        size = max(1, int(request.query_params.get("size") or 24))
-    except (TypeError, ValueError):
-        size = 24
-    if size > 50:
-        size = 50
 
-    kugou_payload = await fetcher(request.app, keyword, page=page, size=size)
+    has_page = request.query_params.get("page") not in (None, "")
+    has_size = request.query_params.get("size") not in (None, "")
 
-    # 临时诊断：只输出酷狗在线结果，不调上游、不做合并，用于验证
-    # 翻页异常是否由合并逻辑导致。
-    if kugou_only:
-        if isinstance(kugou_payload, dict):
-            return JSONResponse(content=kugou_payload, status_code=200)
-        return await forward_to_upstream(request, upstream_client)
+    if has_page or has_size:
+        # PC 网页：按客户端分页参数取单页
+        try:
+            page = max(1, int(request.query_params.get("page") or 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            # 酷狗 /search 未观察到 pagesize 硬上限，50 是响应体积保护。
+            size = max(1, int(request.query_params.get("size") or 24))
+        except (TypeError, ValueError):
+            size = 24
+        if size > 50:
+            size = 50
+        kugou_payload = await fetcher(request.app, keyword, page=page, size=size)
+    else:
+        # 手机端：不传分页参数，酷狗轮询全部结果一次返回
+        kugou_payload = await _fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag)
 
     upstream_json = await _upstream_search_envelope(request, upstream_client)
 
@@ -3673,7 +3683,92 @@ async def search_album(request: Request):
     album 项字段：guid/name/coverId/releaseDate/barcode/createdAt/updatedAt/
     artists/trackCount/score。本地与酷狗结果合并，官方在前、酷狗在后。
     """
-    return await merged_search_meta(request, fetch_kugou_album_search, tag="album", kugou_only=True)
+    return await merged_search_meta(request, fetch_kugou_album_search, tag="album")
+
+
+async def _fetch_kugou_all_pages(
+    fetcher: Callable[..., Awaitable[dict | None]],
+    app_state,
+    keyword: str,
+    tag: str = "meta",
+) -> dict:
+    """酷狗按页轮询，汇总全部搜索结果，返回单条 data。
+
+    酷狗 /search 不支持一次全量，每页最多数十条。这里按
+    meta_full_poll_page_size（默认 50）循环翻页，终止条件：
+    - 累计已达酷狗 total
+    - 返回空页
+    - 返回条数小于页大小（已到末页）
+    - 达到安全上限（默认 10 页，避免死循环）
+    任一单页失败即停止汇总，返回已拿到的部分，不吞异常。
+    """
+    page_size = max(1, int(CONF.get("meta_full_poll_page_size") or 50))
+    max_pages = max(1, int(CONF.get("meta_full_poll_max_pages") or 10))
+    per_page_timeout = float(CONF.get("meta_full_poll_page_timeout") or 8)
+
+    all_items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    total = 0
+
+    for p in range(1, max_pages + 1):
+        try:
+            res = await asyncio.wait_for(
+                fetcher(app_state, keyword, page=p, size=page_size),
+                timeout=per_page_timeout,
+            )
+        except Exception as exc:
+            logger.warning("[SEARCH_%s] full poll page=%d failed: %s", tag.upper(), p, exc)
+            break
+
+        if not isinstance(res, dict):
+            break
+        data = res.get("data") or {}
+        if not isinstance(data, dict):
+            break
+        items = data.get("list") or []
+        if not isinstance(items, list):
+            items = []
+        t = _read_int(data.get("total"), total)
+        if t > total:
+            total = t
+
+        if not items:
+            break
+
+        added = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = (str(it.get("guid") or "").strip(), str(it.get("name") or "").strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            all_items.append(it)
+            added += 1
+
+        logger.warning(
+            "[SEARCH_%s] full poll page=%d got=%d added=%d total=%d",
+            tag.upper(), p, len(items), added, total,
+        )
+        if total and len(all_items) >= total:
+            break
+        if len(items) < page_size:
+            break
+        if added == 0:
+            break
+
+    logger.warning(
+        "[SEARCH_%s] full poll done pages=%d items=%d total=%d",
+        tag.upper(), len(seen), len(all_items), total,
+    )
+    return {
+        "code": 0,
+        "msg": "",
+        "data": {
+            "list": all_items,
+            "total": total if total > 0 else len(all_items),
+        },
+    }
 
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
