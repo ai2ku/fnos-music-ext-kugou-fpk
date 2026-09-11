@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -68,6 +69,9 @@ CONF = {
     "cover_upload_enabled": os.environ.get("FNMUSIC_COVER_UPLOAD_ENABLED", "true").lower() in ("true", "1", "yes"),
     "cover_upload_max_bytes": int(os.environ.get("FNMUSIC_COVER_UPLOAD_MAX_BYTES", str(4 * 1024 * 1024)) or 4194304),
     "cover_upload_timeout": float(os.environ.get("FNMUSIC_COVER_UPLOAD_TIMEOUT", "15")),
+    # 换官方 coverId 时按该分辨率取图再上传；0=不缩放原样上传。
+    # 酷狗 URL 直接把 size 占位符填成该值；本地 sidecar 文件用 ffmpeg 缩到该宽度。
+    "cover_upload_size": int(os.environ.get("FNMUSIC_COVER_UPLOAD_SIZE", "1600") or 1600),
     "cover_id_cache_file": os.environ.get(
         "FNMUSIC_COVER_ID_CACHE_FILE", os.path.join(_HOME, "cache", "cover_ids.json")
     ),
@@ -2910,18 +2914,28 @@ _COVER_UPLOAD_FAILED: dict[str, float] = {}
 _FAILED_COOLDOWN_SEC = 1800.0
 
 
-async def _trigger_local_cover_upload(request: Request, app_state, guid: str, image_bytes: bytes) -> None:
+async def _trigger_local_cover_upload(
+    request: Request,
+    app_state,
+    guid: str,
+    image_bytes: bytes = None,
+    fetch: Callable[[], Awaitable[bytes]] = None,
+) -> None:
     """本地曲目缺封面时的完整链路：预检 -> 上传换官方 coverId -> POST 回写 -> 缓存。
 
     严格边界：仅本地曲目 + 上游 track.coverId 为空才上传。线上曲目/歌单/
     歌手专辑实体不进入此函数；已有封面时不产生任何上游写入。
     全程静默失败，不影响当前封面响应。
 
+    image_bytes 为空时可传 fetch(url) 供本函数抓取（例如按 cover_upload_size
+    回源酷狗大图）。缓存命中/冷却/配置关闭的检查都在抓取之前，
+    保证不会为了拿一张用不上的图而浪费一次网络。
+
     内部请求必须带音乐端鉴权头（copy_incoming_headers）：上游 socket 的
     track/metadata 无鉴权会回 401。
     """
     global _COVER_UPLOAD_FAILED
-    if not guid or not image_bytes:
+    if not guid:
         return
     if not CONF.get("cover_upload_enabled", True):
         return
@@ -2962,6 +2976,15 @@ async def _trigger_local_cover_upload(request: Request, app_state, guid: str, im
         # post_official_cover_id 内部读 data.get("track")，所以传 data 层而非外层
         # {code, data:{track:{...}}}。传外层会取不到 track，回写必报 skip-no-title。
         inner_data = _data if isinstance(_data, dict) else {}
+        # 未直接给出图字节时，用调用方提供的 fetch 回源（例如按 cover_upload_size
+        # 拉酷狗大图）。抓取失败不阻断：降级为空字节，upload 内部会直接返回空。
+        if image_bytes is None and fetch is not None:
+            try:
+                image_bytes = await fetch() or b""
+            except Exception as e:
+                logger.warning("[COVERUPLOAD] fetch-err guid=%s err=%s:%s",
+                               guid, type(e).__name__, e)
+                image_bytes = b""
         cid = await upload_cover_to_official(app_state, image_bytes, headers)
         if not cid:
             _COVER_UPLOAD_FAILED[guid] = time.monotonic()
@@ -4149,6 +4172,107 @@ def _fill_cover_size(cover: str, request: Request) -> str:
     return cover
 
 
+def _fill_cover_size_for_upload(cover: str, request: Request) -> str:
+    """按 cover_upload_size 填尺寸占位符，用于「为换 coverId 回源拉大图」。
+
+    前端请求的 size 通常只有 160/240，拿那张小图去上传换官方 coverId，
+    入库的就是缩略图。这里改成按配置的分辨率回源：
+    - 酷狗歌单 /uploadpic/<子路径>/<N>/ 里的 <N> 直接换成目标尺寸（原
+      _fill_cover_size 会按本次请求的 size 填，那正是问题所在）
+    - album/v8/<id>_<N>.jpg 里的 _<N>.jpg 同理
+    - 其余 URL（netease/music163 等）本身不带尺寸参数，原样返回
+    0 表示不缩放，原样返回请求自带的尺寸。
+    """
+    target = int(CONF.get("cover_upload_size") or 0)
+    if not cover:
+        return ""
+    if not target:
+        return _fill_cover_size(cover, request)
+    size_s = str(target)
+    out = cover.replace("{size}", size_s).replace("{SIZE}", size_s)
+    out = _SINGER_SIZE_RE.sub(lambda m: f"{m.group(1)}/{size_s}{m.group(2)}", out, count=1)
+    out = re.sub(r"_\d+\.jpg(?!.*\d+\.jpg)", f"_{size_s}.jpg", out, count=1)
+    return out
+
+
+async def _resize_cover_to_upload_size(image_bytes: bytes) -> bytes:
+    """本地 sidecar 封面缩到 cover_upload_size 宽度后再上传。
+
+    酷狗 URL 分支能直接回源 1600，但本地音频同目录的 .jpg/.png 是静态文件，
+    尺寸由原始导入决定，只能在这里转。系统 ffmpeg 可用且代理 venv 里没有
+    Pillow，所以走 subprocess + asyncio.to_thread，不阻塞事件循环。
+    目标尺寸已达标 / 缩放失败 / ffmpeg 不存在时一律原样返回，宁可传小图
+    也不能因为缩放把封面弄丢。
+    """
+    target = int(CONF.get("cover_upload_size") or 0)
+    if not target or not image_bytes or len(image_bytes) < 16 * 1024:
+        return image_bytes
+    if not shutil.which("ffmpeg"):
+        return image_bytes
+    # 先探测原图宽度：宽度已 ≤ 目标则直接返回原图。放大只会糊，不划算。
+    tmp_in = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="covsrc_", suffix=".img", delete=False) as f:
+            f.write(image_bytes)
+            tmp_in = f.name
+        # _probe_image_width 是同步函数，不能 await；误写 await 会抛
+        # TypeError: object int can't be used in 'await' expression，被下面的
+        # except 吞掉后静默返回原图（看起来像「缩放不生效」）。
+        w = _probe_image_width(tmp_in)
+        if 0 < w <= target:
+            return image_bytes
+        tmp_out = tmp_in + ".out.jpg"
+        await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-i", tmp_in, "-vf", f"scale={target}:-2", "-q:v", "2", tmp_out],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) <= 0:
+            return image_bytes
+        with open(tmp_out, "rb") as f:
+            out = f.read()
+        if not out or len(out) > int(CONF.get("cover_upload_max_bytes") or 4 * 1024 * 1024):
+            return image_bytes
+        logger.warning("[COVERRESIZE] %dx→%d宽 bytes=%d->%d", w, target, len(image_bytes), len(out))
+        return out
+    except Exception as e:
+        logger.warning("[COVERRESIZE] err=%s:%s", type(e).__name__, e)
+        return image_bytes
+    finally:
+        # tmp_in 为空时不要退化成相对路径 ".out.jpg"，否则会误删 cwd 下的同名文件。
+        if tmp_in:
+            for p in (tmp_in, tmp_in + ".out.jpg"):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _probe_image_width(path: str) -> int:
+    """用 ffprobe/ffmpeg 读图宽；失败返 0，由调用方决定降级。"""
+    p = shutil.which("ffprobe")
+    if p:
+        try:
+            r = subprocess.run(
+                [p, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width", "-of", "default=nk=1:nw=1", path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+            return int(str(r.stdout.decode()).strip() or 0)
+        except Exception:
+            return 0
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+             "-f", "null", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        m = re.search(r"(\d+)x(\d+)", r.stderr.decode(errors="replace"))
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return 0
+
+
 async def _fetch_kugou_playlist_cover_url(request: Request, coll_id: str) -> str:
     """用歌单 ID 回源酷狗，取歌单详情里的 pic 封面。
 
@@ -4803,7 +4927,11 @@ async def static_cover(request: Request, subpath: str = ""):
         if sidecar is not None:
             # 仅本地曲目触发上传换官方 coverId；函数内部已检查上游
             # track.coverId 是否为空，已有封面时不会产生任何写入。
-            asyncio.ensure_future(_trigger_local_cover_upload(request, request.app, guid, sidecar.body))
+            # sidecar 是本地音频同目录的静态文件，size 参数对它不生效；
+            # 磁盘上存在 160px 这类小图，所以上传前先按 cover_upload_size 缩放。
+            asyncio.ensure_future(_trigger_local_cover_upload(
+                request, request.app, guid, None,
+                fetch=lambda b=sidecar.body: _resize_cover_to_upload_size(b)))
             logger.warning("[COVCDB] step2-sidecar rid=%s HIT guid=%s bytes=%d",
                            rid, guid, len(sidecar.body))
             return sidecar
@@ -4843,7 +4971,19 @@ async def static_cover(request: Request, subpath: str = ""):
         # 只有本地曲目（无 online:/歌单前缀）才触发；实体封面走上面
         # step2-entity 分支，不会到这里。
         if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
-            asyncio.ensure_future(_trigger_local_cover_upload(request, request.app, guid, response.body))
+            # 前端请求的 size 通常只有 160/240，拿那张小图去换 coverId
+            # 会把缩略图写进曲库。这里把「1600 尺寸 URL 抓取器」交给后台任务，
+            # 由它在上传前自己拉大图；本请求仍立刻返回已有的小图，不增首屏延迟。
+            up_url = _fill_cover_size_for_upload(cover, request)
+            if up_url != cover:
+                async def _upload_bytes(u=up_url):
+                    _r = await _fetch_cover_image_response(u)
+                    return _r.body if _r is not None else b""
+                asyncio.ensure_future(_trigger_local_cover_upload(
+                    request, request.app, guid, None, fetch=_upload_bytes))
+            else:
+                asyncio.ensure_future(
+                    _trigger_local_cover_upload(request, request.app, guid, response.body))
         logger.warning("[COVCDB] step7-ok rid=%s bytes=%d total=%.2fs",
                        rid, len(response.body), time.monotonic() - t_all)
         return response
