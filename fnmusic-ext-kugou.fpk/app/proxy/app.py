@@ -2769,6 +2769,7 @@ async def merged_search_meta(
     request: Request,
     fetcher: Callable[..., Awaitable[dict | None]],
     tag: str,
+    kugou_only: bool = False,
 ) -> Response:
     """歌手/歌单/专辑搜索的统一处理：官方在前，酷狗在后。
 
@@ -2783,7 +2784,6 @@ async def merged_search_meta(
     keyword = extract_keyword(request)
     if not keyword:
         return await forward_to_upstream(request, upstream_client)
-
     try:
         page = max(1, int(request.query_params.get("page") or 1))
     except (TypeError, ValueError):
@@ -2796,8 +2796,16 @@ async def merged_search_meta(
     if size > 50:
         size = 50
 
-    upstream_json = await _upstream_search_envelope(request, upstream_client)
     kugou_payload = await fetcher(request.app, keyword, page=page, size=size)
+
+    # 临时诊断：只输出酷狗在线结果，不调上游、不做合并，用于验证
+    # 翻页异常是否由合并逻辑导致。
+    if kugou_only:
+        if isinstance(kugou_payload, dict):
+            return JSONResponse(content=kugou_payload, status_code=200)
+        return await forward_to_upstream(request, upstream_client)
+
+    upstream_json = await _upstream_search_envelope(request, upstream_client)
 
     if not isinstance(upstream_json, dict):
         if isinstance(kugou_payload, dict):
@@ -3665,7 +3673,7 @@ async def search_album(request: Request):
     album 项字段：guid/name/coverId/releaseDate/barcode/createdAt/updatedAt/
     artists/trackCount/score。本地与酷狗结果合并，官方在前、酷狗在后。
     """
-    return await merged_search_meta(request, fetch_kugou_album_search, tag="album")
+    return await merged_search_meta(request, fetch_kugou_album_search, tag="album", kugou_only=True)
 
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
