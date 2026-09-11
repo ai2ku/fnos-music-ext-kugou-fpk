@@ -2398,6 +2398,16 @@ def get_upstream_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def _is_get_request(request: Request) -> bool:
+    """代理只接管 GET 请求，其他方法一律透传上游。
+
+    音乐端（/music/api/v1）所有被接管路由统一走此闸门：POST/PUT/DELETE/
+    PATCH/HEAD/OPTIONS 等不进入本代理的处理逻辑，直接原样转上游，避免
+    代理改动非 GET 请求语义、请求体或返回体。
+    """
+    return request.method.upper() == "GET"
+
+
 async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Response:
     url_path = request.url.path
     if request.url.query:
@@ -3166,6 +3176,8 @@ async def ext_healthz(request: Request):
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     keyword = extract_keyword(request)
 
@@ -3338,6 +3350,8 @@ async def search_track(request: Request):
 @app.get("/music/api/v1/search/artist")
 @app.get("/music/api/v1/search/artist/{subpath=path}")
 async def search_artist(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/search/artist：酷狗歌手搜索；空关键词走飞牛上游。
 
     飞牛请求形如 /music/api/v1/search/artist?q=%E6%9C%AC%E5%85%AE&page=1&size=24。
@@ -3352,6 +3366,8 @@ async def search_artist(request: Request):
 @app.get("/music/api/v1/search/album")
 @app.get("/music/api/v1/search/album/{subpath=path}")
 async def search_album(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/search/album：酷狗专辑搜索；空关键词走飞牛上游。
 
     飞牛请求形如 /music/api/v1/search/album?q=%E5%BC%A0%E6%9D%B0&page=1&size=24。
@@ -3366,6 +3382,8 @@ async def search_album(request: Request):
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
 async def search_suggest(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     if not CONF["merge_suggest"]:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -3696,6 +3714,8 @@ def stream_tee_response(
 @app.get("/music/api/v1/track/stream")
 @app.get("/music/api/v1/track/stream/{subpath:path}")
 async def stream_track(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = extract_guid(request)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -3754,6 +3774,8 @@ async def stream_track(request: Request):
 @app.get("/music/api/v1/track/hls/{guid}/preset.m3u8")
 @app.get("/music/api/v1/track/hls/{guid}/{filename}")
 async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -3784,6 +3806,8 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
 @app.api_route("/music/api/v1/track/transcode/heartbeat", methods=["GET", "POST"])
 @app.api_route("/music/api/v1/track/transcode/quit", methods=["GET", "POST"])
 async def track_transcode_session(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -3792,6 +3816,8 @@ async def track_transcode_session(request: Request):
 
 @app.api_route("/music/api/v1/track/transcode", methods=["GET", "POST"])
 async def track_transcode(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = await extract_guid_from_body(request)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -4350,6 +4376,8 @@ async def _fetch_cover_image_origin(url: str, t0: float) -> Response | None:
 @app.get("/music/api/v1/lyric/list")
 @app.get("/music/api/v1/lyric/list/{subpath:path}")
 async def lyric_list(request: Request, subpath: str = ""):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
         cached = get_stream_lyric(guid)
@@ -4389,6 +4417,8 @@ async def lyric_list(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/track/lyrics/{subpath:path}")
 @app.get("/music/api/v1/detail/lyrics/{subpath:path}")
 async def track_lyrics(request: Request, subpath: str = ""):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
         return await forward_upstream_with_local_lyric_fallback(request, get_upstream_client(request.app))
@@ -4405,6 +4435,8 @@ async def track_lyrics(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/track/metadata/{subpath:path}")
 @app.get("/music/api/v1/track/audio-info")
 async def track_metadata(request: Request, subpath: str = ""):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
         # 本地曲目：透传后补 data.track.coverId = 歌曲 guid
@@ -4429,6 +4461,8 @@ async def track_metadata(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/search/playlist")
 @app.get("/music/api/v1/search/playlist/{subpath:path}")
 async def search_playlist(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/search/playlist：酷狗专题歌单搜索；空关键词走飞牛上游。
 
     飞牛请求形如 /music/api/v1/search/playlist?q=%E6%B5%8B%E8%AF%95&page=1&size=24。
@@ -4443,6 +4477,8 @@ async def search_playlist(request: Request):
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     # [COVCDB] 封面链路诊断日志。同一个 rid 串起一次请求的所有步骤。
     # 排查完后整体删除即可（搜索 COVCDB / COVERURL / COVERIMG / COVERFALLBACK）。
     rid = uuid4().hex[:8]
@@ -4697,6 +4733,8 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
 
 @app.post("/music/api/v1/favorite-track/create")
 async def favorite_track_create(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     try:
         body = await request.json()
@@ -4760,6 +4798,8 @@ async def favorite_track_create(request: Request):
 
 @app.post("/music/api/v1/favorite-track/delete")
 async def favorite_track_delete(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     try:
         body = await request.json()
@@ -4790,6 +4830,8 @@ async def favorite_track_delete(request: Request):
 
 @app.get("/music/api/v1/favorite-track/list")
 async def favorite_track_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     url_path = request.url.path
     if request.url.query:
@@ -4879,6 +4921,8 @@ async def favorite_track_list(request: Request):
 @app.get("/music/api/v1/album/artist-detail/list")
 @app.get("/music/api/v1/album/artist-detail/list/{subpath:path}")
 async def album_artist_detail_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/album/artist-detail/list：酷狗歌手作品聚合为飞牛专辑列表。"""
     artist_guid = str(request.query_params.get("artistGUID") or request.query_params.get("artistGuid") or request.query_params.get("artist_id") or request.query_params.get("artistId") or "").strip()
     try:
@@ -4900,6 +4944,8 @@ async def album_artist_detail_list(request: Request):
 @app.get("/music/api/v1/artist/detail")
 @app.get("/music/api/v1/artist/detail/{subpath=path}")
 async def artist_detail(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/artist/detail：酷狗歌手详情；非酷狗 GUID 走飞牛上游。
 
     非酷狗 GUID（飞牛原生本地歌手）转上游后补 coverId：上游对无头像的
@@ -4928,6 +4974,8 @@ async def artist_detail(request: Request):
 @app.get("/music/api/v1/artist/list")
 @app.get("/music/api/v1/artist/list/{subpath=path}")
 async def artist_list(request: Request, subpath: str = ""):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/artist/list：本地歌手列表；转上游后补空 coverId 为 artist:<guid>。
 
     上游对无头像的本地歌手表 coverId=null，前端歌手列表卡片头像位空白。
@@ -4948,6 +4996,8 @@ async def artist_list(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/album/list")
 @app.get("/music/api/v1/album/list/{subpath=path}")
 async def album_list(request: Request, subpath: str = ""):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/album/list：本地专辑列表；转上游后补空 coverId 为 album:<guid>。
 
     与 artist/list 同构：上游对无封面的本地专辑标 coverId=null，前端专辑
@@ -4967,6 +5017,8 @@ async def album_list(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/album/detail")
 @app.get("/music/api/v1/album/detail/{subpath=path}")
 async def album_detail(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/album/detail：酷狗专辑详情；非酷狗 GUID 走飞牛上游。
 
     飞牛请求形如
@@ -5000,6 +5052,8 @@ async def album_detail(request: Request):
 @app.get("/music/api/v1/track/album-detail/list")
 @app.get("/music/api/v1/track/album-detail/list/{subpath=path}")
 async def track_album_detail_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/track/album-detail/list：酷狗专辑歌曲列表；非酷狗 GUID 走飞牛上游。
 
     参数映射参考 /track/artist-detail/list 与 /track/playlist-detail/list：
@@ -5056,6 +5110,8 @@ async def track_album_detail_list(request: Request):
 @app.get("/music/api/v1/track/artist-detail/list")
 @app.get("/music/api/v1/track/artist-detail/list/{subpath:path}")
 async def track_artist_detail_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """/track/artist-detail/list：酷狗歌手作品歌曲列表；非酷狗 GUID 走飞牛上游。
 
     参数映射参考 /track/playlist-detail/list：page/size + artistGUID，返回
@@ -5116,6 +5172,8 @@ async def track_artist_detail_list(request: Request):
 @app.get("/music/api/v1/playlist/list")
 @app.get("/music/api/v1/playlist/list/{subpath:path}")
 async def playlist_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
 
     # 1. 先加载酷狗用户歌单（不依赖上游）
@@ -5183,6 +5241,8 @@ async def playlist_list(request: Request):
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = str(request.query_params.get("guid") or "").strip()
     if not is_kugou_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
@@ -5216,6 +5276,8 @@ async def playlist_detail(request: Request):
 
 @app.get("/music/api/v1/playlist/batch-detail")
 async def playlist_batch_detail(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
     kugou_ids = [g for g in guids if is_kugou_playlist_guid(g)]
@@ -5270,6 +5332,8 @@ async def playlist_batch_detail(request: Request):
 
 @app.get("/music/api/v1/track/playlist-detail/list")
 async def playlist_track_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = str(
         request.query_params.get("playlistGUID")
         or request.query_params.get("playlistGuid")
@@ -5304,6 +5368,8 @@ async def playlist_track_list(request: Request):
 
 @app.post("/music/api/v1/event/report")
 async def event_report(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     raw = await request.body()
     try:
@@ -5344,6 +5410,8 @@ async def event_report(request: Request):
 @app.get("/music/api/v1/play-history/list")
 @app.get("/music/api/v1/play-history/list/{subpath:path}")
 async def play_history_list(request: Request):
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
     """播放历史列表：透传飞牛上游，补全本地歌曲的空 coverId。
 
     上游对无专辑封面/无内嵌封面标签的本地曲目标 coverId=null，
@@ -5706,6 +5774,11 @@ async def _save_settings_impl(form):
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, full_path: str):
+    # 代理只接管 GET：其余方法（POST/PUT/DELETE/PATCH/HEAD/OPTIONS）
+    # 一律透传上游，不进入本代理的拦截与字段兜底逻辑。
+    if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+
     if full_path == "music/api/v1/track/list":
         upstream_client = get_upstream_client(request.app)
         payload_or_resp = await fetch_upstream_envelope(request, upstream_client)
