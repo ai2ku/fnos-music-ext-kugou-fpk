@@ -18,14 +18,15 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Awaitable, Callable, Coroutine
-from urllib.parse import quote, urlencode, parse_qs
+from urllib.parse import quote, urlencode, parse_qs, unquote
 from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
-import tempfile
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -63,6 +64,13 @@ CONF = {
     "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
     "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
+    # 代理主动上传封面换官方 coverId 并回写 /track/metadata；失败静默，不影响封面出图。
+    "cover_upload_enabled": os.environ.get("FNMUSIC_COVER_UPLOAD_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "cover_upload_max_bytes": int(os.environ.get("FNMUSIC_COVER_UPLOAD_MAX_BYTES", str(4 * 1024 * 1024)) or 4194304),
+    "cover_upload_timeout": float(os.environ.get("FNMUSIC_COVER_UPLOAD_TIMEOUT", "15")),
+    "cover_id_cache_file": os.environ.get(
+        "FNMUSIC_COVER_ID_CACHE_FILE", os.path.join(_HOME, "cache", "cover_ids.json")
+    ),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
     "music_db": os.environ.get(
@@ -1095,11 +1103,15 @@ async def forward_upstream_with_local_lyric_fallback(
     request: Request,
     client: httpx.AsyncClient,
     local_cover_guid: str = "",
+    on_local_payload: Callable[[dict], None] | None = None,
 ) -> Response:
     """透传上游；本地歌 metadata 强制 hasLyric=True，避免前端首次播放不请求歌词。
 
     local_cover_guid 非空时（本地曲目）同步补 data.track.coverId = 该 guid；
     歌词路由不传，行为不变。
+
+    on_local_payload：上游 code==0 时回调原 payload（供本地缺封面时安排后台
+    上传换官方 coverId）；回调异常不影响主流程。
     """
     payload_or_resp = await fetch_upstream_envelope(request, client)
     if isinstance(payload_or_resp, Response):
@@ -1111,6 +1123,11 @@ async def forward_upstream_with_local_lyric_fallback(
     force_has_lyric_true(payload)
     if local_cover_guid:
         fill_local_metadata_cover_id(payload, local_cover_guid)
+    if on_local_payload is not None:
+        try:
+            on_local_payload(payload)
+        except Exception as e:
+            logger.warning("[COVERUPLOAD] on_local_payload err=%s:%s", type(e).__name__, e)
     return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
 
 
@@ -1135,7 +1152,9 @@ def fill_local_metadata_cover_id(payload: dict, guid: str) -> None:
         return
     if str(track.get("coverId") or "").strip():
         return
-    track["coverId"] = guid
+    # 优先用已上传换到的官方 coverId（前端用它请求 /static/cover 直接命中飞牛
+    # 官方封面）；未换到则退回自身 guid（本地封面链路本就按 guid 解析）。
+    track["coverId"] = cover_id_from_cache(guid) or guid
 
 
 def _fill_cover_id(item: dict, prefix: str = "") -> bool:
@@ -2866,6 +2885,256 @@ _COVER_HTTP_LOCK = asyncio.Lock()
 # 磁盘缓存：酷狗图片 URL 对同一歌曲恒定不变（stdmusic/160/...），同一张图
 # 被反复下载十几次，批量刷列表时 10+ 并发同刷又把连接池顶爆 -> 超时 ->
 # fallback 默认图。缓存后首次回源，后续全走本地。
+# ============================================================
+# 本地曲目缺封面：代理主动上传换官方 coverId，并主动 POST 回写。
+#
+# 触发条件（严格）：GET /track/metadata 上游返回 data.track.coverId 为空 且
+# guid 是本地曲目（无 online:/artist:/album: 前缀）。其余场景（线上曲目、
+# 歌单、歌手/专辑实体、已有封面）一律不触碰。
+#
+# 关键约束：所有内部 POST 必须走 get_upstream_client() 直连上游 unix socket。
+# 代理自身有 GET 闸门（0ce5f94），非 GET 会被透传回上游；若内部 POST 走
+# self.app.state.upstream_client 之外的自路径则形成自回环。
+# ============================================================
+import json as _json
+
+_COVER_UPLOAD_LOCK = threading.Lock()
+# guid -> 官方 coverId 磁盘映射（懒加载）。
+_COVER_ID_CACHE: dict[str, str] = {}
+_COVER_ID_CACHE_LOADED = False
+# guid -> 开始时间，避免同一首歌并发重复上传（封面批量刷新时并发请求多）。
+_COVER_UPLOAD_INFLIGHT: dict[str, float] = {}
+_INFLIGHT_STALE_SEC = 600.0
+# 失败冷却：上传/回写失败后不再重试，避免坏请求反复打上游。
+_COVER_UPLOAD_FAILED: dict[str, float] = {}
+_FAILED_COOLDOWN_SEC = 1800.0
+
+
+async def _trigger_local_cover_upload(app_state, guid: str, image_bytes: bytes) -> None:
+    """严格版触发：先查上游 track.coverId，非空（已有封面）直接退出。
+
+    仅本地曲目 + 上游确实缺封面时才走上传。线上曲目/歌单/实体不进入
+    此函数；已有封面时也不会产生任何上游写入。
+    """
+    global _COVER_UPLOAD_FAILED
+    if not guid or not image_bytes:
+        return
+    now = time.monotonic()
+    if not CONF.get("cover_upload_enabled", True):
+        return
+    try:
+        if cover_id_from_cache(guid):
+            return
+        with _COVER_UPLOAD_LOCK:
+            if guid in _COVER_UPLOAD_FAILED and now - _COVER_UPLOAD_FAILED[guid] < _FAILED_COOLDOWN_SEC:
+                return
+            if guid in _COVER_UPLOAD_INFLIGHT:
+                return
+            _COVER_UPLOAD_INFLIGHT[guid] = now
+        # 先确认上游确实缺封面，避免给已有封面的歌曲重复上传。
+        client = get_upstream_client(app_state)
+        req = client.build_request(
+            "GET",
+            f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}",
+            headers={"User-Agent": "fnmusic-ext-kugou/cover-upload"},
+        )
+        resp = await client.send(req, timeout=10.0)
+        upstream_data = resp.json() if resp.status_code == 200 else {}
+        _track = (upstream_data or {}).get("data", {})
+        _track = _track.get("track", {}) if isinstance(_track, dict) else {}
+        if str((_track or {}).get("coverId") or "").strip():
+            return  # 已有封面，不动
+        await trigger_cover_upload(app_state, guid, upstream_data or {}, image_bytes)
+    except Exception as e:
+        logger.warning("[COVERUPLOAD] precheck-err guid=%s err=%s:%s", guid, type(e).__name__, e)
+    finally:
+        _COVER_UPLOAD_INFLIGHT.pop(guid, None)
+
+
+def _cover_id_cache_path() -> str:
+    return CONF.get("cover_id_cache_file") or os.path.join(CONF["cache_dir"], "cover_ids.json")
+
+
+def _load_cover_id_cache() -> dict:
+    global _COVER_ID_CACHE_LOADED
+    if _COVER_ID_CACHE_LOADED:
+        return _COVER_ID_CACHE
+    _COVER_ID_CACHE_LOADED = True
+    try:
+        with open(_cover_id_cache_path(), "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            _COVER_ID_CACHE.clear()
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str) and v:
+                    _COVER_ID_CACHE[k] = v
+    except (OSError, ValueError):
+        pass
+    except Exception as e:
+        logger.warning("[COVERUPLOAD] cache-load err=%s", e)
+    return _COVER_ID_CACHE
+
+
+def remember_cover_id(guid: str, cover_id: str) -> None:
+    """记本地 guid -> 官方 coverId 映射并落盘（tmp + os.replace 原子替换）。"""
+    if not guid or not cover_id:
+        return
+    _COVER_ID_CACHE[guid] = cover_id
+    path = _cover_id_cache_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(_COVER_ID_CACHE, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("[COVERUPLOAD] cache-write-err err=%s", e)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    except Exception as e:
+        logger.warning("[COVERUPLOAD] cache-write-err err=%s", e)
+
+
+def cover_id_from_cache(guid: str) -> str:
+    """取已换到的官方 coverId；无记录返回空串（空串表示未命中，调用方保留 guid 兜底）。"""
+    if not guid:
+        return ""
+    return _load_cover_id_cache().get(guid, "")
+
+
+async def upload_cover_to_official(app_state, image_bytes: bytes) -> str:
+    """POST /music/api/v1/static/cover/track (multipart/form-data, name=file) 换官方 coverId。"""
+    if not image_bytes or len(image_bytes) > int(CONF.get("cover_upload_max_bytes") or 4 * 1024 * 1024):
+        return ""
+    if image_bytes.startswith(b"\x89PNG"):
+        ext = "png"
+    elif image_bytes[:3] == b"\xff\xd8\xff":
+        ext = "jpg"
+    elif image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        ext = "gif"
+    elif image_bytes[:4] == b"RIFF":
+        ext = "webp"
+    else:
+        ext = "jpg"
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="cover_", suffix=f".{ext}", delete=False
+        ) as tf:
+            tf.write(image_bytes)
+            tmp_path = tf.name
+        client = get_upstream_client(app_state)
+        async with open(tmp_path, "rb") as f:
+            req = client.build_request(
+                "POST",
+                "/music/api/v1/static/cover/track",
+                files={"file": (f"cover.{ext}", f, f"image/{'jpeg' if ext == 'jpg' else ext}")},
+            )
+            resp = await client.send(req, timeout=float(CONF.get("cover_upload_timeout") or 15))
+        if resp.status_code != 200:
+            logger.warning("[COVERUPLOAD] http=%d body=%s", resp.status_code, resp.text[:200])
+            return ""
+        data = resp.json()
+        d = data.get("data") or {}
+        cid = str(d.get("coverId") or "").strip()
+        if not cid and isinstance(d, dict):
+            cid = str(d.get("guid") or "").strip()
+        logger.warning("[COVERUPLOAD] code=%s coverId=%s", data.get("code"), cid or "(empty)")
+        return cid if data.get("code") == 0 else ""
+    except Exception as e:
+        logger.warning("[COVERUPLOAD] err=%s:%s", type(e).__name__, e)
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict) -> bool:
+    """POST /music/api/v1/track/metadata 回写官方 coverId，用户无感。
+
+    仅提交上游已刮削的有值字段，再加 coverId/coverGUID。空数组与 None
+    一律不提交 —— metadata correction 端点会把空 artistGUIDs 解成
+    「清空歌手」，误传会把歌曲刮削结果弄坏。
+    """
+    track = data.get("track") if isinstance(data, dict) else None
+    track = track if isinstance(track, dict) else {}
+    payload: dict[str, Any] = {"guid": guid, "coverId": cover_id, "coverGUID": cover_id}
+    for key in ("title", "album"):
+        value = track.get(key) or data.get(key)
+        if str(value or "").strip():
+            payload[key] = value
+    for key in ("artistGUIDs", "genreGUIDs"):
+        value = track.get(key) if track.get(key) is not None else data.get(key)
+        if isinstance(value, list) and value:
+            payload[key] = value
+    for key in ("year", "discNo", "trackNo"):
+        value = track.get(key) if track.get(key) is not None else data.get(key)
+        if value is not None:
+            payload[key] = value
+    if not str(payload.get("title") or "").strip():
+        logger.warning("[COVERWRITE] skip-no-title guid=%s (metadata incomplete)", guid)
+        return False
+    try:
+        client = get_upstream_client(app_state)
+        req = client.build_request(
+            "POST",
+            "/music/api/v1/track/metadata",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = await client.send(req, timeout=20.0)
+        if resp.status_code != 200:
+            logger.warning("[COVERWRITE] http=%d guid=%s", resp.status_code, guid)
+            return False
+        r = resp.json()
+        ok = r.get("code") == 0
+        logger.warning("[COVERWRITE] %s code=%s guid=%s coverId=%s", "OK" if ok else "FAIL", r.get("code"), guid, cover_id)
+        return ok
+    except Exception as e:
+        logger.warning("[COVERWRITE] err=%s:%s", type(e).__name__, e)
+        return False
+
+
+async def trigger_cover_upload(app_state, guid: str, upstream_data: dict, image_bytes: bytes) -> None:
+    """后台执行：上传封面 -> 主动 POST 回写 -> 记映射缓存。全程静默，不影响当前响应。"""
+    global _COVER_UPLOAD_FAILED
+    if not guid or not image_bytes:
+        return
+    now = time.monotonic()
+    with _COVER_UPLOAD_LOCK:
+        if guid in _COVER_UPLOAD_FAILED and now - _COVER_UPLOAD_FAILED[guid] < _FAILED_COOLDOWN_SEC:
+            return
+        if guid in _COVER_UPLOAD_INFLIGHT:
+            return
+        _COVER_UPLOAD_INFLIGHT[guid] = now
+        # 清理过期条目，避免 dict 无限增长。
+        for g in [k for k, t in _COVER_UPLOAD_INFLIGHT.items() if now - t > _INFLIGHT_STALE_SEC]:
+            _COVER_UPLOAD_INFLIGHT.pop(g, None)
+        _COVER_UPLOAD_FAILED = {k: t for k, t in _COVER_UPLOAD_FAILED.items() if now - t < _FAILED_COOLDOWN_SEC}
+    try:
+        if cover_id_from_cache(guid):
+            return
+        cid = await upload_cover_to_official(app_state, image_bytes)
+        if not cid:
+            _COVER_UPLOAD_FAILED[guid] = time.monotonic()
+            return
+        ok = await post_official_cover_id(app_state, guid, cid, upstream_data)
+        if ok:
+            remember_cover_id(guid, cid)
+        else:
+            _COVER_UPLOAD_FAILED[guid] = time.monotonic()
+    except Exception as e:
+        logger.warning("[COVERUPLOAD] trigger-err guid=%s err=%s", guid, e)
+        _COVER_UPLOAD_FAILED[guid] = time.monotonic()
+    finally:
+        _COVER_UPLOAD_INFLIGHT.pop(guid, None)
+
+
 _COVER_DISK_TTL = 24 * 3600
 _COVER_DISK_MAX_FILES = 500
 
@@ -4439,7 +4708,8 @@ async def track_metadata(request: Request, subpath: str = ""):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
-        # 本地曲目：透传后补 data.track.coverId = 歌曲 guid
+        # 本地曲目：透传后补 data.track.coverId（优先官方 coverId，未换到则用 guid）。
+        # 上传与回写由 static_cover 在拿到封面 bytes 时触发，此处不重复回源。
         return await forward_upstream_with_local_lyric_fallback(
             request, get_upstream_client(request.app), local_cover_guid=guid
         )
@@ -4478,6 +4748,13 @@ async def search_playlist(request: Request):
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
     if not _is_get_request(request):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    # 代理上传换到的官方 coverId（track_<hash> / artist_<hash> / album_<hash> /
+    # playlist_<hash>）已回写飞牛数据库，后续封面请求必须直接透传上游拿官方封面，
+    # 不能用它当本地 guid 去搜酷狗（会拿假 guid 搜不到、白回源）。
+    _probe_guid = extract_guid(request, subpath if is_online_guid(subpath) else None) or unquote(subpath or "")
+    if _probe_guid and _probe_guid.startswith(("track_", "artist_", "album_", "playlist_")):
+        logger.warning("[COVERDB] step0-official rid=%s coverId=%s -> upstream", uuid4().hex[:8], _probe_guid[:60])
         return await forward_to_upstream(request, get_upstream_client(request.app))
     # [COVCDB] 封面链路诊断日志。同一个 rid 串起一次请求的所有步骤。
     # 排查完后整体删除即可（搜索 COVCDB / COVERURL / COVERIMG / COVERFALLBACK）。
@@ -4528,6 +4805,9 @@ async def static_cover(request: Request, subpath: str = ""):
     if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
         sidecar = _local_sidecar_art_response(guid)
         if sidecar is not None:
+            # 仅本地曲目触发上传换官方 coverId；函数内部已检查上游
+            # track.coverId 是否为空，已有封面时不会产生任何写入。
+            asyncio.ensure_future(_trigger_local_cover_upload(request.app, guid, sidecar.body))
             logger.warning("[COVCDB] step2-sidecar rid=%s HIT guid=%s bytes=%d",
                            rid, guid, len(sidecar.body))
             return sidecar
@@ -4564,6 +4844,10 @@ async def static_cover(request: Request, subpath: str = ""):
                    rid, cover[:100], request.query_params.get("size"), time.monotonic() - t_all)
     response = await _fetch_cover_image_response(cover)
     if response is not None:
+        # 只有本地曲目（无 online:/歌单前缀）才触发；实体封面走上面
+        # step2-entity 分支，不会到这里。
+        if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
+            asyncio.ensure_future(_trigger_local_cover_upload(request.app, guid, response.body))
         logger.warning("[COVCDB] step7-ok rid=%s bytes=%d total=%.2fs",
                        rid, len(response.body), time.monotonic() - t_all)
         return response
