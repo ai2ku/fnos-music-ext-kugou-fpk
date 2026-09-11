@@ -2910,18 +2910,22 @@ _COVER_UPLOAD_FAILED: dict[str, float] = {}
 _FAILED_COOLDOWN_SEC = 1800.0
 
 
-async def _trigger_local_cover_upload(app_state, guid: str, image_bytes: bytes) -> None:
-    """严格版触发：先查上游 track.coverId，非空（已有封面）直接退出。
+async def _trigger_local_cover_upload(request: Request, app_state, guid: str, image_bytes: bytes) -> None:
+    """本地曲目缺封面时的完整链路：预检 -> 上传换官方 coverId -> POST 回写 -> 缓存。
 
-    仅本地曲目 + 上游确实缺封面时才走上传。线上曲目/歌单/实体不进入
-    此函数；已有封面时也不会产生任何上游写入。
+    严格边界：仅本地曲目 + 上游 track.coverId 为空才上传。线上曲目/歌单/
+    歌手专辑实体不进入此函数；已有封面时不产生任何上游写入。
+    全程静默失败，不影响当前封面响应。
+
+    内部请求必须带音乐端鉴权头（copy_incoming_headers）：上游 socket 的
+    track/metadata 无鉴权会回 401。
     """
     global _COVER_UPLOAD_FAILED
     if not guid or not image_bytes:
         return
-    now = time.monotonic()
     if not CONF.get("cover_upload_enabled", True):
         return
+    now = time.monotonic()
     try:
         if cover_id_from_cache(guid):
             return
@@ -2931,22 +2935,49 @@ async def _trigger_local_cover_upload(app_state, guid: str, image_bytes: bytes) 
             if guid in _COVER_UPLOAD_INFLIGHT:
                 return
             _COVER_UPLOAD_INFLIGHT[guid] = now
-        # 先确认上游确实缺封面，避免给已有封面的歌曲重复上传。
+            # 清理过期条目，避免 dict 无限增长。
+            _COVER_UPLOAD_FAILED = {k: t for k, t in _COVER_UPLOAD_FAILED.items() if now - t < _FAILED_COOLDOWN_SEC}
+            for g in [k for k, t in _COVER_UPLOAD_INFLIGHT.items() if now - t > _INFLIGHT_STALE_SEC]:
+                _COVER_UPLOAD_INFLIGHT.pop(g, None)
+        headers = copy_incoming_headers(request)
+        # 预检：上游 track.coverId 已存在则直接退出，不给已有封面的歌重复上传。
         client = get_upstream_client(app_state)
         req = client.build_request(
             "GET",
             f"/music/api/v1/track/metadata?guid={quote(guid, safe='')}",
-            headers={"User-Agent": "fnmusic-ext-kugou/cover-upload"},
+            headers=headers,
+            timeout=10.0,
         )
-        resp = await client.send(req, timeout=10.0)
-        upstream_data = resp.json() if resp.status_code == 200 else {}
-        _track = (upstream_data or {}).get("data", {})
-        _track = _track.get("track", {}) if isinstance(_track, dict) else {}
-        if str((_track or {}).get("coverId") or "").strip():
+        resp = await client.send(req)
+        if resp.status_code != 200:
+            logger.warning("[COVERUPLOAD] precheck http=%d guid=%s -> skip", resp.status_code, guid)
+            return
+        upstream_data = resp.json()
+        _data = upstream_data.get("data") if isinstance(upstream_data, dict) else None
+        _track = _data.get("track") if isinstance(_data, dict) else None
+        if not isinstance(_track, dict):
+            _track = {}
+        if str(_track.get("coverId") or "").strip():
             return  # 已有封面，不动
-        await trigger_cover_upload(app_state, guid, upstream_data or {}, image_bytes)
+        # post_official_cover_id 内部读 data.get("track")，所以传 data 层而非外层
+        # {code, data:{track:{...}}}。传外层会取不到 track，回写必报 skip-no-title。
+        inner_data = _data if isinstance(_data, dict) else {}
+        cid = await upload_cover_to_official(app_state, image_bytes, headers)
+        if not cid:
+            _COVER_UPLOAD_FAILED[guid] = time.monotonic()
+            return
+        # 换到官方 coverId 就先落缓存：即使回写失败，用户下次请求也能看到封面，
+        # 不能因为回写没成就把已取得的 coverId 丢掉。
+        remember_cover_id(guid, cid)
+        if await post_official_cover_id(app_state, guid, cid, inner_data, headers):
+            _COVER_UPLOAD_FAILED.pop(guid, None)
+        else:
+            # 回写失败设上传冷却：coverId 已缓存，下次请求缓存命中会早退，
+            # 不会重复上传；冷却过后仍可重试回写。
+            _COVER_UPLOAD_FAILED[guid] = time.monotonic()
     except Exception as e:
-        logger.warning("[COVERUPLOAD] precheck-err guid=%s err=%s:%s", guid, type(e).__name__, e)
+        logger.warning("[COVERUPLOAD] err guid=%s err=%s:%s", guid, type(e).__name__, e)
+        _COVER_UPLOAD_FAILED[guid] = time.monotonic()
     finally:
         _COVER_UPLOAD_INFLIGHT.pop(guid, None)
 
@@ -3004,8 +3035,12 @@ def cover_id_from_cache(guid: str) -> str:
     return _load_cover_id_cache().get(guid, "")
 
 
-async def upload_cover_to_official(app_state, image_bytes: bytes) -> str:
-    """POST /music/api/v1/static/cover/track (multipart/form-data, name=file) 换官方 coverId。"""
+async def upload_cover_to_official(app_state, image_bytes: bytes, headers: dict) -> str:
+    """POST /music/api/v1/static/cover/track (multipart/form-data, name=file) 换官方 coverId。
+
+    headers 必须带音乐端鉴权（cookie / authorization / x-trim-music-temp-token），
+    否则飞牛回 401。
+    """
     if not image_bytes or len(image_bytes) > int(CONF.get("cover_upload_max_bytes") or 4 * 1024 * 1024):
         return ""
     if image_bytes.startswith(b"\x89PNG"):
@@ -3018,21 +3053,22 @@ async def upload_cover_to_official(app_state, image_bytes: bytes) -> str:
         ext = "webp"
     else:
         ext = "jpg"
-    tmp_path = ""
+    mime = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp"}[ext]
+    # 直接用 bytes 当 multipart 内容，不落临时文件、不持文件句柄。
+    # 注意：build_request() 只记录 content，真正读取发生在 send()；
+    # 若用 with open() 包住 build_request，退出 with 时会先关文件再读，报
+    # "seek of closed file"。字节内容无此问题。
     try:
-        with tempfile.NamedTemporaryFile(
-            prefix="cover_", suffix=f".{ext}", delete=False
-        ) as tf:
-            tf.write(image_bytes)
-            tmp_path = tf.name
         client = get_upstream_client(app_state)
-        async with open(tmp_path, "rb") as f:
-            req = client.build_request(
-                "POST",
-                "/music/api/v1/static/cover/track",
-                files={"file": (f"cover.{ext}", f, f"image/{'jpeg' if ext == 'jpg' else ext}")},
-            )
-            resp = await client.send(req, timeout=float(CONF.get("cover_upload_timeout") or 15))
+        req = client.build_request(
+            "POST",
+            "/music/api/v1/static/cover/track",
+            files={"file": (f"cover.{ext}", image_bytes, mime)},
+            headers=headers,
+            timeout=float(CONF.get("cover_upload_timeout") or 15),
+        )
+        resp = await client.send(req)
         if resp.status_code != 200:
             logger.warning("[COVERUPLOAD] http=%d body=%s", resp.status_code, resp.text[:200])
             return ""
@@ -3041,20 +3077,14 @@ async def upload_cover_to_official(app_state, image_bytes: bytes) -> str:
         cid = str(d.get("coverId") or "").strip()
         if not cid and isinstance(d, dict):
             cid = str(d.get("guid") or "").strip()
-        logger.warning("[COVERUPLOAD] code=%s coverId=%s", data.get("code"), cid or "(empty)")
+        logger.warning("[COVERUPLOAD] code=%s coverId=%s bytes=%d", data.get("code"), cid or "(empty)", len(image_bytes))
         return cid if data.get("code") == 0 else ""
     except Exception as e:
         logger.warning("[COVERUPLOAD] err=%s:%s", type(e).__name__, e)
         return ""
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
-async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict) -> bool:
+async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict, headers: dict) -> bool:
     """POST /music/api/v1/track/metadata 回写官方 coverId，用户无感。
 
     仅提交上游已刮削的有值字段，再加 coverId/coverGUID。空数组与 None
@@ -3085,11 +3115,12 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
             "POST",
             "/music/api/v1/track/metadata",
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers={**headers, "Content-Type": "application/json"},
+            timeout=20.0,
         )
-        resp = await client.send(req, timeout=20.0)
+        resp = await client.send(req)
         if resp.status_code != 200:
-            logger.warning("[COVERWRITE] http=%d guid=%s", resp.status_code, guid)
+            logger.warning("[COVERWRITE] http=%d body=%s guid=%s", resp.status_code, resp.text[:200], guid)
             return False
         r = resp.json()
         ok = r.get("code") == 0
@@ -3098,41 +3129,6 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
     except Exception as e:
         logger.warning("[COVERWRITE] err=%s:%s", type(e).__name__, e)
         return False
-
-
-async def trigger_cover_upload(app_state, guid: str, upstream_data: dict, image_bytes: bytes) -> None:
-    """后台执行：上传封面 -> 主动 POST 回写 -> 记映射缓存。全程静默，不影响当前响应。"""
-    global _COVER_UPLOAD_FAILED
-    if not guid or not image_bytes:
-        return
-    now = time.monotonic()
-    with _COVER_UPLOAD_LOCK:
-        if guid in _COVER_UPLOAD_FAILED and now - _COVER_UPLOAD_FAILED[guid] < _FAILED_COOLDOWN_SEC:
-            return
-        if guid in _COVER_UPLOAD_INFLIGHT:
-            return
-        _COVER_UPLOAD_INFLIGHT[guid] = now
-        # 清理过期条目，避免 dict 无限增长。
-        for g in [k for k, t in _COVER_UPLOAD_INFLIGHT.items() if now - t > _INFLIGHT_STALE_SEC]:
-            _COVER_UPLOAD_INFLIGHT.pop(g, None)
-        _COVER_UPLOAD_FAILED = {k: t for k, t in _COVER_UPLOAD_FAILED.items() if now - t < _FAILED_COOLDOWN_SEC}
-    try:
-        if cover_id_from_cache(guid):
-            return
-        cid = await upload_cover_to_official(app_state, image_bytes)
-        if not cid:
-            _COVER_UPLOAD_FAILED[guid] = time.monotonic()
-            return
-        ok = await post_official_cover_id(app_state, guid, cid, upstream_data)
-        if ok:
-            remember_cover_id(guid, cid)
-        else:
-            _COVER_UPLOAD_FAILED[guid] = time.monotonic()
-    except Exception as e:
-        logger.warning("[COVERUPLOAD] trigger-err guid=%s err=%s", guid, e)
-        _COVER_UPLOAD_FAILED[guid] = time.monotonic()
-    finally:
-        _COVER_UPLOAD_INFLIGHT.pop(guid, None)
 
 
 _COVER_DISK_TTL = 24 * 3600
@@ -4807,7 +4803,7 @@ async def static_cover(request: Request, subpath: str = ""):
         if sidecar is not None:
             # 仅本地曲目触发上传换官方 coverId；函数内部已检查上游
             # track.coverId 是否为空，已有封面时不会产生任何写入。
-            asyncio.ensure_future(_trigger_local_cover_upload(request.app, guid, sidecar.body))
+            asyncio.ensure_future(_trigger_local_cover_upload(request, request.app, guid, sidecar.body))
             logger.warning("[COVCDB] step2-sidecar rid=%s HIT guid=%s bytes=%d",
                            rid, guid, len(sidecar.body))
             return sidecar
@@ -4847,7 +4843,7 @@ async def static_cover(request: Request, subpath: str = ""):
         # 只有本地曲目（无 online:/歌单前缀）才触发；实体封面走上面
         # step2-entity 分支，不会到这里。
         if not is_online_guid(guid) and not is_kugou_playlist_guid(guid):
-            asyncio.ensure_future(_trigger_local_cover_upload(request.app, guid, response.body))
+            asyncio.ensure_future(_trigger_local_cover_upload(request, request.app, guid, response.body))
         logger.warning("[COVCDB] step7-ok rid=%s bytes=%d total=%.2fs",
                        rid, len(response.body), time.monotonic() - t_all)
         return response
