@@ -4150,6 +4150,15 @@ async def _online_info(request: Request, guid: str) -> dict | None:
 # 时不会误配，但子路径含 /album/ 的专辑封面会被错配成 /album 分支。
 _SINGER_SIZE_RE = re.compile(r"(/uploadpic/[^/]+)/\d+(/)")
 
+# 路径段形式的具体尺寸，如 /stdmusic/160/、/custom/600/、/uploadpic/softhead/160/。
+# 2-4 位数字兼避 6 位日期段（/uploadpic/avatar2/202404/240/ 里的 202404 不会误换）。
+_KUGOU_SIZE_SEG_RE = re.compile(
+    r"(/(?:stdmusic|custom|soft/collection|uploadpic/[^/]+)/)\d{2,4}(?=/)"
+)
+
+# album/v8/<id>_<N>.jpg 后缀形式。
+_KUGOU_ALBUM_SUF_RE = re.compile(r"(album/v8/\d+)_\d+\.jpg")
+
 
 
 
@@ -4176,12 +4185,15 @@ def _fill_cover_size_for_upload(cover: str, request: Request) -> str:
     """按 cover_upload_size 填尺寸占位符，用于「为换 coverId 回源拉大图」。
 
     前端请求的 size 通常只有 160/240，拿那张小图去上传换官方 coverId，
-    入库的就是缩略图。这里改成按配置的分辨率回源：
-    - 酷狗歌单 /uploadpic/<子路径>/<N>/ 里的 <N> 直接换成目标尺寸（原
-      _fill_cover_size 会按本次请求的 size 填，那正是问题所在）
-    - album/v8/<id>_<N>.jpg 里的 _<N>.jpg 同理
-    - 其余 URL（netease/music163 等）本身不带尺寸参数，原样返回
-    0 表示不缩放，原样返回请求自带的尺寸。
+    入库的就是缩略图。这里改成按配置的分辨率回源。
+
+    尺寸在酷狗 URL 里有三种形态，必须都覆盖：
+    1. {size}/{SIZE} 占位符（代理内部缓存的原模板）
+    2. 路径段：/stdmusic/160/、/custom/600/、/uploadpic/softhead/160/
+       —— 这是主力形态，旧正则只匹配 uploadpic 一种，其余全部失配
+    3. 后缀：album/v8/<id>_<N>.jpg
+    匹配不到的 URL（albkmid、music163 等本身不带尺寸）原样返回，由调用方走降级。
+    0 表示不缩放。
     """
     target = int(CONF.get("cover_upload_size") or 0)
     if not cover:
@@ -4190,8 +4202,10 @@ def _fill_cover_size_for_upload(cover: str, request: Request) -> str:
         return _fill_cover_size(cover, request)
     size_s = str(target)
     out = cover.replace("{size}", size_s).replace("{SIZE}", size_s)
-    out = _SINGER_SIZE_RE.sub(lambda m: f"{m.group(1)}/{size_s}{m.group(2)}", out, count=1)
-    out = re.sub(r"_\d+\.jpg(?!.*\d+\.jpg)", f"_{size_s}.jpg", out, count=1)
+    # 要求 2-4 位数字：既覆盖 160/600/1024，也天然避开 6 位日期段（如
+    # /uploadpic/avatar2/202404/240/ 里的 202404 不会被误当尺寸替换）。
+    out = _KUGOU_SIZE_SEG_RE.sub(lambda m: f"{m.group(1)}{size_s}", out, count=1)
+    out = _KUGOU_ALBUM_SUF_RE.sub(lambda m: f"{m.group(1)}_{size_s}.jpg", out, count=1)
     return out
 
 
