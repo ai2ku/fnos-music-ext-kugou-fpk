@@ -1161,7 +1161,8 @@ def _fill_cover_id(item: dict, prefix: str = "") -> bool:
 def fill_local_track_list_cover_ids(payload: dict) -> None:
     """补 data.list[] 下空的 coverId，填为本项自身的 guid。
 
-    track/list 与 play-history/list 共用。本地曲目没有专辑封面/内嵌
+    track/list、play-history/list、track/genre-detail/list 共用（均为曲目
+    列表，data.list[] 元素为 track）。本地曲目没有专辑封面/内嵌
     封面标签时上游标 coverId=null，前端按 coverId 取封面会拿不到；
     用歌曲自身 guid 兜底（本地封面链路本就按 guid 解析）。线上曲目
     guid 形如 online:kugou:track:<id>，同样能被封面路由识别，故不分
@@ -1220,6 +1221,24 @@ def fill_artist_list_cover_ids(payload: dict) -> None:
     for item in list_obj:
         if isinstance(item, dict):
             _fill_cover_id(item, prefix=_LOCAL_ARTIST_COVER_PREFIX)
+
+
+def fill_album_list_cover_ids(payload: dict) -> None:
+    """补 /album/list 的 data.list[] 空 coverId，填为 album:<guid>。
+
+    与 fill_artist_list_cover_ids 同构：专辑实体 guid 与本地曲目 guid
+    同为 32 位 hex，补成裸 guid 会被 /static/cover 按曲目链路解析。
+    非空不覆盖，上游自带 album: 前缀时保持原样，不会双重前缀。
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return
+    list_obj = data.get("list")
+    if not isinstance(list_obj, list):
+        return
+    for item in list_obj:
+        if isinstance(item, dict):
+            _fill_cover_id(item, prefix=_LOCAL_ALBUM_COVER_PREFIX)
 
 
 def payload_or_resp_status(payload: dict) -> int:
@@ -4926,6 +4945,25 @@ async def artist_list(request: Request, subpath: str = ""):
     return JSONResponse(content=envelope, headers=headers)
 
 
+@app.get("/music/api/v1/album/list")
+@app.get("/music/api/v1/album/list/{subpath=path}")
+async def album_list(request: Request, subpath: str = ""):
+    """/album/list：本地专辑列表；转上游后补空 coverId 为 album:<guid>。
+
+    与 artist/list 同构：上游对无封面的本地专辑标 coverId=null，前端专辑
+    列表卡片封面位空白。必须带 album: 前缀，裸 guid 会走曲目链路。
+    酷狗专辑列表走 /search/album，不经本路由。
+    """
+    envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {})
+    if envelope.get("code") != 0:
+        return JSONResponse(content=envelope, headers=headers)
+    fill_album_list_cover_ids(envelope)
+    return JSONResponse(content=envelope, headers=headers)
+
+
 @app.get("/music/api/v1/album/detail")
 @app.get("/music/api/v1/album/detail/{subpath=path}")
 async def album_detail(request: Request):
@@ -5669,6 +5707,19 @@ async def _save_settings_impl(form):
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def catch_all(request: Request, full_path: str):
     if full_path == "music/api/v1/track/list":
+        upstream_client = get_upstream_client(request.app)
+        payload_or_resp = await fetch_upstream_envelope(request, upstream_client)
+        if isinstance(payload_or_resp, Response):
+            return payload_or_resp
+        payload = payload_or_resp
+        headers = payload.pop("_ext_headers", {})
+        fill_local_track_list_cover_ids(payload)
+        return JSONResponse(content=payload, status_code=payload_or_resp_status(payload), headers=headers or None)
+
+    # 风格详情曲目列表：结构与 track/list 一致（data.list[] 为 track），
+    # 本地曲目无专辑封面时 coverId=null，走 catch-all 透传会保持空值，
+    # 前端歌曲列表封面位空白。复用同一兜底，补为曲目自身 guid。
+    if full_path == "music/api/v1/track/genre-detail/list":
         upstream_client = get_upstream_client(request.app)
         payload_or_resp = await fetch_upstream_envelope(request, upstream_client)
         if isinstance(payload_or_resp, Response):
