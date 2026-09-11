@@ -1138,6 +1138,23 @@ def fill_local_metadata_cover_id(payload: dict, guid: str) -> None:
     track["coverId"] = guid
 
 
+def _fill_cover_id(item: dict) -> bool:
+    """把空 coverId 兜底为该项自身 guid。返回是否发生了写入。
+
+    本地实体无封面/无内嵌封面标签时上游标 coverId=null（甚至直接缺键），
+    前端按 coverId 取封面拿不到；用自身 guid 兜底（本地封面链路本就按
+    guid 解析）。线上实体 guid 形如 online:kugou:track:<id>，同样能被封面
+    路由识别，故不分线上/线下统一兜底。已有非空 coverId 时不覆盖。
+    """
+    guid = str(item.get("guid") or "").strip()
+    if not guid:
+        return False
+    if item.get("coverId") in (None, ""):
+        item["coverId"] = guid
+        return True
+    return False
+
+
 def fill_local_track_list_cover_ids(payload: dict) -> None:
     """补 data.list[] 下空的 coverId，填为本项自身的 guid。
 
@@ -1154,13 +1171,27 @@ def fill_local_track_list_cover_ids(payload: dict) -> None:
     if not isinstance(list_obj, list):
         return
     for item in list_obj:
-        if not isinstance(item, dict):
-            continue
-        guid = str(item.get("guid") or "").strip()
-        if not guid:
-            continue
-        if item.get("coverId") in (None, ""):
-            item["coverId"] = guid
+        if isinstance(item, dict):
+            _fill_cover_id(item)
+
+
+def fill_detail_cover_id(payload: dict) -> None:
+    """补 detail 接口顶层 data.coverId，填为 data.guid。
+
+    artist/detail 与 album/detail 的 data 是实体对象本身（非 list），
+    无封面时上游标 coverId=null，歌手/专辑头像位空白。补法与 list 类
+    接口一致：用实体自身 guid 兜底，非空不覆盖。同一 payload 的
+    data.list[]（如专辑详情内嵌曲目）也一并补齐，保持口径一致。
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return
+    _fill_cover_id(data)
+    list_obj = data.get("list")
+    if isinstance(list_obj, list):
+        for item in list_obj:
+            if isinstance(item, dict):
+                _fill_cover_id(item)
 
 
 def payload_or_resp_status(payload: dict) -> int:
@@ -3649,6 +3680,12 @@ async def _online_info(request: Request, guid: str) -> dict | None:
     return None
 
 
+# 歌手图 URL 形如 singerimg.kugou.com/uploadpic/softhead/240/<date>/x.jpg，
+# /uploadpic/<子路径>/<像素>/ 末段是尺寸。酷狗 author 搜索的 Avatar 字段
+# 固定是 240 图，前端要 size=1024 时得换这段，否则拿到的是模糊原图。
+_SINGER_SIZE_RE = re.compile(r"(/uploadpic/[^/]+)/\d+(/)")
+
+
 def _fill_cover_size(cover: str, request: Request) -> str:
     if not cover:
         return ""
@@ -3657,7 +3694,12 @@ def _fill_cover_size(cover: str, request: Request) -> str:
         size_s = str(int(size)).strip()
     except (TypeError, ValueError):
         size_s = "240"
-    return cover.replace("{size}", size_s).replace("{SIZE}", size_s)
+    cover = cover.replace("{size}", size_s).replace("{SIZE}", size_s)
+    def _sub_artist_size(m):
+        return f"{m.group(1)}{size_s}{m.group(2)}"
+
+    cover = _SINGER_SIZE_RE.sub(_sub_artist_size, cover, count=1)
+    return cover
 
 
 async def _fetch_kugou_playlist_cover_url(request: Request, coll_id: str) -> str:
@@ -3749,6 +3791,107 @@ async def _fetch_kugou_album_cover_url(request: Request, album_id: str) -> str:
     return ""
 
 
+# 本地歌手封面：/artist/detail 取名字 -> 酷狗 author 搜索取 Avatar。
+# 本地歌手 guid 无 online: 前缀，此前落入"按曲目解析"分支（/track/metadata
+# 查不到 title，几十毫秒就写空串失败缓存并透传上游），歌手头像位空白。
+
+
+async def _local_artist_name_by_guid(request: Request, guid: str) -> str | None:
+    """guid 若是飞牛本地歌手：返回歌手名字；不是歌手（曲目/专辑/无效）返回 None。
+
+    判定依据 /artist/detail 的返回体：歌手详情 data 里有 name 与 trackCount，
+    曲目/专辑详情没有 trackCount，所以 trackCount<=0 一律按"不是歌手"处理，
+    避免把曲目 guid 误判成歌手后去酷狗搜一个空名。
+    """
+    if not guid or is_online_guid(guid) or is_kugou_playlist_guid(guid):
+        return None
+    try:
+        envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+        if isinstance(envelope, Response):
+            return None
+        if envelope.get("code") != 0:
+            return None
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            return None
+        name = str(data.get("name") or data.get("artist") or data.get("singer") or "").strip()
+        if not name:
+            return None
+        try:
+            if int(data.get("trackCount") or 0) <= 0:
+                return None
+        except (TypeError, ValueError):
+            return None
+        return name
+    except Exception as e:
+        logger.warning("[LOCAL_ARTIST] detail error guid=%s err=%s", guid, e)
+        return None
+
+
+async def _kugou_author_avatar_by_name(name: str, page: int = 1, limit: int = 30) -> str:
+    """用歌手名搜酷狗，返回歌手头像 URL。
+
+    数据源 KuGouMusicApi /search?keywords=<歌手名>&type=author。
+    精确同名优先；无精确同名时返回酷狗原始排序的第一名（可能挂到同名的
+    不同歌手，宁可模糊命中也不留空白）。返回未填尺寸的原图，尺寸由调用方
+    按请求参数统一替换。
+    """
+    kw = str(name or "").strip()
+    if not kw:
+        return ""
+    try:
+        async with kugou_source._client() as c:
+            r = await c.get(
+                "/search",
+                params={"keywords": kw, "page": page, "pagesize": limit, "type": "author"},
+            )
+            if r.status_code != 200:
+                logger.warning("[KUGOU_ARTIST_AVATAR] http=%s kw=%r", r.status_code, kw)
+                return ""
+            body = r.json()
+            data = body.get("data") or {} if isinstance(body, dict) else {}
+            lists = data.get("lists") or [] if isinstance(data, dict) else []
+            if not isinstance(lists, list):
+                return ""
+    except Exception as e:
+        logger.warning("[KUGOU_ARTIST_AVATAR] error kw=%r err=%s", kw, e)
+        return ""
+
+    first = ""
+    for it in lists:
+        if not isinstance(it, dict):
+            continue
+        author = str(it.get("AuthorName") or it.get("author_name") or "").strip()
+        avatar = str(it.get("Avatar") or it.get("avatar") or it.get("img") or "").strip()
+        if not author or not avatar:
+            continue
+        if author == kw:
+            return avatar
+        if not first:
+            first = avatar
+    if first:
+        logger.warning("[KUGOU_ARTIST_AVATAR] no exact-name match kw=%r, using first result", kw)
+    return first
+
+
+async def _resolve_local_artist_cover_url(request: Request, guid: str) -> str:
+    """本地歌手封面兜底：/artist/detail 拿名字 -> 酷狗 author 搜索拿 Avatar。"""
+    if not guid or is_online_guid(guid) or is_kugou_playlist_guid(guid):
+        return ""
+    if not CONF.get("kugou_enabled", True):
+        return ""
+    t0 = time.monotonic()
+    name = await _local_artist_name_by_guid(request, guid)
+    if not name:
+        logger.warning("[STATIC_COVER] artist branch=local_artist not_artist guid=%s elapsed=%.2fs",
+                       guid, time.monotonic() - t0)
+        return ""
+    avatar = await _kugou_author_avatar_by_name(name, page=1, limit=30)
+    logger.warning("[STATIC_COVER] artist branch=local_artist guid=%s name=%r avatar=%s elapsed=%.2fs",
+                   guid, name, avatar[:80] if avatar else "NO", time.monotonic() - t0)
+    return avatar
+
+
 async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
     """按 GUID 取封面：在线直取在线信息，酷狗歌单取 pic，酷狗专辑查详情，本地回退到酷狗搜索。"""
     if not guid:
@@ -3785,6 +3928,15 @@ async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
                        raw[:80], "yes" if url else "NO", time.monotonic() - t0, guid)
         return url
     t0 = time.monotonic()
+    url = await _resolve_local_artist_cover_url(request, guid)
+    if url:
+        # 返回未填尺寸的原图：static_cover 主路由会 remember_local_cover_url 缓存模板，
+        # 再用 _fill_cover_size 按本次请求的 size 填（歌手图 /uploadpic/xxx/<N>/ 会同步换 N）。
+        logger.warning("[COVERURL] step6 branch=local_artist got=yes url=%s elapsed=%.2fs guid=%s",
+                       url[:90], time.monotonic() - t0, guid)
+        return url
+    logger.warning("[COVERURL] step6 branch=local_artist got=NO -> local_track elapsed=%.2fs guid=%s",
+                   time.monotonic() - t0, guid)
     url = await _resolve_local_static_cover_url(request, guid)
     logger.warning("[COVERURL] step6 branch=local got=%s elapsed=%.2fs guid=%s",
                    "yes" if url else "NO", time.monotonic() - t0, guid)
@@ -4484,14 +4636,29 @@ async def album_artist_detail_list(request: Request):
 @app.get("/music/api/v1/artist/detail")
 @app.get("/music/api/v1/artist/detail/{subpath=path}")
 async def artist_detail(request: Request):
-    """/artist/detail：酷狗歌手详情；非酷狗 GUID 走飞牛上游。"""
+    """/artist/detail：酷狗歌手详情；非酷狗 GUID 走飞牛上游。
+
+    非酷狗 GUID（飞牛原生本地歌手）转上游后补 coverId：上游对无头像的
+    本地歌手表 coverId=null，前端歌手详情页头像位空白；用歌手自身 guid
+    兜底，与 list 类接口补法一致。酷狗分支由 fetch_kugou_artist_detail
+    自行填 coverId=guid，不需补。
+    """
     artist_guid = str(request.query_params.get("guid") or request.query_params.get("GUID") or "").strip()
     if not artist_guid:
         return JSONResponse(content={"code": 400, "msg": "guid required", "data": None})
+    parsed_artist_id, artist_kind = parse_kugou_artist_guid(artist_guid)
+    if artist_kind != "kugou_artist":
+        envelope = await fetch_upstream_envelope(request, get_upstream_client(request.app))
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        if envelope.get("code") != 0:
+            return JSONResponse(content=envelope, headers=headers)
+        fill_detail_cover_id(envelope)
+        return JSONResponse(content=envelope, headers=headers)
     kugou_payload = await fetch_kugou_artist_detail(request.app, artist_guid)
     if isinstance(kugou_payload, dict):
         return JSONResponse(content=kugou_payload, status_code=200)
-    return await forward_to_upstream(request, get_upstream_client(request.app))
 
 
 @app.get("/music/api/v1/album/detail")
