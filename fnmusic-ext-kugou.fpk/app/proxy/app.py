@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import glob
 import hashlib
 import json
@@ -631,6 +632,26 @@ _STREAM_CACHE_MAX_BYTES = 320 * 1024 * 1024  # 320 MB,防止长时间试听占�
 
 # guid -> {"body": bytes, "ext": str, "ts": float}
 _STREAM_CACHE: dict[str, dict] = {}
+
+
+# meta 搜索（歌手/专辑/歌单）全量合并结果缓存：
+# {"meta:{tag}:{keyword}": {"ts": float, "payload": <合并后的完整 envelope>}}
+# payload 恒为未切片的全量；切片在 deepcopy 副本上进行。
+_META_CACHE: dict[str, dict] = {}
+_META_CACHE_MAX_ENTRIES = 100
+
+
+def _clean_meta_cache() -> None:
+    """写入时若 len(_META_CACHE) > 上限，按 ts 升序砍掉最旧一半。"""
+    if len(_META_CACHE) > _META_CACHE_MAX_ENTRIES:
+        sorted_keys = sorted(_META_CACHE.keys(), key=lambda k: _META_CACHE[k].get("ts", 0))
+        for k in sorted_keys[: len(sorted_keys) // 2]:
+            _META_CACHE.pop(k, None)
+
+
+def _set_meta_cache(key: str, payload: dict) -> None:
+    _clean_meta_cache()
+    _META_CACHE[key] = {"ts": time.time(), "payload": payload}
 
 
 def _clean_search_cache() -> None:
@@ -1928,29 +1949,6 @@ def build_online_track(item: dict) -> dict:
     }
 
 
-def artist_from_track(item: dict) -> str:
-    if not isinstance(item, dict):
-        return ""
-    a = item.get("artist") or item.get("singer") or item.get("singers") or ""
-    if isinstance(a, list):
-        names = []
-        for x in a:
-            if isinstance(x, dict):
-                names.append(str(x.get("name") or ""))
-            else:
-                names.append(str(x))
-        return " ".join(n for n in names if n).strip().lower()
-    if isinstance(a, dict):
-        return str(a.get("name") or "").strip().lower()
-    return str(a).strip().lower()
-
-
-def title_from_track(item: dict) -> str:
-    if not isinstance(item, dict):
-        return ""
-    return str(item.get("title") or item.get("name") or "").strip().lower()
-
-
 def should_cache(range_header: str | None) -> bool:
     """完整拉取才落盘：无 Range，或 bytes=0-（开区间）。Safari bytes=0-1 探测不落盘。"""
     if not range_header:
@@ -2664,40 +2662,30 @@ def merge_online_tracks(
         )
         return upstream_json
 
-    existing_keys = set()
-    for item in target_list:
-        t = title_from_track(item)
-        a = artist_from_track(item)
-        if t and a:
-            existing_keys.add((t, a))
-
-    filtered_online = []
+    # 官方在前、酷狗在后，原样全部追加，不做跨源去重（与 meta 侧口径一致）。
+    # 同名的官方曲目与酷狗曲目是不同的可播放对象，全部保留由用户自选。
+    added_online = 0
     for online_item in raw_items:
-        ot = str(online_item.get("title") or online_item.get("name") or "").strip().lower()
-        oa = str(online_item.get("artist") or "").strip().lower()
-        if ot and oa and (ot, oa) in existing_keys:
-            continue
-        filtered_online.append(online_item)
-
-
-    for it in filtered_online:
-        target_list.append(build_online_track(it))
+        if isinstance(online_item, dict):
+            target_list.append(build_online_track(online_item))
+            added_online += 1
 
     # total 恒等于实际返回条数，绝不使用两侧的「声明总数」。
     #
     # 旧逻辑 total = official_total + online_total 用的是两边的声明总数，与
-    # 列表实际条数无关：本兮 官方声明 22 + 酷狗声明 480 = 502，而列表实际
-    # 只有 316 项，客户端按 502 算出十页，翻到第三页就空——表现为「没有
-    # 返回所有结果」。酷狗的 total 又是结果上限值而非实际计数（周杰伦只有
-    # 99 首同样报 480），更不能拿它做 total。
-    online_total = len(filtered_online)
+    # 列表实际条数无关：早期版本 本兮 官方声明 22 + 酷狗声明 480 = 502，
+    # 而列表因去重只剩 316 项，客户端按 502 算出十页，翻到第三页就空
+    # ——表现为「没有返回所有结果」。去掉去重后 502 与实际条数一致，
+    # 但酷狗 total 仍是结果上限值而非实际计数（周杰伦只有 99 首同样报
+    # 480），所以 total 只能取合并后的真实条数。
+    online_total = added_online
 
     # PC 端按 page/size 切片；手机端不传 page/size 时 page=1/size=50 由路由
     # 层改写为全量（见 search_track），故此处切片是安全的。
     # 切片前记录 total 作为「全量条数」，切片后写回 parent，前端据此算页数。
     total = len(target_list)
     # 官方实际合并条数：在切片前就算好，切片后列表变短不能再用 len 倒推。
-    official_items = total - len(filtered_online)
+    official_items = total - added_online
     if size is not None and total > 0:
         # 整表换成「本页那一段」。必须用全量快照切片后再赋回：
         # target_list 是原列表的引用，就地删改会把 data.list 本身弄坏。
@@ -2712,7 +2700,7 @@ def merge_online_tracks(
         parent["total"] = total
     logger.warning(
         "[SEARCH_MERGE] official_items=%d official_declared=%d online_items=%d online_declared=%d total=%d page=%d size=%d returned=%d",
-        official_items, official_total, len(filtered_online),
+        official_items, official_total, added_online,
         _read_int((online_result or {}).get("total"), 0), total, page, size,
         len(target_list),
     )
@@ -2739,8 +2727,6 @@ def merge_search_meta(
     upstream_json: dict,
     kugou_payload: dict | None,
     tag: str = "meta",
-    page: int = 1,
-    size: int | None = 50,
 ) -> dict:
     """歌手 / 歌单 / 专辑搜索：官方（本地+飞牛线上）结果在前，酷狗结果在后。
 
@@ -2792,12 +2778,10 @@ def merge_search_meta(
     if not kugou_list:
         total = len(target_list)
         official_items = total
-        _slice_meta_list(target_list, total, page, size)
         _search_data_root(upstream_json)["total"] = total
         logger.warning(
-            "[SEARCH_%s] official_count=%d official_declared=%d kugou_items=0 kugou_declared=0 total=%d page=%d size=%s returned=%d",
-            tag.upper(), official_items, official_total, total, page, size,
-            len(target_list),
+            "[SEARCH_%s] official_count=%d official_declared=%d kugou_items=0 kugou_declared=0 total=%d",
+            tag.upper(), official_items, official_total, total,
         )
         return upstream_json
 
@@ -2816,15 +2800,26 @@ def merge_search_meta(
     # 酷狗的 total 是结果条数上限值（歌手/专辑 500、歌单 480）而非实际计数，
     # 相加会让前端按虚高页数翻页、翻到空页。
     total = len(target_list)
-    _slice_meta_list(target_list, total, page, size)
     _search_data_root(upstream_json)["total"] = total
 
     logger.warning(
-        "[SEARCH_%s] official_count=%d official_declared=%d kugou_items=%d kugou_declared=%d total=%d page=%d size=%s returned=%d",
-        tag.upper(), official_items, official_total, len(kugou_list), kugou_total,
-        total, page, size, len(target_list),
+        "[SEARCH_%s] official_count=%d official_declared=%d kugou_items=%d kugou_declared=%d total=%d",
+        tag.upper(), official_items, official_total, len(kugou_list), kugou_total, total,
     )
     return upstream_json
+
+
+def _apply_meta_page(envelope: dict, page: int, size: int | None) -> dict:
+    """把已合并的全量 envelope 就地切成目标页那一段，返回同一对象。
+
+    必须由调用方先 deepcopy 再传入：_slice_meta_list 是就地替换 list 内容，
+    直接切缓存里的对象会让第二次请求拿到已被切短的全量（第 2 页变成空表）。
+    size 为 None（手机端）时不切，返回合并全量。
+    """
+    target_list = ensure_search_list(envelope)
+    total = _read_int(_search_data_root(envelope).get("total"), len(target_list))
+    _slice_meta_list(target_list, total, page, size)
+    return envelope
 
 
 async def _upstream_search_envelope(
@@ -2901,6 +2896,23 @@ async def merged_search_meta(
     if size is not None and size < 1:
         size = None
 
+    # 缓存命中：直接对深拷贝切片返回，不再发任何上游 / 酷狗请求。
+    # 酷狗全量轮询要 10 次请求，每次翻页都重跑会让同一关键词的翻页代价
+    # 线性放大（线上实测翻 3 页触发 90 次酷狗请求）。
+    cache_key = f"meta:{tag}:{keyword}"
+    now = time.time()
+    entry = _META_CACHE.get(cache_key)
+    if entry is not None and now - entry.get("ts", 0) < CONF["search_cache_ttl"]:
+        # 先切片再打日志：切片前算 len 会把全量条数当返回条数，误导排查。
+        envelope = _apply_meta_page(copy.deepcopy(entry["payload"]), page, size)
+        logger.warning(
+            "[SEARCH_%s] cache hit keyword=%r total=%d page=%d size=%s returned=%d",
+            tag.upper(), keyword, _read_int(_search_data_root(envelope).get("total"), 0),
+            page, size, len(ensure_search_list(envelope)),
+        )
+        return JSONResponse(content=envelope)
+
+    # 未命中：酷狗全量轮询 + 官方全量，合并后缓存，再切片返回。
     # 酷狗 /search 不支持一次全量，按余数末页法轮询全部结果再合并。
     kugou_payload = await _fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag, cap=cap)
 
@@ -2911,7 +2923,15 @@ async def merged_search_meta(
             return JSONResponse(content=kugou_payload, status_code=200)
         return await forward_to_upstream(request, upstream_client)
 
-    return JSONResponse(content=merge_search_meta(upstream_json, kugou_payload, tag=tag, page=page, size=size))
+    envelope = merge_search_meta(upstream_json, kugou_payload, tag=tag)
+    _set_meta_cache(cache_key, envelope)
+    envelope = _apply_meta_page(copy.deepcopy(envelope), page, size)
+    logger.warning(
+        "[SEARCH_%s] cache miss keyword=%r total=%d page=%d size=%s returned=%d",
+        tag.upper(), keyword, _read_int(_search_data_root(envelope).get("total"), 0),
+        page, size, len(ensure_search_list(envelope)),
+    )
+    return JSONResponse(content=envelope)
 
 
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
