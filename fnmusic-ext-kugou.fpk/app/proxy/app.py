@@ -3182,28 +3182,35 @@ async def upload_cover_to_official(app_state, image_bytes: bytes, headers: dict)
 async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict, headers: dict) -> bool:
     """POST /music/api/v1/track/metadata 回写官方 coverId，用户无感。
 
-    仅提交上游已刮削的有值字段，再加 coverId/coverGUID。空数组与 None
-    一律不提交 —— metadata correction 端点会把空 artistGUIDs 解成
-    「清空歌手」，误传会把歌曲刮削结果弄坏。
+    官方接口要求**所有字段必带**，无值时按类型留空占位：
+      字符串 -> ""，数组 -> []，数字 -> null。
+    只有 title 完全为空才放弃回写（metadata 不全时官方无意义）。
+    历史上只提交有值字段的写法会触发 code=100001。
     """
     track = data.get("track") if isinstance(data, dict) else None
     track = track if isinstance(track, dict) else {}
-    payload: dict[str, Any] = {"guid": guid, "coverId": cover_id, "coverGUID": cover_id}
-    for key in ("title", "album"):
-        value = track.get(key) or data.get(key)
-        if str(value or "").strip():
-            payload[key] = value
-    for key in ("artistGUIDs", "genreGUIDs"):
-        value = track.get(key) if track.get(key) is not None else data.get(key)
-        if isinstance(value, list) and value:
-            payload[key] = value
-    for key in ("year", "discNo", "trackNo"):
-        value = track.get(key) if track.get(key) is not None else data.get(key)
-        if value is not None:
-            payload[key] = value
-    if not str(payload.get("title") or "").strip():
+
+    def _scalar(key: str):
+        v = track.get(key)
+        return data.get(key) if v is None else v
+
+    title = str(_scalar("title") or "").strip()
+    if not title:
         logger.warning("[COVERWRITE] skip-no-title guid=%s (metadata incomplete)", guid)
         return False
+
+    payload: dict[str, Any] = {
+        "guid": guid,
+        "coverId": cover_id,
+        "coverGUID": cover_id,
+        "title": title,
+        "album": str(_scalar("album") or ""),
+        "artistGUIDs": _scalar("artistGUIDs") if isinstance(_scalar("artistGUIDs"), list) else [],
+        "genreGUIDs": _scalar("genreGUIDs") if isinstance(_scalar("genreGUIDs"), list) else [],
+        "year": _scalar("year"),
+        "discNo": _scalar("discNo"),
+        "trackNo": _scalar("trackNo"),
+    }
     try:
         client = get_upstream_client(app_state)
         req = client.build_request(
