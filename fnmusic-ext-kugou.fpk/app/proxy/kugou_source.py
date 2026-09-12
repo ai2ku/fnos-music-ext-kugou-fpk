@@ -101,6 +101,20 @@ def _remember_song(item: dict) -> None:
         _search_index[sid] = dict(item)
 
 
+def get_search_index(song_id: str) -> dict | None:
+    """读内存索引里的单曲元数据（album/artist 等）；未命中返回 None。
+
+    本地曲目走封面回写时，若上游 track.album 为空则用此函数
+    拿酷狗侧已搜过的专辑名强制覆盖。未命中时调用方应走
+    /search 回源匹配。
+    """
+    if not song_id:
+        return None
+    sid = str(song_id).split(":", 1)[-1].strip()
+    cached = _search_index.get(sid)
+    return dict(cached) if cached else None
+
+
 
 
 # ============================================================

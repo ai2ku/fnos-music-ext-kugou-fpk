@@ -946,6 +946,48 @@ async def _kugou_candidates(keywords: str, limit: int = 30) -> list[dict]:
     return [x for x in items if isinstance(x, dict)]
 
 
+async def fetch_kugou_album_for_local_track(title: str, artist: str, duration: float) -> str:
+    """按本地曲目的 title/artist/duration 回源酷狗，拿匹配候选的专辑名。
+
+    封面回写专用：官方 /track/metadata 支持 album 字段更新，但上游
+    track.album 经常为空。用与歌词回落同一套评分逻辑（_kugou_candidates
+    + _kugou_item_matches_local），取命中候选的 album 字段强制覆盖。
+
+    命中候选且专辑名非空才返回；搜索空结果、候选均未匹配、匹配但
+    专辑名为空，都返回 ""，由调用方降级为 upstream track.album。
+    """
+    if not CONF.get("kugou_enabled", True):
+        return ""
+    keywords = " ".join(x for x in [title, artist] if x and str(x).strip()).strip()
+    if not keywords:
+        return ""
+    try:
+        items = await _kugou_candidates(keywords, limit=30)
+        if not items:
+            return ""
+        scored: list[tuple[tuple, dict]] = []
+        for idx, item in enumerate(items):
+            scored.append((_kugou_item_matches_local(item, title, artist, duration)[:3] + (-idx,), item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for _, item in scored:
+            matched = _kugou_item_matches_local(item, title, artist, duration)[3]
+            if not matched:
+                continue
+            album = str(item.get("album") or "").strip()
+            if album:
+                logger.warning(
+                    "[KUGOU_ALBUM_MATCH] keywords=%r -> album=%r cand=%r/%r dur_diff=%.3f",
+                    keywords, album, item.get("title"), item.get("artist"),
+                    _kugou_item_matches_local(item, title, artist, duration)[4],
+                )
+                return album
+        logger.warning("[KUGOU_ALBUM_MATCH] no match keywords=%r items=%d", keywords, len(items))
+        return ""
+    except Exception as e:
+        logger.warning("[KUGOU_ALBUM_MATCH] err keywords=%r err=%s:%s", keywords, type(e).__name__, e)
+        return ""
+
+
 async def fetch_local_lyric_by_keywords(title: str, artist: str, duration: float = 0.0) -> str:
     """仅用于飞牛本地歌：先搜酷狗候选，再按相关度和时长匹配取歌词。"""
     if not CONF.get("kugou_enabled", True):
@@ -3045,9 +3087,44 @@ async def _trigger_local_cover_upload(
             _track = {}
         if str(_track.get("coverId") or "").strip():
             return  # 已有封面，不动
-        # post_official_cover_id 内部读 data.get("track")，所以传 data 层而非外层
-        # {code, data:{track:{...}}}。传外层会取不到 track，回写必报 skip-no-title。
+        # 强制用酷狗专辑名覆盖 upstream track.album：官方 /track/metadata
+        # 支持 album 字段更新，但 upstream 对冷门歌曲经常刮不到，
+        # 直接提交 null 官方会忽略。用 title+artist+duration 匹配酷狗候选
+        # （与歌词回落同一套评分逻辑），命中后取其 album 字段覆盖。
+        # 酷狗匹配失败降级用 upstream 原值，不阻断上传。
         inner_data = _data if isinstance(_data, dict) else {}
+        try:
+            # _track 在 _data.track 不是 dict 时会被重绑为 {}，对 {} 赋值不会反映到
+            # inner_data 里。所以取专辑名时读 _track，写回时直接写 inner_data["track"]。
+            _t = str(_track.get("title") or "").strip()
+            _a = str(_track.get("artist") or "").strip()
+            if isinstance(_track.get("artist"), dict):
+                _a = _a or str(_track["artist"].get("name") or "").strip()
+            _d = 0.0
+            for _dk in ("duration", "durationMs", "duration_ms"):
+                if _track.get(_dk):
+                    try:
+                        _d = float(_track[_dk])
+                        if _d > 1000:  # ms 转 s
+                            _d /= 1000.0
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            _up_album = str(_track.get("album") or "").strip()
+            _kugou_album = await fetch_kugou_album_for_local_track(_t, _a, _d)
+            if _kugou_album:
+                logger.warning(
+                    "[COVERUPLOAD] album-override guid=%s upstream=%r kugou=%r title=%r artist=%r",
+                    guid, _up_album, _kugou_album, _t, _a
+                )
+                if not isinstance(inner_data.get("track"), dict):
+                    inner_data["track"] = dict(_track)
+                inner_data["track"]["album"] = _kugou_album
+        except Exception as _e:
+            logger.warning(
+                "[COVERUPLOAD] album-override err guid=%s err=%s:%s",
+                guid, type(_e).__name__, _e
+            )
         # 未直接给出图字节时，用调用方提供的 fetch 回源（例如按 cover_upload_size
         # 拉酷狗大图）。抓取失败不阻断：降级为空字节，upload 内部会直接返回空。
         if image_bytes is None and fetch is not None:
