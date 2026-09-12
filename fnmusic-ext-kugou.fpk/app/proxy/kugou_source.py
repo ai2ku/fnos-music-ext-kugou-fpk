@@ -16,7 +16,6 @@ import logging
 import json
 import re
 import time
-from datetime import datetime
 from typing import Any
 
 import httpx
@@ -102,8 +101,6 @@ def _remember_song(item: dict) -> None:
         _search_index[sid] = dict(item)
 
 
-def clear_index() -> None:
-    _search_index.clear()
 
 
 # ============================================================
@@ -150,41 +147,10 @@ def _singers_from_any(it: dict) -> list[dict]:
     return []
 
 
-def _album_info_from_any(it: dict) -> dict:
-    """统一专辑信息提取：优先 albuminfo，搜索格式使用 AlbumID/AlbumName。"""
-    if isinstance(it.get("albuminfo"), dict):
-        return it.get("albuminfo") or {}
-    album_name = ""
-    for key in ("AlbumID", "albumID", "albumId", "AlbumId", "album_id"):
-        album_id = str(it.get(key) or "").strip()
-        if album_id:
-            album_info = {"id": album_id}
-            if it.get("AlbumName") or it.get("albumName") or it.get("albumname"):
-                album_info["name"] = str(it.get("AlbumName") or it.get("albumName") or it.get("albumname")).strip()
-            return album_info
-    for key in ("AlbumName", "albumname", "albumName", "album_name", "album", "Album"):
-        value = it.get(key)
-        if isinstance(value, dict):
-            return value
-        if value not in (None, ""):
-            album_name = str(value).strip()
-            break
-    return {"name": album_name, "id": str(it.get("AlbumID") or it.get("albumID") or it.get("albumId") or "")} if (album_name or str(it.get("AlbumID") or it.get("albumID") or it.get("albumId") or "")) else {}
 
 
-def _duration_seconds_from_any(it: dict) -> float:
-    """统一时长：优先 timelen/timelength(ms)，搜索旧字段 duration/playTime 通常是秒。"""
-    if any(k in it for k in ("timelen", "timeLen", "TimeLen", "timelength", "timelength_ms", "timeLength", "TimeLength")):
-        return _timelen_to_seconds(it.get("timelen") or it.get("timeLen") or it.get("TimeLen") or it.get("timelength") or it.get("timelength_ms") or it.get("timeLength") or it.get("TimeLength"))
-    value = it.get("duration") or it.get("Duration") or it.get("playTime") or it.get("PlayTime") or 0
-    return _to_float(value)
 
 
-def _song_name_from_any(it: dict, album_name: str) -> str:
-    """统一歌名：先按酷狗“歌手 - 歌名”去掉歌手前缀。"""
-    raw_name = it.get("name") or it.get("SongName") or it.get("songname") or it.get("songName") or it.get("FileName") or it.get("fileName") or it.get("OriSongName") or it.get("title") or it.get("song") or ""
-    singer_names = [str(x.get("name") or "").strip() for x in _singers_from_any(it) if isinstance(x, dict)]
-    return _strip_singer_prefix_from_name(str(raw_name), singer_names, album_name)
 
 
 def _format_from_any(it: dict) -> str:
@@ -232,11 +198,6 @@ def _pick_ci(it: dict, *keys: str, default: str = "") -> str:
     return default
 
 
-def _size_bitrate_from_any(it: dict) -> tuple[int, int]:
-    """统一大小/比特率：歌单 size/bitrate，搜索兼容 FileSize/Bitrate。"""
-    size = _to_int(it.get("size") or it.get("FileSize") or it.get("fileSize") or it.get("filesize") or it.get("fileSize") or 0)
-    bitrate = _to_int(it.get("bitrate") or it.get("Bitrate") or it.get("BitRate") or it.get("bitRate") or 0)
-    return size, bitrate
 
 
 def search_item_to_raw(it: dict) -> dict:
@@ -946,36 +907,8 @@ def _to_int(value: Any) -> int:
         return 0
 
 
-def track_item_hash(it: dict) -> str:
-    """从 KuGouMusicApi 歌曲对象中取 hash；兼容 hash/songhash/FileHash。"""
-    return str(
-        _field(
-            it,
-            (
-                "hash",
-                "songhash",
-                "songHash",
-                "filehash",
-                "fileHash",
-                "FileHash",
-                "Id",
-                "id",
-            ),
-            "",
-        )
-    ).strip()
 
 
-def _singer_name_from_singerinfo(singerinfo: Any) -> str:
-    """酷狗歌单 track/all 正确格式：singerinfo[].name 用 - 连接。"""
-    names: list[str] = []
-    if isinstance(singerinfo, list):
-        for item in singerinfo:
-            if isinstance(item, dict):
-                name = str(item.get("name") or "").strip()
-                if name:
-                    names.append(name)
-    return "、".join(names)
 
 
 def _album_info_id(albuminfo: Any) -> str:
