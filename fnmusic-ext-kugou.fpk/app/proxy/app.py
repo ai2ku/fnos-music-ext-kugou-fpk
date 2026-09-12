@@ -87,13 +87,14 @@ CONF = {
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "300")),
     # 歌手/专辑/歌单全量拉取（手机端不传 page/size 时触发）的分页参数
-    # 酷狗搜索有 480 条结果上限，且最后一页必须能整除：pagesize 不整除时
-    # 超出上限的页会返回 149 "Out Page Range"（如 pagesize=50 时第 10 页
-    # from=450,size=50 越界）。默认 30：480/30=16 页，可取满全部 480 条。
-    # 其他可整除值：24/40/48/60/80/96/120/160/240/480。
-    "meta_full_poll_page_size": int(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_SIZE", "30")),
-    "kugou_track_page_size": int(os.environ.get("FNMUSIC_KUGOU_TRACK_PAGE_SIZE", "30")),
-    "meta_full_poll_max_pages": int(os.environ.get("FNMUSIC_META_FULL_POLL_MAX_PAGES", "10")),
+    # 酷狗 /search 有结果条数上限（歌曲/歌单 480，专辑/歌手 500）且末页必须
+    # 满足 from + size <= 上限，否则返回 149 "Out Page Range"（HTTP 502，body
+    # 里 error_code=149 / from / size）。步长取 50 即可通吃两类：末页用剩余
+    # 条数当 size（余数末页法），页号按本页 size 重算，from + size 恰好等于
+    # 上限，不越界，故不需要挑 480 的因子。见 _kugou_page_params。
+    "kugou_search_limit": int(os.environ.get("FNMUSIC_KUGOU_SEARCH_LIMIT", "480")),
+    "kugou_meta_limit": int(os.environ.get("FNMUSIC_KUGOU_META_LIMIT", "500")),
+    "kugou_step": int(os.environ.get("FNMUSIC_KUGOU_STEP", "50")),
     "meta_full_poll_page_timeout": float(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_TIMEOUT", "8")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5")),
     "fav_dir": os.environ.get(
@@ -2606,11 +2607,60 @@ def _read_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _kugou_page_params(cap: int, step: int) -> list[tuple[int, int, int]]:
+    """生成酷狗分页序列，末页用「剩余条数」当 size，避免越界。
+
+    酷狗 /search 有结果条数上限 cap（歌曲/歌单 480，专辑/歌手 500），且末页
+    必须满足 from + size <= cap，否则返回 149 "Out Page Range"（HTTP 502，
+    body 里 error_code=149 / from / size）。
+
+    关键：酷狗的 from 是按**本次请求的 size** 算的，不是固定步长：
+        from = (page - 1) * size
+    所以末页的 size 变小了，页号也必须跟着重算：page = offset // size + 1，
+    否则 from 会偏到错误区间（例：cap=480 step=50 时末页若取 (10,30)，
+    from=(10-1)*30=270，实际取的是 270~300，不是想要的 450~480）。
+
+    步长 step 固定；前若干页各取 step 条，最后一页用 remainder = cap -
+    offset 当 size，页号取 offset // remainder + 1，使 from + size 恰好等于
+    cap，不越界。数据覆盖无缝：前段 0~offset，末页 offset~cap。
+
+    例：cap=480, step=50 -> (1,50)...(9,50) 后接 (16,30)：from=450, 450+30=480。
+        cap=500, step=50 -> 正好 (1,50)...(10,50)，450+50=500 同样不越界。
+        cap=99,  step=50 -> (1,50) 后接 (3,25)(6,12)(37,2)：remainder 不整除
+        offset 时逐步降级 size，保证 from 始终精确落在 offset，不丢不重。
+
+    返回 [(page, size, page_total), ...]，page_total = from + size。
+    """
+    step = max(1, int(step))
+    out: list[tuple[int, int, int]] = []
+    offset = 0
+    while offset < cap:
+        s = min(step, cap - offset)
+        if offset > 0:
+            # from = (page-1)*size，要精确落在 offset 必须 size 整除 offset；
+            # 否则页号算出来 from 会错位（如 offset=50 时 size=49 -> from=49）。
+            while offset % s != 0:
+                s -= 1
+        page = offset // s + 1
+        out.append((page, s, offset + s))
+        offset += s
+    return out
+
+
+def _kugou_item_key(item: dict) -> tuple[str, str]:
+    """酷狗 item 的跨页去重键：id/guid 为主，标题+歌手兜底。"""
+    raw_id = item.get("id") or item.get("guid") or ""
+    id_str = str(raw_id).strip()
+    title = str(item.get("title") or item.get("name") or "").strip().lower()
+    artist = str(item.get("artist") or item.get("singer") or "").strip().lower()
+    return (id_str, title, artist)
+
+
 def merge_online_tracks(
     upstream_json: dict,
     online_data: dict | list[dict] | None,
     page: int = 1,
-    size: int = 50,
+    size: int | None = 50,
 ) -> dict:
     target_list = ensure_search_list(upstream_json)
     for item in target_list:
@@ -2794,6 +2844,7 @@ async def merged_search_meta(
     request: Request,
     fetcher: Callable[..., Awaitable[dict | None]],
     tag: str,
+    cap: int = 500,
 ) -> Response:
     """歌手/歌单/专辑搜索的统一处理：官方在前，酷狗在后。
 
@@ -2833,8 +2884,8 @@ async def merged_search_meta(
             size = 50
         kugou_payload = await fetcher(request.app, keyword, page=page, size=size)
     else:
-        # 手机端：不传分页参数，酷狗轮询全部结果一次返回
-        kugou_payload = await _fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag)
+        # 手机端：不传分页参数，酷狗按余数末页法轮询全部结果一次返回
+        kugou_payload = await _fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag, cap=cap)
 
     upstream_json = await _upstream_search_envelope(request, upstream_client)
 
@@ -3518,13 +3569,14 @@ async def search_track(request: Request):
 
     size_str = request.query_params.get("size")
     try:
-        size = int(size_str) if size_str else 50
+        size = int(size_str) if size_str else None
     except (TypeError, ValueError):
+        size = None
+    # 没传 size = 手机端：返回合并全量，不切片（size=None）。
+    # 传了 size = PC 端：按客户端 size 切片（飞牛 PC 每页 50），由
+    # merge_online_tracks 按 page/size 切合并全量列表。
+    if size is not None and size < 1:
         size = 50
-    if size < 1:
-        size = 50
-    # size 仅作酷狗侧汇总上限（路由从不按 page 切片，客户端 size 不影响返回长度）。
-    size = 500
 
     url_path = request.url.path
     params = dict(request.query_params)
@@ -3576,12 +3628,11 @@ async def search_track(request: Request):
     entry = cached_entry
     entry.setdefault("online", {})
 
-    async def _get_online_result(kugou_page: int) -> dict | None:
-        page_size = int(CONF.get("kugou_track_page_size") or 30)
-        cache = entry.setdefault("online", {})
+    async def _get_online_result(kugou_page: int, page_size: int) -> dict | None:
         # 缓存键必须带页大小：同一页号在不同 pagesize 下内容不同，
-        # 只按页号存会在 FNMUSIC_KUGOU_TRACK_PAGE_SIZE 改动后串数据。
+        # 只按页号存会在步长调整后串数据。
         key = (kugou_page, page_size)
+        cache = entry.setdefault("online", {})
         cached = cache.get(key)
         if isinstance(cached, dict):
             return cached
@@ -3603,87 +3654,80 @@ async def search_track(request: Request):
         return result
 
     async def _fetch_online_pages() -> dict | None:
-        """酷狗不支持一次全量拉取：按页循环取到上限，直到末页、空页或安全上限。
+        """歌曲搜索：余数末页法轮询酷狗，取满上限后交给上层按 page/size 切片。
 
-        酷狗搜索有 480 条结果上限，且末页必须能整除：pagesize 不整除时超出
-        上限的页返回 149 "Out Page Range"（HTTP 502，body 里带 error_code=149 /
-        from / size）。实测 pagesize=50 时第 10 页 from=450,size=50 越界被拒，
-        只能拿到前 9 页；改 30 后 480/30=16 页可取满。默认 30，也可用
-        FNMUSIC_KUGOU_TRACK_PAGE_SIZE 覆盖，必须是 480 的因子
-        （24/40/48/60/80/96/120/160/240/480）。
+        酷狗 /search 有结果条数上限（歌曲/歌单 480）且末页必须满足
+        from + size <= 上限，否则返回 149 "Out Page Range"（HTTP 502）。
+        步长固定 50，最后一页用剩余条数当 size 并把页号对齐到
+        offset // step + 1，使 from + size 恰好等于上限，不越界。
+        例：上限 480 -> (1,50)...(9,50) 后接 (16,30)，from=450, 450+30=480。
 
-        酷狗侧恒按全量轮询取到上限，PC 端的 page/size 切片在上层做
-        （手机端不传 page/size 时拿全量）。
-
-        终止判据用「本页不足页大小」（末页）+「累计达到 total」（取满上限）
-        +「整页零新增」（重复到底）；不用「本页去重后条数」判断末页，
-        因为酷狗跨页重复会让某页去重后不足页大小，从而被误判为末页提前收工。
+        终止判据用「本轮是否新增」而不是「本页条数」：酷狗跨页重复会让某页
+        去重后不足页大小，按条数判末页会提前收工。total 是上限值而非实际
+        计数（周杰伦只有 99 首同样报 480），也不能拿来判断取满。
         """
+        step = max(1, int(CONF.get("kugou_step") or 50))
+        cap = int(CONF.get("kugou_search_limit") or 480)
+        deadline = time.time() + 25.0
+        items: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        declared_total = 0
         cache = entry.setdefault("online", {})
-        page_size = int(CONF.get("kugou_track_page_size") or 30)
-        online_items: list[dict] = []
-        seen: set[tuple[str, ...]] = set()
-        total = 0
+        params = _kugou_page_params(cap, step)
         pages_fetched = 0
-        # 三重保护：页数上限 + 条数上限 + 整体时间预算。
-        # 页数上限按 480/pagesize 的理论页数加 4 页余量（跨页重复会让实际
-        # 页数超过理论值）；条数上限 5000 兜住极端关键词；整体预算 25 秒。
-        max_items = 5000
-        max_pages = max(20, 480 // page_size + 4)
-        deadline = time.time() + 25.0  # 单页 8 秒超时，整体预算更宽
-        for kugou_page in range(1, max_pages + 1):
-            pages_fetched = kugou_page
-            page_data = cache.get(kugou_page)
-            if not isinstance(page_data, dict):
-                page_data = await _get_online_result(kugou_page)
-                if not isinstance(page_data, dict):
-                    logger.warning("[SEARCH_KUGOU_PAGE_FAIL] keyword=%r kugou_page=%d", keyword, kugou_page)
+
+        for p, step_size, step_total in params:
+            pages_fetched = p
+            cached = cache.get((p, step_size))
+            if not isinstance(cached, dict):
+                cached = await _get_online_result(p, step_size)
+                if not isinstance(cached, dict):
+                    logger.warning("[SEARCH_KUGOU_PAGE_FAIL] keyword=%r kugou_page=%d size=%d", keyword, p, step_size)
                     break
-            raw_items = page_data.get("items", [])
-            if not isinstance(raw_items, list):
-                raw_items = []
+            page_items = cached.get("items", [])
+            if not isinstance(page_items, list):
+                page_items = []
             added = 0
-            for item in raw_items:
-                t = str(item.get("title") or item.get("name") or "").strip().lower()
-                a = str(item.get("artist") or "").strip().lower()
-                key = (t, a) if t and a else (str(item.get("id") or ""), t, a)
+            for item in page_items:
+                if not isinstance(item, dict):
+                    continue
+                key = _kugou_item_key(item)
                 if key in seen:
                     continue
                 seen.add(key)
-                online_items.append(item)
+                items.append(item)
                 added += 1
-            total = _read_int(page_data.get("total"), total)
-            logger.warning("[SEARCH_KUGOU_PAGE_FETCH] keyword=%r kugou_page=%d page_items=%d added=%d merged_items=%d online_total=%d",
-                           keyword, kugou_page, len(raw_items), added, len(online_items), total)
-            # 已取到酷狗声明的 total（480 是上限值，达到即到底）
-            if total and len(online_items) >= total:
+            declared = _read_int(cached.get("total"), 0)
+            if declared > declared_total:
+                declared_total = declared
+            logger.warning(
+                "[SEARCH_KUGOU_PAGE_FETCH] keyword=%r kugou_page=%d size=%d page_items=%d added=%d merged_items=%d cap=%d declared=%d",
+                keyword, p, step_size, len(page_items), added, len(items), cap, declared,
+            )
+            if len(items) >= cap:
+                break
+            if p > 1 and added == 0:
+                break
+            if len(items) >= 5000:
                 break
             if time.time() >= deadline:
                 break
-            if len(online_items) >= max_items:
-                online_items = online_items[:max_items]
-                break
-            # 末页：本页不足页大小（整除时末页恰好满页，靠空页收口）
-            if len(raw_items) < page_size:
-                break
-            # 整页重复：酷狗开始循环返回相同结果，视为已到底
-            if kugou_page > 1 and added == 0:
-                break
 
+        # 取满上限即 complete。total 保留酷狗声明值仅供日志与前端「结果上限」
+        # 提示；实际返回条数由上层 merge_online_tracks 计算并写回 parent。
         result = {
-            "items": deduplicate_online_items(online_items),
-            "total": total or len(online_items),
+            "items": deduplicate_online_items(items),
+            "total": declared_total if declared_total > 0 else len(items),
             "page": pages_fetched,
-            "pagesize": page_size,
+            "pagesize": step,
             "pages": pages_fetched,
             "fetched_pages": pages_fetched,
-            "fetched_items": len(online_items),
-            "complete": bool(total and len(online_items) >= total),
+            "fetched_items": len(items),
+            "complete": len(items) >= cap,
         }
         cache["__all__"] = result
-        logger.warning("[SEARCH_KUGOU_ALL] keyword=%r pages=%d items=%d kugou_total=%d complete=%s",
-                       keyword, pages_fetched, len(result.get("items", [])),
-                       result.get("total"), result["complete"])
+        logger.warning("[SEARCH_KUGOU_ALL] keyword=%r items=%d cap=%d complete=%s",
+                       keyword, len(result.get("items", [])), cap, result["complete"])
         return result
 
     online_all: dict | None = None
@@ -3745,33 +3789,37 @@ async def _fetch_kugou_all_pages(
     app_state,
     keyword: str,
     tag: str = "meta",
+    cap: int = 500,
 ) -> dict:
-    """酷狗按页轮询，汇总全部搜索结果，返回单条 data。
+    """歌手/专辑/歌单：余数末页法轮询酷狗，汇总全部结果。
 
-    酷狗 /search 不支持一次全量，每页最多数十条。这里按
-    meta_full_poll_page_size（默认 50）循环翻页，终止条件：
-    - 累计已达酷狗 total
-    - 返回空页
-    - 返回条数小于页大小（已到末页）
-    - 达到安全上限（默认 10 页，避免死循环）
-    任一单页失败即停止汇总，返回已拿到的部分，不吞异常。
+    歌手/专辑搜索上限 500，步长 50 正好整除，末页 (10,50) 时
+    from=450, 450+50=500 同样不越界。歌单走同一上限（480）时末页
+    自动降级为 (16,30)，from=450, 450+30=480。
+
+    终止判据用「本轮是否新增」：酷狗跨页重复会让某页去重后不足页大小，
+    按条数判末页会提前收工。total 是上限值而非实际计数，不能拿来判断取满。
     """
-    page_size = max(1, int(CONF.get("meta_full_poll_page_size") or 50))
-    max_pages = max(1, int(CONF.get("meta_full_poll_max_pages") or 10))
+    step = max(1, int(CONF.get("kugou_step") or 50))
+    # cap 由调用方指定（专辑/歌手 500，歌单 480）；未传时回落到配置默认值。
+    cap = int(cap or CONF.get("kugou_meta_limit") or 500)
     per_page_timeout = float(CONF.get("meta_full_poll_page_timeout") or 8)
 
     all_items: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    total = 0
+    seen: set[tuple[str, str, str]] = set()
+    declared_total = 0
+    pages_fetched = 0
 
-    for p in range(1, max_pages + 1):
+    for p, step_size, _step_total in _kugou_page_params(cap, step):
+        pages_fetched = p
         try:
             res = await asyncio.wait_for(
-                fetcher(app_state, keyword, page=p, size=page_size),
+                fetcher(app_state, keyword, page=p, size=step_size),
                 timeout=per_page_timeout,
             )
         except Exception as exc:
-            logger.warning("[SEARCH_%s] full poll page=%d failed: %s", tag.upper(), p, exc)
+            logger.warning("[SEARCH_%s] full poll page=%d size=%d failed: %s",
+                           tag.upper(), p, step_size, exc)
             break
 
         if not isinstance(res, dict):
@@ -3782,18 +3830,15 @@ async def _fetch_kugou_all_pages(
         items = data.get("list") or []
         if not isinstance(items, list):
             items = []
-        t = _read_int(data.get("total"), total)
-        if t > total:
-            total = t
-
-        if not items:
-            break
+        declared = _read_int(data.get("total"), 0)
+        if declared > declared_total:
+            declared_total = declared
 
         added = 0
         for it in items:
             if not isinstance(it, dict):
                 continue
-            key = (str(it.get("guid") or "").strip(), str(it.get("name") or "").strip())
+            key = _kugou_item_key(it)
             if key in seen:
                 continue
             seen.add(key)
@@ -3801,26 +3846,30 @@ async def _fetch_kugou_all_pages(
             added += 1
 
         logger.warning(
-            "[SEARCH_%s] full poll page=%d got=%d added=%d total=%d",
-            tag.upper(), p, len(items), added, total,
+            "[SEARCH_%s] full poll page=%d size=%d got=%d added=%d items=%d cap=%d declared=%d",
+            tag.upper(), p, step_size, len(items), added, len(all_items), cap, declared,
         )
-        if total and len(all_items) >= total:
+        if len(all_items) >= cap:
             break
-        if len(items) < page_size:
+        if p > 1 and added == 0:
             break
-        if added == 0:
+        if len(all_items) >= 5000:
+            break
+        if not items:
             break
 
     logger.warning(
-        "[SEARCH_%s] full poll done pages=%d items=%d total=%d",
-        tag.upper(), len(seen), len(all_items), total,
+        "[SEARCH_%s] full poll done pages=%d items=%d cap=%d declared=%d",
+        tag.upper(), pages_fetched, len(all_items), cap, declared_total,
     )
     return {
         "code": 0,
         "msg": "",
         "data": {
             "list": all_items,
-            "total": total if total > 0 else len(all_items),
+            "total": len(all_items),
+            "pages": pages_fetched,
+            "pagesize": step,
         },
     }
 
