@@ -87,7 +87,12 @@ CONF = {
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "300")),
     # 歌手/专辑/歌单全量拉取（手机端不传 page/size 时触发）的分页参数
-    "meta_full_poll_page_size": int(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_SIZE", "50")),
+    # 酷狗搜索有 480 条结果上限，且最后一页必须能整除：pagesize 不整除时
+    # 超出上限的页会返回 149 "Out Page Range"（如 pagesize=50 时第 10 页
+    # from=450,size=50 越界）。默认 30：480/30=16 页，可取满全部 480 条。
+    # 其他可整除值：24/40/48/60/80/96/120/160/240/480。
+    "meta_full_poll_page_size": int(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_SIZE", "30")),
+    "kugou_track_page_size": int(os.environ.get("FNMUSIC_KUGOU_TRACK_PAGE_SIZE", "30")),
     "meta_full_poll_max_pages": int(os.environ.get("FNMUSIC_META_FULL_POLL_MAX_PAGES", "10")),
     "meta_full_poll_page_timeout": float(os.environ.get("FNMUSIC_META_FULL_POLL_PAGE_TIMEOUT", "8")),
     "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5")),
@@ -2651,22 +2656,29 @@ def merge_online_tracks(
     for it in filtered_online:
         target_list.append(build_online_track(it))
 
-    # total 恒等于实际返回条数。
+    # total 恒等于实际返回条数，绝不使用两侧的「声明总数」。
     #
-    # 路由从不按 page/size 切片（page 参数既不传给酷狗也不传给上游），
-    # 所以无论客户端是分页请求还是不分页请求，拿到的都是同一份合并全量列表。
-    # 旧逻辑 total = official_total + online_total 用的是两边的「声明总数」，
-    # 与列表实际条数无关：本兮 官方声明 22 + 酷狗声明 480 = 502，而列表实际
-    # 只有 316 项。客户端按 502 算出十页，翻到第三页就空——表现为「没有返回
-    # 所有结果」。
+    # 旧逻辑 total = official_total + online_total 用的是两边的声明总数，与
+    # 列表实际条数无关：本兮 官方声明 22 + 酷狗声明 480 = 502，而列表实际
+    # 只有 316 项，客户端按 502 算出十页，翻到第三页就空——表现为「没有
+    # 返回所有结果」。酷狗的 total 又是结果上限值而非实际计数（周杰伦只有
+    # 99 首同样报 480），更不能拿它做 total。
     online_total = len(filtered_online)
+
+    # PC 端按 page/size 切片；手机端不传 page/size 时 page=1/size=50 由路由
+    # 层改写为全量（见 search_track），故此处切片是安全的。
+    # 切片前记录 total 作为「全量条数」，切片后写回 parent，前端据此算页数。
     total = len(target_list)
-    if total > 0:
+    if size and total > 0:
+        target_list[size * (page - 1):] = []
+        parent["total"] = total
+    elif total > 0:
         parent["total"] = total
     logger.warning(
-        "[SEARCH_MERGE] official_items=%d official_declared=%d online_items=%d online_declared=%d total=%d page=%d size=%d",
+        "[SEARCH_MERGE] official_items=%d official_declared=%d online_items=%d online_declared=%d total=%d page=%d size=%d returned=%d",
         len(target_list) - len(filtered_online), official_total, len(filtered_online),
         _read_int((online_result or {}).get("total"), 0), total, page, size,
+        len(target_list),
     )
 
     return upstream_json
@@ -3565,9 +3577,12 @@ async def search_track(request: Request):
     entry.setdefault("online", {})
 
     async def _get_online_result(kugou_page: int) -> dict | None:
-        page_size = 50
+        page_size = int(CONF.get("kugou_track_page_size") or 30)
         cache = entry.setdefault("online", {})
-        cached = cache.get(kugou_page)
+        # 缓存键必须带页大小：同一页号在不同 pagesize 下内容不同，
+        # 只按页号存会在 FNMUSIC_KUGOU_TRACK_PAGE_SIZE 改动后串数据。
+        key = (kugou_page, page_size)
+        cached = cache.get(key)
         if isinstance(cached, dict):
             return cached
         try:
@@ -3582,33 +3597,39 @@ async def search_track(request: Request):
         result = {
             **kugou_res,
             "items": deduplicate_online_items(kugou_res.get("items", [])),
+            "pagesize": page_size,
         }
-        cache[kugou_page] = result
+        cache[key] = result
         return result
 
     async def _fetch_online_pages() -> dict | None:
-        """酷狗不支持一次全量拉取：按 50 条/页循环，直到达到 total、空页或安全上限。
+        """酷狗不支持一次全量拉取：按页循环取到上限，直到末页、空页或安全上限。
 
-        路由从不按 page/size 切片（客户端的 page 既不传给酷狗也不传给上游），
-        无论手机端还是 PC 端，拿到的都是同一份合并后的全量列表。因此这里恒按
-        全量轮询，不再区分分页/全量两种模式。
+        酷狗搜索有 480 条结果上限，且末页必须能整除：pagesize 不整除时超出
+        上限的页返回 149 "Out Page Range"（HTTP 502，body 里带 error_code=149 /
+        from / size）。实测 pagesize=50 时第 10 页 from=450,size=50 越界被拒，
+        只能拿到前 9 页；改 30 后 480/30=16 页可取满。默认 30，也可用
+        FNMUSIC_KUGOU_TRACK_PAGE_SIZE 覆盖，必须是 480 的因子
+        （24/40/48/60/80/96/120/160/240/480）。
 
-        终止判据必须用「本轮是否新增」而不是「本页条数是否小于页大小」：
-        缓存里的 items 已经过 deduplicate_online_items，酷狗跨页重复（同一首歌
-        出现在多个结果页）会让某页去重后不足 50，从而被误判为末页提前收工。
-        正确做法是累计新增为 0 时才停，对齐 _fetch_kugou_all_pages 的 added 判据。
+        酷狗侧恒按全量轮询取到上限，PC 端的 page/size 切片在上层做
+        （手机端不传 page/size 时拿全量）。
+
+        终止判据用「本页不足页大小」（末页）+「累计达到 total」（取满上限）
+        +「整页零新增」（重复到底）；不用「本页去重后条数」判断末页，
+        因为酷狗跨页重复会让某页去重后不足页大小，从而被误判为末页提前收工。
         """
         cache = entry.setdefault("online", {})
-        page_size = 50
+        page_size = int(CONF.get("kugou_track_page_size") or 30)
         online_items: list[dict] = []
         seen: set[tuple[str, ...]] = set()
         total = 0
         pages_fetched = 0
         # 三重保护：页数上限 + 条数上限 + 整体时间预算。
-        # 跨页重复会让实际页数多于理论页数（480 首按 50/页理论 10 页，实测要
-        # 翻 10 页以上），故页数上限放宽到 40；条数上限 5000 条兜住极端关键词。
+        # 页数上限按 480/pagesize 的理论页数加 4 页余量（跨页重复会让实际
+        # 页数超过理论值）；条数上限 5000 兜住极端关键词；整体预算 25 秒。
         max_items = 5000
-        max_pages = 40
+        max_pages = max(20, 480 // page_size + 4)
         deadline = time.time() + 25.0  # 单页 8 秒超时，整体预算更宽
         for kugou_page in range(1, max_pages + 1):
             pages_fetched = kugou_page
@@ -3634,6 +3655,7 @@ async def search_track(request: Request):
             total = _read_int(page_data.get("total"), total)
             logger.warning("[SEARCH_KUGOU_PAGE_FETCH] keyword=%r kugou_page=%d page_items=%d added=%d merged_items=%d online_total=%d",
                            keyword, kugou_page, len(raw_items), added, len(online_items), total)
+            # 已取到酷狗声明的 total（480 是上限值，达到即到底）
             if total and len(online_items) >= total:
                 break
             if time.time() >= deadline:
@@ -3641,11 +3663,11 @@ async def search_track(request: Request):
             if len(online_items) >= max_items:
                 online_items = online_items[:max_items]
                 break
-            # 空页：酷狗已到末尾
-            if kugou_page > 1 and not raw_items:
+            # 末页：本页不足页大小（整除时末页恰好满页，靠空页收口）
+            if len(raw_items) < page_size:
                 break
-            # 本页没有任何新增（酷狗开始循环重复）
-            if added == 0:
+            # 整页重复：酷狗开始循环返回相同结果，视为已到底
+            if kugou_page > 1 and added == 0:
                 break
 
         result = {
