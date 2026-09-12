@@ -3438,6 +3438,12 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
 
 _COVER_DISK_TTL = 24 * 3600
 _COVER_DISK_MAX_FILES = 500
+# 防驱逐：淘汰时优先删小于该字节的缓存，保护大图不被小缩略图挤掉。
+# 实测同一首歌不同尺寸请求并存（120/160/400/800px），缓存内容 2.3KB~738KB，
+# 纯 LRU 会让 2KB 缩略图把 800px 大图挤掉，下次回源成本远高于重取缩略图。
+_COVER_DISK_PROTECT_BYTES = int(
+    os.environ.get("FNMUSIC_COVER_PROTECT_BYTES", str(20 * 1024))
+)
 
 
 def _cover_disk_dir() -> str:
@@ -3496,21 +3502,40 @@ def _cover_disk_put(url: str, body: bytes) -> None:
 
 
 def _cover_disk_cleanup() -> None:
-    """超限时按 mtime 清旧，避免缓存无限增长。"""
+    """超限时按 mtime 清旧，避免缓存无限增长。
+
+    防驱逐：候选集中先删小于 _COVER_DISK_PROTECT_BYTES 的，全删光后才会动大图。
+    同一首歌 120/160/400/800px 多尺寸请求并存，内容跨度 2KB~738KB；纯 LRU
+    会让 2KB 缩略图把 800px 大图挤掉，下次回源成本远高于重取缩略图。
+    注意不同尺寸的 URL 在 CDN 上是不同分辨率文件，不能共用字节（缓存 240 回给
+    700 的请求会分辨率错乱），所以只能做淘汰策略优化，不能合并缓存。
+    """
     try:
-        files = [
-            (os.stat(p).st_mtime, p)
-            for p in (
-                os.path.join(_cover_disk_dir(), n)
-                for n in os.listdir(_cover_disk_dir())
-                if n.endswith(".cover")
-            )
-        ]
-        if len(files) <= _COVER_DISK_MAX_FILES:
+        entries = []
+        for n in os.listdir(_cover_disk_dir()):
+            if not n.endswith(".cover"):
+                continue
+            p = os.path.join(_cover_disk_dir(), n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+        if len(entries) <= _COVER_DISK_MAX_FILES:
             return
-        for _, p in sorted(files)[: len(files) - _COVER_DISK_MAX_FILES]:
+        to_remove = len(entries) - _COVER_DISK_MAX_FILES
+        # 小图按时间旧优先；大图同样按时间旧，但排在后面。
+        small = [e for e in entries if e[1] < _COVER_DISK_PROTECT_BYTES]
+        large = [e for e in entries if e[1] >= _COVER_DISK_PROTECT_BYTES]
+        small.sort(key=lambda e: e[0])
+        large.sort(key=lambda e: e[0])
+        removed = 0
+        for _mt, _sz, p in small + large:
+            if removed >= to_remove:
+                break
             try:
                 os.unlink(p)
+                removed += 1
             except OSError:
                 pass
     except Exception as e:
