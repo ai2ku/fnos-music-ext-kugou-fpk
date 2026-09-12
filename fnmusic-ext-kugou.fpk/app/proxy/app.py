@@ -32,7 +32,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 
 logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -123,14 +123,6 @@ def kugou_playlist_id_from_guid(guid: str) -> str:
     return rest.split(":", 1)[0]
 
 
-def _kugou_playlist_name_from_guid(guid: str) -> str:
-    s = str(guid or "")
-    if not s.startswith(_KUGOU_PLAYLIST_PREFIX):
-        return ""
-    rest = s[len(_KUGOU_PLAYLIST_PREFIX):]
-    if ":" not in rest:
-        return ""
-    return rest.split(":", 1)[1]
 
 
 def _kugou_playlist_field(it: dict, keys: tuple[str, ...], default: Any = "") -> Any:
@@ -158,62 +150,6 @@ def build_kugou_playlist_obj(it: dict) -> dict:
     }
 
 
-def stamp_kugou_playlist_tracks(items: list[dict], now: float | None = None) -> list[dict]:
-    ts = int(now or time.time())
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        # /playlist/track/all 的真实字段：FileName/SingerName/AlbumName/Duration/Image...
-        raw = kugou_source.track_item_to_raw(it)
-        title = str(raw.get("title") or "").strip()
-        artist = str(raw.get("artist") or "").strip()
-        album = str(raw.get("album") or "").strip()
-        dur = raw.get("duration_s") or 0
-        try:
-            dur_s = float(dur or 0)
-        except (TypeError, ValueError):
-            dur_s = 0.0
-        ext = str(raw.get("ext") or "mp3").strip().lower() or "mp3"
-        hashv = str(raw.get("hash") or "").strip()
-        guid = online_guid_from_item({"id": f"kugou:{hashv}", "source": "kugou"}) if hashv else ""
-        cover = str(raw.get("cover_url") or "").strip()
-        # 酷狗 URL 常见格式：.../Image/{size}x{size}/xxx.jpg；若缺少 size 则按前端尺寸补成 240x240
-        if cover and "{size}" in cover:
-            cover = cover.replace("{size}", "240")
-        item = {
-            "guid": guid,
-            "id": guid,
-            "title": title,
-            "name": title,
-            "artist": artist,
-            "artists": [{"name": artist, "guid": f"{guid}:artist"}] if artist else [],
-            "album": {
-                "name": album,
-                "guid": f"{guid}:album",
-                "coverId": guid,
-                "artists": [{"name": artist, "guid": f"{guid}:artist"}] if artist else [],
-            },
-            "duration": int(dur_s * 1000),
-            "duration_ms": int(dur_s * 1000),
-            "durationMs": int(dur_s * 1000),
-            "duration_s": dur_s,
-            "ext": ext,
-            "format": ext,
-            "coverId": guid,
-            "coverUrl": cover,
-            "cover_url": cover,
-            "union_cover": cover,
-            "source": "kugou",
-            "is_online": bool(guid),
-            "createdAt": ts,
-            "updatedAt": ts,
-            "isFavorite": False,
-            "isCue": False,
-            "accessStatus": 0,
-        }
-        out.append(item)
-    return out
 
 
 async def fetch_kugou_user_playlist_bundles() -> list[dict]:
@@ -1494,10 +1430,6 @@ _LOCAL_ALBUM_COVER_PREFIX = "album:"
 _LOCAL_ENTITY_COVER_PREFIXES = (_LOCAL_ARTIST_COVER_PREFIX, _LOCAL_ALBUM_COVER_PREFIX)
 
 
-def is_local_entity_cover_id(cover_id: str | None) -> bool:
-    """coverId 是否为本地实体（歌手/专辑）封面。"""
-    raw = str(cover_id or "")
-    return any(raw.startswith(p) for p in _LOCAL_ENTITY_COVER_PREFIXES)
 
 
 def is_local_artist_cover_id(cover_id: str | None) -> bool:
@@ -2199,31 +2131,6 @@ def unique_library_path(directory: str, basename: str, ext: str) -> str:
     return os.path.join(directory, f"{basename} ({n}).{ext}")
 
 
-def write_audio_tags(path: str, title: str, artist: str = "", album: str = "") -> None:
-    """写入 title/artist/album，飞牛扫描后用标签而不是文件名显示。"""
-    title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
-    if not title and not artist:
-        return
-    try:
-        from mutagen import File as MutagenFile
-
-        audio = MutagenFile(path, easy=True)
-        if audio is None:
-            return
-        if getattr(audio, "tags", None) is None:
-            try:
-                audio.add_tags()
-            except Exception:
-                pass
-        if title:
-            audio["title"] = title
-        if artist:
-            audio["artist"] = artist
-        if album:
-            audio["album"] = album
-        audio.save()
-    except Exception as e:
-        logger.warning("Failed to write audio tags for %s: %s", path, e)
 
 
 def detect_library_dir() -> str:
@@ -2286,94 +2193,12 @@ def find_cache_file(guid: str) -> str | None:
     return None
 
 
-def promote_cache_hit(guid: str, audio_path: str) -> str:
-    """旧 cache/ 音频：若曲库已有对应文件或歌词，则对齐过去。"""
-    recalled = recalled_media_path(guid)
-    if recalled:
-        return recalled
-    lib = detect_library_dir()
-    try:
-        if os.path.abspath(os.path.dirname(audio_path)) == os.path.abspath(lib):
-            remember_media_path(guid, audio_path)
-            return audio_path
-    except Exception:
-        return audio_path
-    file_id = online_file_id(guid)
-    ext = os.path.splitext(audio_path)[1] or ".mp3"
-    dest = None
-    if os.path.isdir(lib):
-        for lrc in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.lrc")):
-            dest = os.path.splitext(lrc)[0] + ext
-            break
-    if not dest:
-        return audio_path
-    if not os.path.exists(dest):
-        try:
-            os.makedirs(lib, exist_ok=True)
-            shutil.copy2(audio_path, dest)
-            adopt_library_perms(dest)
-        except Exception as e:
-            logger.warning("Failed to promote cache audio into library: %s", e)
-            return audio_path
-    remember_media_path(guid, dest)
-    return dest
 
 
-def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str:
-    recalled = recalled_media_path(guid)
-    if recalled:
-        return recalled
-    stem = recalled_media_stem(guid)
-    if stem:
-        return f"{stem}.{ext}"
-    lib = detect_library_dir()
-    file_id = online_file_id(guid)
-    if os.path.isdir(lib):
-        for path in glob.glob(os.path.join(lib, f"* - {glob.escape(file_id)}.{ext}")):
-            if os.path.getsize(path) > 0:
-                return path
-    os.makedirs(lib, exist_ok=True)
-    return unique_library_path(lib, library_basename(title, artist), ext)
 
 
-def find_lyric_file(guid: str) -> str | None:
-    stem = recalled_media_stem(guid)
-    if stem:
-        sibling = f"{stem}.lrc"
-        if os.path.exists(sibling) and os.path.getsize(sibling) > 0:
-            return sibling
-    audio = find_cache_file(guid)
-    if audio:
-        sibling = os.path.splitext(audio)[0] + ".lrc"
-        if os.path.exists(sibling) and os.path.getsize(sibling) > 0:
-            return sibling
-    file_id = online_file_id(guid)
-    safe = cache_safe_guid(guid)
-    for d in iter_media_dirs():
-        if not os.path.isdir(d):
-            continue
-        exact = os.path.join(d, f"{safe}.lrc")
-        if os.path.exists(exact) and os.path.getsize(exact) > 0:
-            return exact
-        pattern = os.path.join(d, f"* - {glob.escape(file_id)}.lrc")
-        for path in glob.glob(pattern):
-            if os.path.getsize(path) > 0:
-                return path
-    return None
 
 
-def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
-    found = find_lyric_file(guid)
-    if found:
-        return found
-    audio = find_cache_file(guid)
-    if audio:
-        return os.path.splitext(audio)[0] + ".lrc"
-    d = detect_library_dir()
-    os.makedirs(d, exist_ok=True)
-    if (title or "").strip() or (artist or "").strip():
-        return os.path.join(d, f"{library_basename(title, artist)}.lrc")
-    return os.path.join(d, f"{cache_safe_guid(guid)}.lrc")
 
 
 def read_lyric_cache(guid: str) -> str:
@@ -2483,47 +2308,6 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
     return start, end
 
 
-def serve_file_with_range(path: str, range_header: str | None, media_type: str) -> Response:
-    file_size = os.path.getsize(path)
-    rng = parse_http_range(range_header, file_size)
-
-    def iter_file(offset: int, length: int) -> AsyncGenerator[bytes, None]:
-        async def gen() -> AsyncGenerator[bytes, None]:
-            remaining = length
-            with open(path, "rb") as fp:
-                fp.seek(offset)
-                while remaining > 0:
-                    chunk = fp.read(min(64 * 1024, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
-
-        return gen()
-
-    if rng is None:
-        return StreamingResponse(
-            iter_file(0, file_size),
-            status_code=200,
-            headers={
-                "Content-Type": media_type,
-                "Content-Length": str(file_size),
-                "Accept-Ranges": "bytes",
-            },
-        )
-
-    start, end = rng
-    length = end - start + 1
-    return StreamingResponse(
-        iter_file(start, length),
-        status_code=206,
-        headers={
-            "Content-Type": media_type,
-            "Content-Length": str(length),
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-            "Accept-Ranges": "bytes",
-        },
-    )
 
 
 def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: str) -> Response:
