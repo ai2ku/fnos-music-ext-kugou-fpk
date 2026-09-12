@@ -2719,14 +2719,23 @@ def merge_online_tracks(
     # 层改写为全量（见 search_track），故此处切片是安全的。
     # 切片前记录 total 作为「全量条数」，切片后写回 parent，前端据此算页数。
     total = len(target_list)
-    if size and total > 0:
-        target_list[size * (page - 1):] = []
+    # 官方实际合并条数：在切片前就算好，切片后列表变短不能再用 len 倒推。
+    official_items = total - len(filtered_online)
+    if size is not None and total > 0:
+        # 整表换成「本页那一段」。必须用全量快照切片后再赋回：
+        # target_list 是原列表的引用，就地删改会把 data.list 本身弄坏。
+        # 不能用 [start:] = [] 这种「删到末尾」写法——page=1 时 start=0，
+        # 会把整张表清空（实测 page=1 returned=0、page=2 只剩 50 条）。
+        full = list(target_list)
+        start = max(0, (page - 1) * size)
+        del target_list[:]
+        target_list.extend(full[start:start + size])
         parent["total"] = total
     elif total > 0:
         parent["total"] = total
     logger.warning(
         "[SEARCH_MERGE] official_items=%d official_declared=%d online_items=%d online_declared=%d total=%d page=%d size=%d returned=%d",
-        len(target_list) - len(filtered_online), official_total, len(filtered_online),
+        official_items, official_total, len(filtered_online),
         _read_int((online_result or {}).get("total"), 0), total, page, size,
         len(target_list),
     )
