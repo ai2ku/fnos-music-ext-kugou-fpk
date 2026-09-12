@@ -819,22 +819,22 @@ def get_stream_lyric(guid: str) -> str:
 # === 本地封面缓存：coverId=guid 的解析结果进程内记忆，避免每张封面都回源 metadata + 酷狗搜索 ===
 
 _LOCAL_COVER_URL_TTL_S = 24 * 3600
-_LOCAL_COVER_FAIL_TTL_S = 5 * 60
 _LOCAL_COVER_URL_CACHE: dict[str, tuple[float, str]] = {}
 
 
 def remember_local_cover_url(guid: str, url: str) -> None:
-    """记住本地曲子的封面 URL；url 为空表示解析失败，短缓存以免每张封面都打回源。"""
-    if not guid:
+    """记住本地曲子的封面 URL 模板。url 为空时不写缓存，
+    以便每次都能重新解析（避免一次失败长期锁定空字符串）。"""
+    if not guid or not url:
         return
-    ttl = _LOCAL_COVER_URL_TTL_S if url else _LOCAL_COVER_FAIL_TTL_S
-    _LOCAL_COVER_URL_CACHE[guid] = (time.time() + ttl, url)
+    _LOCAL_COVER_URL_CACHE[guid] = (time.time() + _LOCAL_COVER_URL_TTL_S, url)
 
 
 def remembered_local_cover_url(guid: str) -> str | None:
-    """命中未过期缓存返回 URL 模板（可能为空串），未命中或过期返回 None。
+    """命中未过期缓存返回 URL 模板，未命中或过期返回 None。
 
-    缓存的是未替换 {size} 占位符的原始 URL，取出后需再用 _fill_cover_size 按本次请求填尺寸。
+    缓存的是未替换 {size} 占位符的原始 URL，取出后需再用
+    _fill_cover_size 按本次请求填尺寸。失败不缓存，每次都会重新解析。
     """
     entry = _LOCAL_COVER_URL_CACHE.get(guid)
     if not entry:
