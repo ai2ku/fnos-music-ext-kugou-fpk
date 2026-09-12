@@ -1984,6 +1984,12 @@ def build_online_track(item: dict) -> dict:
     """对齐飞牛音乐列表标准格式：只返回飞牛标准字段。"""
     guid = online_guid_from_item(item)
     src = str(item.get("source") or source_from_online_guid(guid) or "")
+
+    # 酷狗 track item 自带封面 URL 模板（cover_url / union_cover），
+    # 在构建时预填缓存，后续 /static/cover 按 guid 查缓存直接命中，省去回源查询。
+    cover_tpl = _cover_url_from_item(item)
+    if cover_tpl:
+        remember_local_cover_url(guid, cover_tpl)
     title = str(item.get("title") or item.get("name") or "")
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
@@ -4999,9 +5005,18 @@ async def _fetch_cover_url_by_guid(request: Request, guid: str) -> str:
                        guid[len("online:kugou:artist:"):], "yes" if url else "NO", time.monotonic() - t0)
         return url
     if is_online_guid(guid):
+        # 优先读 build_online_track 预填的缓存模板（列表/搜索接口自带 URL）
+        cached_tpl = remembered_local_cover_url(guid)
+        if cached_tpl is not None:
+            url = _fill_cover_size(cached_tpl, request) if cached_tpl else ""
+            logger.warning("[COVERURL] step6 branch=online CACHE_HIT guid=%s got=%s",
+                           guid, "yes" if url else "NO")
+            return url
         t0 = time.monotonic()
         data = await _online_info(request, guid)
         raw = str((data or {}).get("cover_url") or "")
+        if raw:
+            remember_local_cover_url(guid, raw)
         url = _fill_cover_size(raw, request)
         logger.warning("[COVERURL] step6 branch=online cover_url=%s filled=%s elapsed=%.2fs guid=%s",
                        raw[:80], "yes" if url else "NO", time.monotonic() - t0, guid)
