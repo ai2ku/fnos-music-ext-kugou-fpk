@@ -2651,13 +2651,22 @@ def merge_online_tracks(
     for it in filtered_online:
         target_list.append(build_online_track(it))
 
-    online_total = _read_int((online_result or {}).get("total"), len(filtered_online))
-    total = official_total + online_total
+    # total 恒等于实际返回条数。
+    #
+    # 路由从不按 page/size 切片（page 参数既不传给酷狗也不传给上游），
+    # 所以无论客户端是分页请求还是不分页请求，拿到的都是同一份合并全量列表。
+    # 旧逻辑 total = official_total + online_total 用的是两边的「声明总数」，
+    # 与列表实际条数无关：本兮 官方声明 22 + 酷狗声明 480 = 502，而列表实际
+    # 只有 316 项。客户端按 502 算出十页，翻到第三页就空——表现为「没有返回
+    # 所有结果」。
+    online_total = len(filtered_online)
+    total = len(target_list)
     if total > 0:
         parent["total"] = total
     logger.warning(
-        "[SEARCH_MERGE] official_count=%d official_total=%d online_items=%d online_total=%d page_online=%d total=%d page=%d size=%d",
-        len(target_list), official_total, len(filtered_online), online_total, len(filtered_online), total, page, size,
+        "[SEARCH_MERGE] official_items=%d official_declared=%d online_items=%d online_declared=%d total=%d page=%d size=%d",
+        len(target_list) - len(filtered_online), official_total, len(filtered_online),
+        _read_int((online_result or {}).get("total"), 0), total, page, size,
     )
 
     return upstream_json
@@ -3502,7 +3511,8 @@ async def search_track(request: Request):
         size = 50
     if size < 1:
         size = 50
-    size = 500  # 对飞牛返回的汇总上限；酷狗侧按 50 条分页拉取
+    # size 仅作酷狗侧汇总上限（路由从不按 page 切片，客户端 size 不影响返回长度）。
+    size = 500
 
     url_path = request.url.path
     params = dict(request.query_params)
@@ -3577,15 +3587,29 @@ async def search_track(request: Request):
         return result
 
     async def _fetch_online_pages() -> dict | None:
-        """酷狗不支持一次全量拉取：按 50 条/页循环，直到够 size、空页、达到 total 或安全上限。"""
+        """酷狗不支持一次全量拉取：按 50 条/页循环，直到达到 total、空页或安全上限。
+
+        路由从不按 page/size 切片（客户端的 page 既不传给酷狗也不传给上游），
+        无论手机端还是 PC 端，拿到的都是同一份合并后的全量列表。因此这里恒按
+        全量轮询，不再区分分页/全量两种模式。
+
+        终止判据必须用「本轮是否新增」而不是「本页条数是否小于页大小」：
+        缓存里的 items 已经过 deduplicate_online_items，酷狗跨页重复（同一首歌
+        出现在多个结果页）会让某页去重后不足 50，从而被误判为末页提前收工。
+        正确做法是累计新增为 0 时才停，对齐 _fetch_kugou_all_pages 的 added 判据。
+        """
         cache = entry.setdefault("online", {})
         page_size = 50
         online_items: list[dict] = []
         seen: set[tuple[str, ...]] = set()
         total = 0
         pages_fetched = 0
-        # 安全上限：size=500 -> 10 页；额外 2 页防止酷狗空页/重复导致不足。
-        max_pages = max(10, (size + page_size - 1) // page_size + 2)
+        # 三重保护：页数上限 + 条数上限 + 整体时间预算。
+        # 跨页重复会让实际页数多于理论页数（480 首按 50/页理论 10 页，实测要
+        # 翻 10 页以上），故页数上限放宽到 40；条数上限 5000 条兜住极端关键词。
+        max_items = 5000
+        max_pages = 40
+        deadline = time.time() + 25.0  # 单页 8 秒超时，整体预算更宽
         for kugou_page in range(1, max_pages + 1):
             pages_fetched = kugou_page
             page_data = cache.get(kugou_page)
@@ -3597,6 +3621,7 @@ async def search_track(request: Request):
             raw_items = page_data.get("items", [])
             if not isinstance(raw_items, list):
                 raw_items = []
+            added = 0
             for item in raw_items:
                 t = str(item.get("title") or item.get("name") or "").strip().lower()
                 a = str(item.get("artist") or "").strip().lower()
@@ -3605,17 +3630,22 @@ async def search_track(request: Request):
                     continue
                 seen.add(key)
                 online_items.append(item)
+                added += 1
             total = _read_int(page_data.get("total"), total)
-            logger.warning("[SEARCH_KUGOU_PAGE_FETCH] keyword=%r kugou_page=%d page_items=%d merged_items=%d online_total=%d",
-                           keyword, kugou_page, len(raw_items), len(online_items), total)
+            logger.warning("[SEARCH_KUGOU_PAGE_FETCH] keyword=%r kugou_page=%d page_items=%d added=%d merged_items=%d online_total=%d",
+                           keyword, kugou_page, len(raw_items), added, len(online_items), total)
             if total and len(online_items) >= total:
                 break
-            if len(online_items) >= size:
-                online_items = online_items[:size]
+            if time.time() >= deadline:
                 break
-            if len(raw_items) < page_size:
+            if len(online_items) >= max_items:
+                online_items = online_items[:max_items]
                 break
+            # 空页：酷狗已到末尾
             if kugou_page > 1 and not raw_items:
+                break
+            # 本页没有任何新增（酷狗开始循环重复）
+            if added == 0:
                 break
 
         result = {
@@ -3625,11 +3655,13 @@ async def search_track(request: Request):
             "pagesize": page_size,
             "pages": pages_fetched,
             "fetched_pages": pages_fetched,
+            "fetched_items": len(online_items),
             "complete": bool(total and len(online_items) >= total),
         }
         cache["__all__"] = result
-        logger.warning("[SEARCH_KUGOU_ALL] keyword=%r pages=%d items=%d total=%d size=%d",
-                       keyword, pages_fetched, len(result.get("items", [])), result.get("total"), size)
+        logger.warning("[SEARCH_KUGOU_ALL] keyword=%r pages=%d items=%d kugou_total=%d complete=%s",
+                       keyword, pages_fetched, len(result.get("items", [])),
+                       result.get("total"), result["complete"])
         return result
 
     online_all: dict | None = None
@@ -3643,7 +3675,7 @@ async def search_track(request: Request):
     official_total = _read_int(entry.get("official_total"), current_official_total)
 
     if CONF.get("kugou_enabled", True):
-        # 酷狗不支持全量拉取，按 50 条/页汇总到本地 size 上限。
+        # 酷狗不支持全量拉取，按 50 条/页轮询直到取够 total。
         online_all = await _fetch_online_pages()
 
     logger.warning("[SEARCH_KUGOU_PAGE] keyword=%r official_total=%d kugou_pages=%s fetched_pages=%s online_items=%d online_total=%s",
