@@ -3859,14 +3859,31 @@ async def search_track(request: Request):
         cached = cache.get(key)
         if isinstance(cached, dict):
             return cached
+
+        # in-flight 去重：同一 (page, size) 并发请求共享同一个 Future，
+        # 避免第二个请求在第一个还没返回时重复 fetch。
+        in_flight = entry.setdefault("_in_flight", {})
+        fut = in_flight.get(key)
+        if fut is not None:
+            try:
+                return await fut
+            except (asyncio.CancelledError, Exception):
+                return None
+
+        fut = asyncio.get_event_loop().create_future()
+        in_flight[key] = fut
         try:
             kugou_res = await asyncio.wait_for(
                 fetch_kugou_search(keyword, page_size, page=kugou_page), timeout=min(float(CONF["search_timeout"]), 8.0)
             )
         except Exception as exc:
             logger.warning("kugou search failed keyword=%r page=%d: %s", keyword, kugou_page, exc)
+            fut.set_result(None)
+            in_flight.pop(key, None)
             return None
         if not isinstance(kugou_res, dict):
+            fut.set_result(None)
+            in_flight.pop(key, None)
             return None
         result = {
             **kugou_res,
@@ -3874,6 +3891,8 @@ async def search_track(request: Request):
             "pagesize": page_size,
         }
         cache[key] = result
+        fut.set_result(result)
+        in_flight.pop(key, None)
         return result
 
     async def _fetch_online_pages() -> dict | None:
