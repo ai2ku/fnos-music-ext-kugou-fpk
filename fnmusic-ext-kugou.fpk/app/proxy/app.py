@@ -737,8 +737,17 @@ _FORMAT_ALIASES = {
 
 # 模块级搜索缓存
 _SEARCH_CACHE: dict[str, dict] = {}
-_STREAM_CACHE_MAX_ENTRIES = 8
-_STREAM_CACHE_MAX_BYTES = 320 * 1024 * 1024  # 320 MB,防止长时间试听占满内存
+# 试听音频内存缓存上限，均可 env 覆盖。8 条 × 48MB 是历史默认；机器内存吃紧时
+# 把 FNMUSIC_STREAM_CACHE_MAX_BYTES 调小（如 134217728 = 128MB）或调小条数。
+_STREAM_CACHE_MAX_ENTRIES = int(os.environ.get("FNMUSIC_STREAM_CACHE_ENTRIES", "8") or 8)
+_STREAM_CACHE_MAX_BYTES = int(
+    os.environ.get("FNMUSIC_STREAM_CACHE_MAX_BYTES", str(320 * 1024 * 1024))
+)
+# 单首进入内存的阈值。历史写死 48MB 会让高音质 FLAC 永远走回源：30MB 能缓存、
+# 60MB 不能，音质相近待遇相反，越该被缓存的曲目越得不到缓存。改 env 可调。
+_STREAM_CACHE_MAX_FILE_BYTES = int(
+    os.environ.get("FNMUSIC_STREAM_CACHE_MAX_FILE_BYTES", str(48 * 1024 * 1024))
+)
 
 # guid -> {"body": bytes, "ext": str, "ts": float}
 _STREAM_CACHE: dict[str, dict] = {}
@@ -779,7 +788,12 @@ def _set_search_cache(keyword: str, entry: dict) -> None:
 
 
 def _clean_stream_cache() -> None:
-    """超出容量时按最近使用时间淘汰；纯内存缓存，不落盘。"""
+    """超出容量时按最近使用时间淘汰；纯内存缓存，不落盘。
+
+    必须在本轮写入之后调用：若先清理再插入，稳态占用 = 上限 + 最后一条
+    （8 条 × 48MB 满配时实际 ~472MB，超出配置的 320MB）。清理放插入后，
+    刚插入的条目 ts 最新必然存活，稳态严格 <= 上限。
+    """
     while len(_STREAM_CACHE) > _STREAM_CACHE_MAX_ENTRIES:
         oldest_guid = min(_STREAM_CACHE, key=lambda k: _STREAM_CACHE[k].get("ts", 0))
         _STREAM_CACHE.pop(oldest_guid, None)
@@ -795,14 +809,14 @@ def remember_stream_audio(guid: str, body: bytes, ext: str) -> None:
     """试听缓冲缓存到内存；进程重启即失效。"""
     if not guid or not body or len(body) < 1024:
         return
-    if len(body) > 48 * 1024 * 1024:  # 单首超过 48MB 不放内存，避免异常大音频撑爆
+    if len(body) > _STREAM_CACHE_MAX_FILE_BYTES:
         return
-    _clean_stream_cache()
     _STREAM_CACHE[guid] = {
         "body": body,
         "ext": (ext or "mp3").lower(),
         "ts": time.time(),
     }
+    _clean_stream_cache()  # 插入后清理，保证稳态 <= 上限
     logger.warning("[STREAM_CACHE] remembered guid=%s size=%d ext=%s entries=%d", guid, len(body), ext, len(_STREAM_CACHE))
 
 
@@ -818,21 +832,52 @@ def get_stream_audio(guid: str) -> bytes | None:
     return None
 
 
-_STREAM_LYRIC_CACHE: dict[str, str] = {}
+_STREAM_LYRIC_CACHE: dict[str, dict] = {}
+_STREAM_LYRIC_MAX_ENTRIES = 200
+_STREAM_LYRIC_MAX_BYTES = 8 * 1024 * 1024  # 8 MB，条数上限通常先绑定
+
+
+def _clean_stream_lyric_cache() -> None:
+    """超出容量时按最近使用时间淘汰，与 _STREAM_CACHE 同构。
+
+    历史上这个缓存只写不删，是全系统唯一零淘汰的内存缓存：每播一首加
+    一条、永不回收，长运行下 RSS 单调增长。补与音频缓存一致的条数 +
+    字节双上限。条数通常先绑定（常规歌词 ~2KB，200 条约 400KB）；
+    字节上限只在极端情况下（单条接近 256KB 上限）才起作用。
+    """
+    while len(_STREAM_LYRIC_CACHE) > _STREAM_LYRIC_MAX_ENTRIES:
+        oldest_guid = min(_STREAM_LYRIC_CACHE, key=lambda k: _STREAM_LYRIC_CACHE[k].get("ts", 0))
+        _STREAM_LYRIC_CACHE.pop(oldest_guid, None)
+    while True:
+        total = sum(len(e.get("text") or "") for e in _STREAM_LYRIC_CACHE.values())
+        if total <= _STREAM_LYRIC_MAX_BYTES or not _STREAM_LYRIC_CACHE:
+            break
+        oldest_guid = min(_STREAM_LYRIC_CACHE, key=lambda k: _STREAM_LYRIC_CACHE[k].get("ts", 0))
+        _STREAM_LYRIC_CACHE.pop(oldest_guid, None)
 
 
 def remember_stream_lyric(guid: str, text: str) -> None:
-    """歌词也只做进程内缓存，避免写 .lrc/.ref 到磁盘。"""
+    """歌词只缓存到进程内，不落盘（避免污染曲库目录、避免 sidecar 丢失）。"""
     if not guid or not text:
         return
     if len(text) > 256 * 1024:
         return
-    _STREAM_LYRIC_CACHE[guid] = text
+    _STREAM_LYRIC_CACHE[guid] = {"text": text, "ts": time.time()}
+    # 清理放在插入之后：否则稳态容量 = 上限 + 最后一条（与 _STREAM_CACHE 相反）。
+    _clean_stream_lyric_cache()
     logger.warning("[STREAM_LYRIC_CACHE] remembered guid=%s size=%d entries=%d", guid, len(text), len(_STREAM_LYRIC_CACHE))
 
 
 def get_stream_lyric(guid: str) -> str:
-    return _STREAM_LYRIC_CACHE.get(guid, "")
+    """命中返回歌词并刷新最近使用时间（LRU 依据），未命中返回空串。"""
+    entry = _STREAM_LYRIC_CACHE.get(guid)
+    if not entry:
+        return ""
+    text = entry.get("text")
+    if text:
+        entry["ts"] = time.time()
+        return text
+    return ""
 
 
 # === 本地封面缓存：coverId=guid 的解析结果进程内记忆，避免每张封面都回源 metadata + 酷狗搜索 ===
@@ -2341,7 +2386,7 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
 
 
 async def resolve_online_lyric(request: Request, guid: str) -> str:
-    """本地 .lrc 优先；没有再向源站要，拿到就落盘。"""
+    """内存缓存优先；没有再向源站要，拿到就写回内存（不落盘）。"""
     cached = read_lyric_cache(guid)
     if cached:
         return cached
