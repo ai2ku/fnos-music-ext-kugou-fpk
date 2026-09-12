@@ -3182,8 +3182,8 @@ async def upload_cover_to_official(app_state, image_bytes: bytes, headers: dict)
 async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict, headers: dict) -> bool:
     """POST /music/api/v1/track/metadata 回写官方 coverId，用户无感。
 
-    官方接口要求**所有字段必带**，无值时按类型留空占位：
-      字符串 -> ""，数组 -> []，数字 -> null。
+    官方接口要求**所有字段必带**，无值时按类型留占位：
+      数组 -> []，其他（含字符串） -> null。
     只有 title 完全为空才放弃回写（metadata 不全时官方无意义）。
     历史上只提交有值字段的写法会触发 code=100001。
     """
@@ -3194,7 +3194,14 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
         v = track.get(key)
         return data.get(key) if v is None else v
 
-    title = str(_scalar("title") or "").strip()
+    def _str_or_null(key: str):
+        v = _scalar(key)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    title = _str_or_null("title")
     if not title:
         logger.warning("[COVERWRITE] skip-no-title guid=%s (metadata incomplete)", guid)
         return False
@@ -3202,9 +3209,11 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
     payload: dict[str, Any] = {
         "guid": guid,
         "coverId": cover_id,
-        "coverGUID": cover_id,
+        # coverGUID 是去掉 track_/album_ 前缀的原始 32 位 hash。
+        # 官方接口要求两字段分开提交，不是同一个值。
+        "coverGUID": cover_id.split("_", 1)[1] if "_" in cover_id else cover_id,
         "title": title,
-        "album": str(_scalar("album") or ""),
+        "album": _str_or_null("album"),
         "artistGUIDs": _scalar("artistGUIDs") if isinstance(_scalar("artistGUIDs"), list) else [],
         "genreGUIDs": _scalar("genreGUIDs") if isinstance(_scalar("genreGUIDs"), list) else [],
         "year": _scalar("year"),
