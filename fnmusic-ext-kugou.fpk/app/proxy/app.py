@@ -433,6 +433,116 @@ async def fetch_kugou_artist_detail(app_state, artist_guid: str) -> dict | None:
         return None
 
 
+# 酷狗 /artist/audios 全量获取的 pagesize 与重试次数。
+# 实测 2026-09-12（id=3520 总 1825 首）：pagesize=1000 硬截断为 1000；
+# 2000/3000/5000 均一次返回 1825。故取 2000（2x 安全系数足够，避免过大请求）。
+# 但大 pagesize 仍偶发返空（pagesize=3000 实测 1/3 概率 got=0），故额外重试 3 次。
+_KUGOU_FULL_PAGESIZE = int(os.environ.get("FNMUSIC_KUGOU_FULL_PAGESIZE", "2000"))
+_KUGOU_FULL_RETRY = int(os.environ.get("FNMUSIC_KUGOU_FULL_RETRY", "3"))
+
+
+def _resolve_kugou_size(raw: Any, default: int) -> int:
+    """解析客户端传来的 size 参数。
+
+    飞牛客户端对「列表页」统一传 size=-1 表示「一次拿全」（与分页无关）。
+    旧写法 int(size or N) 会把 -1 当作真值（Python 中 -1 为 truthy）再走
+    max(1,...)，把「全量」退化成 1 或 50，导致歌手专辑页永远只看到 1 条、
+    歌手单曲页永远只看到前 50 首。
+
+    处理：
+      - 空/缺失/非数字 -> default（按客户端默认翻页尺寸）
+      - size >= 1 -> 原值（尊重客户端显式指定）
+      - size < 1  -> -1（保留「全量」信号，路由层据此走全量路径）
+    """
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return v if v >= 1 else -1
+
+
+async def fetch_kugou_artist_tracks_full(app_state, artist_guid: str) -> dict:
+    """酷狗歌手单曲全量获取，处理「客户端要全量 + 上游偶发空/截断」。
+
+    背景：
+      - 飞牛客户端对列表页固定传 size=-1 表示「一次拿全」；
+      - 上游 /artist/audios pagesize=1000 会硬截断为 1000 条（总 1825 时拿到 1000），
+        pagesize>=2000 才能一次吐完（实测 2000/3000/5000 均返 1825）；
+      - 但同一大 pagesize 仍偶发返空（实测 pagesize=3000 有 1/3 概率 got=0），
+        故「一次拿全」不能只靠一次请求，需要空响应重试 + 取不满翻页补齐。
+
+    本函数与 fetch_kugou_artist_tracks 的区别：后者只负责单页直取（兼容
+    playlist-detail/list 的 page/size 分页语义），本函数专门处理「全量」。
+    """
+    artist_id, artist_kind = parse_kugou_artist_guid(artist_guid)
+    if artist_kind != "kugou_artist" or not artist_id:
+        return {"items": [], "total": 0, "page": 1, "pagesize": _KUGOU_FULL_PAGESIZE}
+
+    page_size = _KUGOU_FULL_PAGESIZE
+    all_items: list[dict] = []
+    declared_total = 0
+    first_ok = False
+
+    # 首页：大 pagesize 一次拿全，允许空响应重试（上游偶发 got=0）。
+    for attempt in range(1, _KUGOU_FULL_RETRY + 1):
+        try:
+            payload = await kugou_source.get_artist_audios(
+                artist_id, sort="hot", page=1, pagesize=page_size
+            )
+        except Exception as e:
+            logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s size=%s(err) attempt=%s err=%s",
+                           artist_id, page_size, attempt, e)
+            continue
+        items = payload.get("items") or []
+        declared_total = int(payload.get("total") or 0)
+        logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s size=%s attempt=%s got=%s total=%s",
+                       artist_id, page_size, attempt, len(items), declared_total)
+        if items:
+            first_ok = True
+            all_items.extend(items)
+            break
+        await asyncio.sleep(0.3 * attempt)
+
+    if not first_ok:
+        logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s 全量首页重试%s次均空，返回空列表",
+                       artist_id, _KUGOU_FULL_RETRY)
+        return {"items": [], "total": declared_total, "page": 1, "pagesize": page_size}
+
+    # 取不满则继续翻页补齐（应对 pagesize=1000 硬截断或上游返回异常）。
+    # 单页不足 page_size 即为末页。
+    next_page = 2
+    while len(all_items) < declared_total:
+        try:
+            payload = await kugou_source.get_artist_audios(
+                artist_id, sort="hot", page=next_page, pagesize=page_size
+            )
+        except Exception as e:
+            logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s page=%s size=%s(err) err=%s",
+                           artist_id, next_page, page_size, e)
+            break
+        items = payload.get("items") or []
+        declared_total = int(payload.get("total") or declared_total)
+        logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s page=%s size=%s got=%s total=%s",
+                       artist_id, next_page, page_size, len(items), declared_total)
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < page_size:
+            break
+        next_page += 1
+        if next_page > 10:
+            break
+
+    logger.warning("[KUGOU_ARTIST_TRACKS] artist_id=%s 全量收工 got=%s total=%s pagesize=%s",
+                   artist_id, len(all_items), declared_total, page_size)
+    return {
+        "items": all_items,
+        "total": declared_total or len(all_items),
+        "page": 1,
+        "pagesize": page_size,
+    }
+
+
 async def fetch_kugou_artist_tracks(app_state, artist_guid: str, page: int = 1, size: int = 50) -> dict:
     """酷狗歌手作品 -> 飞牛 track/artist-detail/list 的歌曲列表。
 
@@ -5605,10 +5715,13 @@ async def album_artist_detail_list(request: Request):
         page = max(1, int(request.query_params.get("page") or 1))
     except (TypeError, ValueError):
         page = 1
-    try:
-        size = min(500, max(1, int(request.query_params.get("size") or 60)))
-    except (TypeError, ValueError):
-        size = 60
+    # size=-1 是客户端「一次拿全」的信号：int(-1 or 60) 会拿到 -1（Python 中
+    # -1 为 truthy），再走 max(1,...) 就退化成 1，导致歌手专辑页永远只看到 1 条。
+    # 改用 _resolve_kugou_size 显式识别；size=-1 时按全量 pagesize 拉取
+    # （/artist/albums pagesize=500 实测可一次吐完，无上限拦截）。
+    size = _resolve_kugou_size(request.query_params.get("size"), default=60)
+    if size < 0:
+        size = _KUGOU_FULL_PAGESIZE
     if not artist_guid:
         return JSONResponse(content={"code": 400, "msg": "artistGUID required", "data": None})
     kugou_payload = await fetch_kugou_artist_album_list(request.app, artist_guid, page=page, size=size)
@@ -5825,13 +5938,16 @@ async def track_artist_detail_list(request: Request):
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
         page = 1
-    try:
-        size = int(request.query_params.get("size") or 50)
-    except (TypeError, ValueError):
-        size = 50
-    if size < 1:
-        size = 50
-    payload = await fetch_kugou_artist_tracks(request.app, artist_guid, page=page, size=size)
+    # size=-1 同 album 路由：客户端表示「一次拿全」。旧写法 int(size or 50) 拿到
+    # -1 后靠下面的 if size < 1 回退到 50，看似无错但把「全量」吞成 50，
+    # 歌手 1825 首单曲永远只给前 50 首。用 _resolve_kugou_size 统一处理。
+    size = _resolve_kugou_size(request.query_params.get("size"), default=50)
+    if size < 0:
+        # 全量路径：大 pagesize + 空响应重试 + 取不满翻页补齐，
+        # 避开 pagesize=1000 硬截断与大 pagesize 偶发返空两个坑。
+        payload = await fetch_kugou_artist_tracks_full(request.app, artist_guid)
+    else:
+        payload = await fetch_kugou_artist_tracks(request.app, artist_guid, page=page, size=size)
     # get_artist_audios 内部已调 search_item_to_raw 归一化；不要再套 track_item_to_raw，
     # 否则会把 title 清空（后者只认原始 KuGou 字段 hash/singerinfo/albuminfo）。
     raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
