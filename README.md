@@ -1,136 +1,235 @@
 # 飞牛音乐酷狗扩展 FPK
 
-把 fnos_music_ext 改造成飞牛原生 FPK 应用包，一键安装、配置向导、零命令。
+为飞牛音乐（`trim_music`）接入自建 **KuGouMusicApi** 作为外部音源。
 
-## 特点
+一键安装、图形化配置向导、零命令。酷狗是**唯一外部音源**——历史上的 musicdl / musicbox / 网易云接入已全部下线，仓库里不再有相关代码。
 
-- **一键安装**：飞牛应用中心 → 手动安装 → 上传 .fpk
-- **图形化配置向导**：填 KuGouMusicApi 地址、选音质，无需碰命令
-- **卸载即还原**：卸载时自动切回官方 socket，不留残留
-- **零侵入**：不修改飞牛官方 nginx、二进制或数据库
-- **升级无痛**：新版本 FPK 直接覆盖安装，保留 venv 与缓存
+## 架构
+
+```
+  飞牛音乐客户端
+        │  HTTP
+        ▼
+ /var/run/trim_music.socket          ← 本扩展在此接管
+        │  (FastAPI 代理 app.py)
+        ├── 拦截：search / metadata / stream / lyrics / 封面
+        │        → 拉酷狗源、合并官方结果、返回
+        └── 透传：其余全部请求
+                │  httpx UDS
+                ▼
+ /var/run/trim_music_upstream.socket ← 官方服务（只改名，未改动）
+                │
+                ▼
+        KuGouMusicApi (kugou_url)
+```
+
+**零侵入**：不修改飞牛官方 nginx、二进制、数据库，只换 socket 文件名。卸载即还原。
+
+## 功能
+
+| 能力 | 说明 |
+|---|---|
+| 搜索合并 | track / artist / album / playlist / suggest 五类，官方结果在前、酷狗在后，**不去重** |
+| 分页 | PC 端按 `page/size` 切合并全量；手机端不传分页时轮询酷狗全量（上限 480/500） |
+| 在线播放 | `/track/stream` + HLS 兜底 + `preset.m3u8`，边播边存磁盘缓存回放 |
+| 歌词 | 从 KuGouMusicApi 拉取，磁盘 sidecar 缓存 |
+| 封面 | 代理主动上传换官方 `coverId` 并回写；统一 1600 尺寸；磁盘缓存 |
+| 歌手/专辑/歌单 | `track/artist-detail`、`track/album-detail`、`playlist/detail`、`playlist/batch-detail` |
+| 收藏 | 只读注入：GET `/favorite-track/list` 会从本地收藏文件读入并合并；**写入链路不可达**（见 FAQ） |
+| 播放历史 | 透传上游，兜底补空 `coverId` |
+| 登录 | 二维码登录 KuGouMusicApi（`/_ext/login/qr/*`） |
+| 健康检查 | `/_ext/healthz` |
+
+未拦截的路径全部原样转发。`/music/api/v1/` 下代理只接管 GET（`_is_get_request` 闸门），`/_ext/` 下另有本代理自己实现的 POST（settings / login logout）。详见 FAQ。
 
 ## 目录结构
 
 ```
 fnmusic-ext-kugou-fpk/
-├── build-fpk.sh                      # 打包脚本（本地跑）
-├── README.md                         # 本文件
-└── fnmusic-ext-kugou.fpk/            # FPK 源码目录
-    ├── manifest                      # 应用元信息
-    ├── ICON.png                      # 64x64 图标
-    ├── ICON192.png                   # 192x192 图标
-    ├── ICON256.png                   # 256x256 图标
-    ├── app/                          # → 安装到 target/（TRIM_APPDEST）
-    │   └── proxy/
-    │       ├── app.py                # 已改好的代理（Kugou 唯一源）
-    │       ├── kugou_source.py       # 酷狗源适配
-    │       ├── recommend.py          # 每日推荐
-    │       ├── run_proxy.sh          # 启动脚本
-    │       └── requirements.txt      # Python 依赖
-    ├── cmd/                          # 生命周期钩子
-    │   ├── install_init.sh           # 预检（飞牛音乐是否启动）
-    │   ├── install_callback.sh       # 装依赖、写 .env
-    │   ├── start_init.sh
-    │   ├── start_callback.sh         # 接管 socket、启动 systemd
-    │   ├── stop_callback.sh
-    │   ├── upgrade_callback.sh       # 升级时重启服务
-    │   ├── uninstall_init.sh
-    │   └── uninstall_callback.sh     # 卸载：还原官方 socket
+├── build-fpk.sh                     # 打包脚本（本地跑，含语法/JSON 校验）
+├── fnpack-1.2.3-linux-amd64         # 打包工具
+├── dist/                            # 产物：fnmusic_ext_kugou-1.0.0.fpk
+└── fnmusic-ext-kugou.fpk/           # FPK 源码目录
+    ├── manifest                     # 应用元信息（appname / version / 作者地址）
+    ├── ICON.png ICON192.png ICON256.png
+    ├── app/                         # → 安装后落到 TRIM_APPDEST（app/ 前缀由 fnpack 剥离）
+    │   ├── .env                     # 用户配置（安装时生成，chmod 600）
+    │   ├── proxy/
+    │   │   ├── app.py               # 主代理（FastAPI，约 6618 行）
+    │   │   ├── kugou_source.py      # 酷狗源适配（搜索/直链/歌词/元数据）
+    │   │   ├── app_socket_bridge.py # 网关桥接器：剥 /app/fnmusic_ext_kugou 前缀后转发
+    │   │   ├── run_proxy.sh         # socket 探测 + 接管 + 启动 uvicorn
+    │   │   └── requirements.txt     # fastapi / uvicorn / httpx / mutagen
+    │   ├── ui/config                # 应用中心入口（iframe + 网关前缀）
+    │   └── web/settings.html        # 设置页
+    ├── cmd/                         # 生命周期钩子
+    │   ├── install_init             # 前置检查（仅写日志）
+    │   ├── install_callback         # 找 python3.12、建 venv、装依赖、语法检查、生成 .env
+    │   ├── main                     # 进程管理：start / stop / status
+    │   ├── start_init / start_callback / stop_callback
+    │   ├── upgrade_init / upgrade_callback   # 升级后 py_compile（不阻断）
+    │   └── uninstall_init / uninstall_callback # 卸载前还原 socket
     ├── config/
-    │   ├── privilege.json            # 声明 root 权限
-    │   └── resource.json             # 无额外共享
+    │   ├── privilege                # run-as: root
+    │   └── resource                 # 无额外共享
     └── wizard/
-        ├── wizard.json               # 向导定义
-        └── ui/index.html             # 配置页面
-```
-
-## 打包
-
-```bash
-# 1. 下载 fnpack（如未安装）
-# 从 https://www.fnnas.com/download/fnpack 下载对应平台的 fnpack
-# 放到本目录（build-fpk.sh 所在目录），或设置环境变量 FNPACK_BIN
-
-# 2. 执行打包
-./build-fpk.sh
-
-# 3. 产物在 dist/fnmusic_ext_kugou-1.0.0.fpk
+        ├── wizard.json              # 向导定义
+        └── ui/index.html            # 配置页面
 ```
 
 ## 安装
 
-1. 打开飞牛应用中心
-2. 点击右上角「手动安装」
-3. 上传 `dist/fnmusic_ext_kugou-1.0.0.fpk`
-4. 系统会弹窗要求 root 权限授权 → 输入密码
-5. 进入配置向导 → 填 KuGouMusicApi 地址 → 保存并启动
-6. 打开飞牛音乐，搜索即可
+1. 飞牛应用中心 → 右上角「手动安装」→ 上传 `dist/fnmusic_ext_kugou-1.0.0.fpk`
+2. 授权 root 权限
+3. 配置向导：填 KuGouMusicApi 地址 → 选音质 → 保存
+4. 打开飞牛音乐，搜索即可
 
-## 前置条件
+**前置条件**
 
-- **飞牛音乐应用（`trim_music`）已安装** — 已通过 `install_dep_apps="trim_music"` 在 manifest 中声明，应用中心会自动处理依赖
-- **KugouMusicApi 服务可访问**（本机容器用 http://127.0.0.1:8899，远程用对应 IP:端口）
-- **Python 3 与 python3-venv 已安装**（飞牛镜像一般自带）
+- 飞牛官方音乐应用（`trim.music`）已安装并**处于运行中**
+- KuGouMusicApi 可访问（本机 `http://127.0.0.1:8899`，远程填对应 IP:端口）
+- Python 3.12（manifest 声明 `install_dep_apps="trim.music:python312"`，应用中心自动装）
 
 ## 运行时布局
 
+`TRIM_APPDEST` 实际为 `/var/apps/fnmusic_ext_kugou/target`（`/vol1/@appcenter/fnmusic_ext_kugou` 是同一份应用目录的另一路径）。源码里的 `app/` 一层由 fnpack 剥离，**部署后是扁平结构**（下称 `$DEST`）：
+
 | 路径 | 用途 |
 |---|---|
-| `/opt/target/fnmusic_ext_kugou/` | 应用代码（`TRIM_APPDEST`） |
-| `/opt/target/fnmusic_ext_kugou/.venv-proxy/` | Python 虚拟环境 |
-| `/opt/target/fnmusic_ext_kugou/.env` | 用户配置（向导写入，chmod 600） |
-| `/opt/target/fnmusic_ext_kugou/cache/` | 音频 / 歌词缓存 |
-| `/opt/target/fnmusic_ext_kugou/online_favorites/` | 在线收藏 |
-| `/opt/target/fnmusic_ext_kugou/log/` | 应用日志 |
-| `/var/run/trim_music.socket` | 代理 socket（被本应用接管） |
-| `/var/run/trim_music_upstream.socket` | 官方 socket（保留备份） |
-| `/etc/systemd/system/fnmusic-ext.service` | systemd 服务 |
+| `$DEST/proxy/` | 代理代码（`app.py` / `kugou_source.py` / `app_socket_bridge.py`） |
+| `$DEST/.env` | 用户配置（向导与设置页写入，chmod 600） |
+| `$DEST/.venv-proxy/` | Python 虚拟环境（约 35M，升级保留） |
+| `$DEST/cache/` | 音频与歌词缓存 |
+| `$DEST/app/home/cache/` | 封面 ID 缓存 `cover_ids.json`（路径成因见 FAQ） |
+| `$DEST/app/home/online_favorites/` | 收藏读取目录（写入分支不可达，见 FAQ） |
+| `$DEST/log/proxy.log` | 代理运行日志（超 10MB 自动轮转为 `.1`） |
+| `/tmp/fnmusic-ext-main.log` | `cmd/main` 进程管理日志 |
+| `/tmp/fnmusic-ext-run.log` | 启动器日志 |
+| `/tmp/fnmusic-ext.pid` | 代理 PID |
+| `$DEST/fnmusic_ext_kugou.sock` | 网关桥接器监听 |
+| `/var/run/trim_music.socket` | 代理占用（被接管） |
+| `/var/run/trim_music_upstream.socket` | 官方服务（改名保留） |
+
+运行进程：`uvicorn app:app --app-dir $DEST/proxy --uds /var/run/trim_music.socket`，外加一个桥接器进程。**不用 systemd** —— `cmd/main` 用 `nohup` 拉起两者，PID 记在 `/tmp/fnmusic-ext.pid`。
+
+两个 socket 各服务一个客户端：
+
+| socket | 监听方 | 服务对象 |
+|---|---|---|
+| `/var/run/trim_music.socket` | uvicorn 代理 | 飞牛音乐客户端 |
+| `$DEST/fnmusic_ext_kugou.sock` | `app_socket_bridge.py` | 飞牛统一网关（`/app/fnmusic_ext_kugou` 前缀） |
+
+## 配置
+
+设置页与 `/wizard/ui/index.html` 可改三项：
+
+| 字段 | 取值 | 默认 |
+|---|---|---|
+| `kugou_url` | KuGouMusicApi 地址 | `http://127.0.0.1:8899` |
+| `kugou_quality` | `high` / `320` / `128` / `64` | `high` |
+| `kugou_enabled` | `1` / `0` | `1` |
+
+音质按 `high → 320 → 128 → 64` 逐级回退取直链，取不到直接降级不报错。320kbps 需 KuGou VIP 账号。
+
+`.env` 其余键（登录态与调优）：
+
+```
+FNMUSIC_KUGOU_TOKEN / _USERID / _DFID / _T1 / _MID / _GUID / _DEV / _MAC   # 登录凭证
+FNMUSIC_KUGOU_SEARCH_TIMEOUT=15   # 单请求超时（秒）
+FNMUSIC_KUGOU_SEARCH_LIMIT=480    # 搜索全量上限（酷狗 track）
+FNMUSIC_KUGOU_META_LIMIT=500      # 元数据全量上限（artist / album）
+FNMUSIC_KUGOU_STEP=50             # 轮询步长
+FNMUSIC_MERGE_SUGGEST=1           # suggest 是否合并酷狗
+FNMUSIC_MERGE_SEARCH_META=1       # 元数据搜索是否合并酷狗
+FNMUSIC_COVER_UPLOAD_ENABLED=1    # 封面回写开关
+FNMUSIC_ONLINE_LIMIT=30           # 在线播放缓存条数
+FNMUSIC_SEARCH_CACHE_TTL=300      # 搜索缓存秒数
+```
+
+改 `.env` 后需重启应用生效（`cmd/main stop && cmd/main start`）。
+
+## 常用命令
+
+```bash
+# 健康检查
+curl -s --unix-socket /var/run/trim_music.socket \
+     http://localhost/_ext/healthz
+# → {"ok":true,"upstream":"ok","kugou":"ok"}
+# ok=false 时看 upstream / kugou 哪一侧是 fail
+
+# 登录状态
+curl -s --unix-socket /var/run/trim_music.socket \
+     http://localhost/_ext/login/status
+
+# 应用中心入口（浏览器）
+# https://<nas>/app/fnmusic_ext_kugou
+
+# 实时日志
+tail -f /var/apps/fnmusic_ext_kugou/target/log/proxy.log
+```
+
+`kugou` 字段取值：`ok` / `fail` / `disabled` / `http_<status>`。
+
+## 打包
+
+```bash
+./build-fpk.sh
+```
+
+脚本顺序：`py_compile` 三个 Python 文件 → `bash -n` 全部 shell → JSON 校验 → `fnpack build` → 产物拷到 `dist/`。
+
+`fnpack` 可从 <https://www.fnnas.com/download/fnpack> 下载，放到本目录，或设 `FNPACK_BIN=/path/to/fnpack`。
 
 ## 卸载
 
-飞牛应用中心 → 已安装 → 飞牛音乐酷狗扩展 → 卸载
+应用中心 → 已安装 → 卸载。
 
-`uninstall_callback.sh` 会：
-1. 停止并禁用 `fnmusic-ext.service`
-2. 删除 systemd unit
-3. 把 `/var/run/trim_music_upstream.socket` 移回 `/var/run/trim_music.socket`
+`uninstall_init` 通过 healthz 判断 `trim_music.socket` 是否为代理占用：
+
+- 是代理 → 删除，并把 `_upstream.socket` 还原回去
+- 不是 → 不碰，避免误删官方服务
 
 卸载后飞牛音乐自动切回官方模式。
 
+彻底清理：
+
+```bash
+sudo rm -rf /var/apps/fnmusic_ext_kugou/target
+sudo rm -rf /var/apps/fnmusic_ext_kugou/var
+```
+
 ## 升级
 
-- 新版本 FPK 覆盖安装
-- `upgrade_callback.sh` 语法检查新代码 → 重启 systemd → 健康检查
-- 保留 `.venv-proxy`、`.env`、`cache/`（用户数据不丢）
+覆盖安装即可。`upgrade_callback` 对新代码做 `py_compile`（失败仅告警不阻断），保留 `.venv-proxy` / `.env` / `cache/`，用户数据不丢。
 
 ## 常见问题
 
-### Q: 安装时提示"未检测到飞牛音乐应用"
-先安装并启动飞牛官方音乐应用，再来装本扩展。
+**Q: 安装后启动失败，日志说"未探测到存活的 trim-music socket"**
+先在应用中心确认官方音乐应用处于「运行中」，再来装本扩展。代理必须接管一个真实存在的官方 socket。
 
-### Q: 启动后飞牛音乐搜索不到歌
-```bash
-curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
-# 应返回 {"ok":true,"upstream":"ok","kugou":"ok",...}
-```
-如果 `kugou` 是 `fail`，检查 KuGouMusicApi 是否可访问。
+**Q: `healthz` 显示 `kugou: fail`**
+检查 `kugou_url` 是否可达，以及 KuGouMusicApi 是否正在运行。
 
-### Q: 音质只有 64kbps
-向导里选的音质档可能没通过 KuGouMusicApi 授权。Kugou VIP 账号才能拿 320kbps。
+**Q: 音质只有 64kbps**
+账号无 VIP 权益。回退链会自动降级，不报错但拿不到 320。
 
-### Q: 日志在哪看
-```bash
-sudo journalctl -u fnmusic-ext -f     # 实时日志
-tail -f /opt/target/fnmusic_ext_kugou/log/*.log
-```
+**Q: 搜索没有酷狗结果**
+先看 `.env` 里 `FNMUSIC_KUGOU_URL` 是否为空，再查 `log/proxy.log` 里 `[SEARCH_KUGOU_ALL]` 相关行。酷狗源返回 `data: null` 时会重试，仍空则该次无酷狗项（官方结果不受影响）。
 
-### Q: 想彻底清理（含用户数据）
-```bash
-# 先在飞牛应用中心卸载
-# 再清理残留目录（会删掉缓存和配置）
-sudo rm -rf /opt/target/fnmusic_ext_kugou /opt/var/fnmusic_ext_kugou
-```
+**Q: 封面不显示**
+封面回写失败不影响出图，代理会拉 `singerimg.kugou.com` 的占位图兜底。相关配置：`FNMUSIC_COVER_UPLOAD_ENABLED`、`FNMUSIC_COVER_UPLOAD_SIZE=1600`。
+
+**Q: 在线收藏/封面 ID 缓存找不到文件**
+注意 `_HOME` 读的是 `FNMUSIC_HOME_DIR`，而启动脚本导出的是 `FNMUSIC_HOME`（少一个 `_DIR`），两者不匹配。因此 `cache_dir` 走扁平的 `$DEST/cache/`，而 `cover_ids.json` 与收藏目录实际落在 `$DEST/app/home/` 下。这是当前代码的已知行为，非损坏。
+
+**Q: 在线收藏为什么一直是空的**
+`save_online_favorites` 只被 `POST /favorite-track/create` 与 `/delete` 调用，但这两个端点第一行就走 `_is_get_request` 闸门，POST 一律转发上游（实测返回上游 `INVALID TOKEN`），本地写入分支永远进不去。目前收藏实际处于「只读」状态：`GET /favorite-track/list` 会从本地文件读入并合并，但没有任何路径会写入。要恢复写入需把这两个端点移出 `_is_get_request` 闸门。
+
+**Q: 非 GET 请求代理怎么处理**
+`/music/api/v1/` 下所有路由都过 `_is_get_request` 闸门，非 GET 直接原样转发上游，不碰请求体与返回体。例外是 `/_ext/` 下的三个端点（`POST /_ext/settings`、`POST /_ext/login/logout`），它们是本代理自己实现的真 POST。另注：`/music/api/v1/event/report`、`/favorite-track/create`、`/favorite-track/delete` 虽声明为 POST 路由，因闸门实际是永转发的空壳。
+
+**Q: 想回退到官方纯音乐模式**
+把 `.env` 里 `FNMUSIC_KUGOU_ENABLED=0`，重启应用。代理仍在运行但酷狗源关闭，`healthz` 显示 `kugou: disabled`。
 
 ## License
 

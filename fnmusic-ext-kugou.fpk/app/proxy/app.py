@@ -55,10 +55,6 @@ CONF = {
     "kugou_guid": os.environ.get("FNMUSIC_KUGOU_GUID", ""),
     "kugou_dev": os.environ.get("FNMUSIC_KUGOU_DEV", ""),
     "kugou_mac": os.environ.get("FNMUSIC_KUGOU_MAC", ""),
-    "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
-    "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "2.5")),
-    "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
-    "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
     "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
@@ -5724,7 +5720,7 @@ async def favorite_track_list(request: Request):
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
-# === daily recommend + play history ===
+# === 歌手 / 专辑详情列表 ===
 
 
 @app.get("/music/api/v1/album/artist-detail/list")

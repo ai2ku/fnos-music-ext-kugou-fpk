@@ -12,7 +12,6 @@ echo "==> 语法检查 Python 源码..."
 python3 -m py_compile \
     "${PKG_DIR}/app/proxy/app.py" \
     "${PKG_DIR}/app/proxy/kugou_source.py" \
-    "${PKG_DIR}/app/proxy/recommend.py" \
     "${PKG_DIR}/app/proxy/app_socket_bridge.py"
 echo "Python 源码语法 OK"
 

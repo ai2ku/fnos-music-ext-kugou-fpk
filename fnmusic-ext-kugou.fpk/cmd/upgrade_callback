@@ -19,6 +19,6 @@ if [ -x "$VENV_PY" ]; then
     "$VENV_PY" -m py_compile \
         "$APP_DIR/proxy/app.py" \
         "$APP_DIR/proxy/kugou_source.py" \
-        "$APP_DIR/proxy/recommend.py" 2>/dev/null
+        "$APP_DIR/proxy/kugou_source.py" 2>/dev/null
 fi
 exit 0

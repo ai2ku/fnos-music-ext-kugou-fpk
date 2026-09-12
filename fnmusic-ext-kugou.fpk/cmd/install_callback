@@ -51,9 +51,8 @@ if [ ! -f "$APP_DIR/proxy/requirements.txt" ]; then
 fi
 
 mkdir -p "$APP_DIR/cache" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir cache" >> "$LOGF"; exit 1; }
-mkdir -p "$APP_DIR/online_favorites" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir online_favorites" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/app/home/online_favorites" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir online_favorites" >> "$LOGF"; exit 1; }
 mkdir -p "$APP_DIR/play_history" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir play_history" >> "$LOGF"; exit 1; }
-mkdir -p "$APP_DIR/recommend_cache" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir recommend_cache" >> "$LOGF"; exit 1; }
 mkdir -p "$APP_DIR/log" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir log" >> "$LOGF"; exit 1; }
 echo "[install_callback] 目录建好" >> "$LOGF"
 
@@ -93,7 +92,7 @@ else
 fi
 
 # 语法检查
-"$VENV_PY" -m py_compile "$APP_DIR/proxy/app.py" "$APP_DIR/proxy/kugou_source.py" "$APP_DIR/proxy/recommend.py" >> "$LOGF" 2>&1 || echo "[install_callback] WARN: 语法告警" >> "$LOGF"
+"$VENV_PY" -m py_compile "$APP_DIR/proxy/app.py" "$APP_DIR/proxy/kugou_source.py" >> "$LOGF" 2>&1 || echo "[install_callback] WARN: 语法告警" >> "$LOGF"
 
 # 生成 .env
 ENV_FILE="$APP_DIR/.env"
@@ -110,8 +109,6 @@ ENV_FILE="$APP_DIR/.env"
     echo "FNMUSIC_KUGOU_GUID="
     echo "FNMUSIC_KUGOU_DEV="
     echo "FNMUSIC_KUGOU_MAC="
-    echo "FNMUSIC_MUSICDL_ENABLED=0"
-    echo "FNMUSIC_NETEASE_ENABLED=0"
     echo "FNMUSIC_LIBRARY_DIR="
     echo "FNMUSIC_LLM_BASE_URL="
     echo "FNMUSIC_LLM_API_KEY="
