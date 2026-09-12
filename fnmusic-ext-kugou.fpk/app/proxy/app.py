@@ -2,7 +2,7 @@
 
 功能：
 1. 通用透传：所有非拦截路径原样转发到 trim-music unix socket
-2. 搜索合并：GET /music/api/v1/search/track* （兼容 q/keyword，并行 musicdl）
+2. 搜索合并：GET /music/api/v1/search/track* （兼容 q/keyword，并行酷狗源）
 3. 在线播放：stream + HLS 兜底 + transcode 空操作 + tee 缓存回放（音频与歌词 sidecar）
 4. 在线元数据/歌词/封面
 5. GET /_ext/healthz
@@ -43,9 +43,6 @@ _HOME = os.environ.get(
 _APP_MODE = os.environ.get("FNMUSIC_APP_MODE", "").strip().lower()
 
 CONF = {
-    "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
-    "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
-    "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "false").lower() in ("true", "1", "yes"),
     "kugou_enabled": os.environ.get("FNMUSIC_KUGOU_ENABLED", "true").lower() in ("true", "1", "yes"),
     "kugou_url": os.environ.get("FNMUSIC_KUGOU_URL", "http://127.0.0.1:8899"),
     "kugou_quality": str(os.environ.get("FNMUSIC_KUGOU_QUALITY", "high")),
