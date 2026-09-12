@@ -3273,15 +3273,51 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
 
     def _str_or_null(key: str):
         v = _scalar(key)
+        # upstream 的 album 是 {guid, name, ...} 对象而非字符串；酷狗匹配失败
+        # 时会保留这个 dict，直接 str() 会变成 Python repr 大杂烩，官方也会
+        # 拒绝。这里把 dict 的 name 字段提出来当专辑名。
+        if isinstance(v, dict):
+            v = v.get("name") or v.get("title") or v.get("album")
         if v is None:
             return None
         s = str(v).strip()
         return s if s else None
 
+    def _guid_list(key: str) -> list[str] | None:
+        """从 upstream 的 {artists, genres} 对象数组提取 guid 列表。
+
+        upstream 回参里歌手/风格不是扁平 GUID 数组，而是对象数组：
+          track.artists = [{guid, name, ...}, ...]
+          track.genres  = [{guid, name, ...}, ...]
+        官方 POST /track/metadata 要求 artistGUIDs/genreGUIDs 为字符串数组，
+        故在此转换。取不到时返回 None（不 fallback 到 []——空数组会被官方
+        当作"清空歌手"，历史 bug 根因）。调用方收到 None 时不写该字段，
+        让官方保留原值。
+        """
+        v = _scalar(key)
+        if not isinstance(v, list) or not v:
+            return None
+        guids: list[str] = []
+        for item in v:
+            if isinstance(item, dict):
+                g = str(item.get("guid") or "").strip()
+                if g:
+                    guids.append(g)
+            elif isinstance(item, str):
+                g = item.strip()
+                if g:
+                    guids.append(g)
+        return guids if guids else None
+
     title = _str_or_null("title")
     if not title:
         logger.warning("[COVERWRITE] skip-no-title guid=%s (metadata incomplete)", guid)
         return False
+
+    # 从 upstream 对象数组提取 GUID 列表（artists/genres）。None 表示取不到，
+    # 调用方不写该字段，让官方保留原值，避免历史 bug：fallback [] 会清空歌手。
+    _artist_guids = _guid_list("artists") or _guid_list("artistGUIDs")
+    _genre_guids = _guid_list("genres") or _guid_list("genreGUIDs")
 
     payload: dict[str, Any] = {
         "guid": guid,
@@ -3291,12 +3327,21 @@ async def post_official_cover_id(app_state, guid: str, cover_id: str, data: dict
         "coverGUID": cover_id.split("_", 1)[1] if "_" in cover_id else cover_id,
         "title": title,
         "album": _str_or_null("album"),
-        "artistGUIDs": _scalar("artistGUIDs") if isinstance(_scalar("artistGUIDs"), list) else [],
-        "genreGUIDs": _scalar("genreGUIDs") if isinstance(_scalar("genreGUIDs"), list) else [],
+        # 年/discNo/trackNo 在 upstream track 顶层就是数字，_scalar 直接取值。
         "year": _scalar("year"),
         "discNo": _scalar("discNo"),
         "trackNo": _scalar("trackNo"),
     }
+    # 仅在拿到非空列表时写入；None 时跳过，让官方保留原歌手/风格。
+    if _artist_guids is not None:
+        payload["artistGUIDs"] = _artist_guids
+    if _genre_guids is not None:
+        payload["genreGUIDs"] = _genre_guids
+    logger.warning(
+        "[COVERWRITE] payload guid=%s artistGUIDs=%r genreGUIDs=%r year=%r discNo=%r trackNo=%r",
+        guid, _artist_guids, _genre_guids,
+        payload.get("year"), payload.get("discNo"), payload.get("trackNo"),
+    )
     try:
         client = get_upstream_client(app_state)
         req = client.build_request(
