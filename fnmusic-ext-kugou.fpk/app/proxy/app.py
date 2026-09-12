@@ -317,8 +317,10 @@ async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int =
 
         release_date = str(item.get("publish_date") or "").strip() or None
         ts = parse_ts_to_unix(release_date or time.time())
-        # /artist/albums 回参没有专辑曲目数字段；前端该列展示为来源标识。
-        track_count = "酷狗源"
+        # 注意：酷狗 /artist/albums 回参没有曲目数字段，此处**不返回 trackCount**。
+        # 历史上试过 track_count = 0（谎报为零）和 "酷狗源"（类型错，str 而非 int），
+        # 后者会让手机端整页校验失败、专辑列表显示为空。缺字段客户端能容忍
+        # （与 /track/album-detail/list 的 album 子对象一致，该处也不返回 trackCount）。
 
         artists: list[dict[str, Any]] = []
         for art in item.get("artists") or []:
@@ -355,14 +357,12 @@ async def fetch_kugou_artist_album_list(app_state, artist_guid: str, page: int =
                 "createdAt": ts,
                 "updatedAt": ts,
                 "artists": artists,
-                "trackCount": track_count,
                 "language": str(item.get("language") or "").strip() or None,
                 "albumType": str(item.get("album_type") or "").strip() or None,
                 "publishCompany": str(item.get("publish_company") or "").strip() or None,
             }
             order.append(key)
         entry = seen[key]
-        entry["trackCount"] = track_count
         if not entry.get("releaseDate") and release_date:
             entry["releaseDate"] = release_date
         if not entry.get("language") and item.get("language"):
