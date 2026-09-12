@@ -2807,8 +2807,9 @@ def merge_search_meta(
         _fill_cover(item)
         merged.append(item)
 
-    # 官方实际合并条数在切片前算好，切片后列表变短不能再用 len 倒推。
-    official_items = len(target_list) - len(merged)
+    # 官方实际合并条数：此刻尚未 extend，target_list 就是官方条目本身。
+    # 不能减 len(merged)（那是酷狗条数），官方为 0 时会算出负数。
+    official_items = len(target_list)
 
     target_list.extend(merged)
     # total 恒等于实际合并条数，不用两侧的声明总数：
@@ -5091,7 +5092,13 @@ async def search_playlist(request: Request):
     playlist 项字段：guid/name/coverId/createdAt/updatedAt/trackCount/score。
     本地与酷狗结果合并，官方在前、酷狗在后。
     """
-    return await merged_search_meta(request, fetch_kugou_playlist_search, tag="playlist")
+    # 酷狗歌单上限 480（不是 500）：按 500 算余数末页会得到第 10 页
+    # from=450,size=50 → 500>480 越界返回空，450~479 这 30 条整段丢失。
+    # 与 /search/track 同上限，复用 kugou_search_limit。
+    _pl_cap = int(CONF.get("kugou_search_limit") or 480)
+    return await merged_search_meta(
+        request, fetch_kugou_playlist_search, tag="playlist", cap=_pl_cap
+    )
 
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
