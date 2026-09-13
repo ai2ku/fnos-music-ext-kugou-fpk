@@ -4,6 +4,12 @@
 
 一键安装、图形化配置向导、零命令。酷狗是**唯一外部音源**——历史上的 musicdl / musicbox / 网易云接入已全部下线，仓库里不再有相关代码。
 
+> ## ⚠️ 重要：KuGouMusicApi 需自行部署，本 FPK 不包含它
+>
+> **本扩展不含任何音源，自身不连接酷狗服务器。** 它是飞牛音乐与一个由**你自己部署**的 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) 实例之间的**反向代理**。
+>
+> 若未先部署 KuGouMusicApi，本扩展**装上也无法工作**——搜索不到酷狗结果，`/_ext/healthz` 返回 `"kugou":"fail"`（HTTP 状态不符则为 `"http_<code>"`）。请先按 [安装 · 第 0 步](#安装-第-0-步先部署-kugoumusicapi必做) 完成部署。
+
 ## 灵感与来源
 
 本项目参考并构建了以下项目：
@@ -98,6 +104,39 @@ fnmusic-ext-kugou-fpk/
 
 ## 安装
 
+### 安装第 0 步：先部署 KuGouMusicApi（必做）
+
+**这一步由用户自行完成，本仓库与 FPK 均不包含 KuGouMusicApi，应用中心也不会替你安装它。**
+
+[KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) 是独立的上游项目，负责对接酷狗服务器、返回搜索/直链/歌词/元数据。本扩展只是「飞牛音乐 ←→ 你的 KuGouMusicApi」之间的桥，没有它就没有音源。
+
+典型部署方式（以 Docker Compose 为例）：
+
+```yaml
+services:
+  kugou-music-api:
+    image: <上游项目提供的镜像>   # 以 https://github.com/MakcRe/KuGouMusicApi 仓库说明为准
+    ports:
+      - "8899:8899"
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+```
+
+部署后**从飞牛 NAS 本机**验证可达：
+
+```bash
+curl -sS http://127.0.0.1:8899/health || curl -sS http://127.0.0.1:8899/
+# 有 HTTP 响应即可；若返回 000 / 连接超时，说明地址或端口填错
+```
+
+> **地址填写规则**
+> - KuGouMusicApi 跑在 **NAS 本机容器** → `http://127.0.0.1:8899`
+> - 跑在 **另一台服务器** → `http://<对方IP>:<端口>`，并确认防火墙放行该端口
+> - 本扩展从 **NAS 容器内部**发请求，所以填的是「NAS 访问它」的地址，**不是你浏览器的地址**
+
+### 安装第 1~4 步
+
 1. 飞牛应用中心 → 右上角「手动安装」→ 上传 `dist/fnmusic_ext_kugou-2.0.0.fpk`
 2. 授权 root 权限
 3. 配置向导：填 KuGouMusicApi 地址 → 选音质 → 保存
@@ -105,8 +144,8 @@ fnmusic-ext-kugou-fpk/
 
 **前置条件**
 
+- **KuGouMusicApi 已自行部署并可访问**（本机 `http://127.0.0.1:8899`，远程填对应 IP:端口）—— 见「安装第 0 步」
 - 飞牛官方音乐应用（`trim.music`）已安装并**处于运行中**
-- KuGouMusicApi 可访问（本机 `http://127.0.0.1:8899`，远程填对应 IP:端口）
 - Python 3.12（manifest 声明 `install_dep_apps="trim.music:python312"`，应用中心自动装）
 
 ## 运行时布局
@@ -223,11 +262,25 @@ sudo rm -rf /var/apps/fnmusic_ext_kugou/var
 
 ## 常见问题
 
+**Q: 这个 FPK 里已经自带 KuGouMusicApi 吗？**
+没有。本扩展**不含任何音源**，装完也不会自动下载或部署 KuGouMusicApi，飞牛应用中心同样装不了它。请先自行部署 [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) 实例，再在本扩展里填它的地址（见 [安装第 0 步](#安装-第-0-步先部署-kugoumusicapi必做)）。本扩展只做反向代理与结果合并。
+
 **Q: 安装后启动失败，日志说"未探测到存活的 trim-music socket"**
 先在应用中心确认官方音乐应用处于「运行中」，再来装本扩展。代理必须接管一个真实存在的官方 socket。
 
-**Q: `healthz` 显示 `kugou: fail`**
-检查 `kugou_url` 是否可达，以及 KuGouMusicApi 是否正在运行。
+**Q: `healthz` 显示 `kugou: fail`（或 `http_404` / `http_500`）**
+说明 KuGouMusicApi 实例没起来、地址填错，或不是 KuGouMusicApi 那个服务。
+
+`kugou` 字段完整取值：
+
+| 值 | 含义 |
+|---|---|
+| `ok` | 连通正常，探测端点 `/login/qr/key` 返回 200 |
+| `fail` | 连不上（地址错误、未启动、防火墙拦截、超时） |
+| `http_<code>` | 连得上但返回非 200——通常地址指向了错误的服务 |
+| `disabled` | `.env` 里 `FNMUSIC_KUGOU_ENABLED=0`，酷狗源被主动关闭 |
+
+探测方式是 GET `{kugou_url}/login/qr/key`，超时 3 秒。该端点无需登录凭证，因此也能作为部署是否成功的判据。
 
 **Q: 音质只有 64kbps**
 账号无 VIP 权益。回退链会自动降级，不报错但拿不到 320。
