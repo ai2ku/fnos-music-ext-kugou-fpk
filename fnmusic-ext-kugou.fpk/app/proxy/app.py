@@ -4329,6 +4329,11 @@ def stream_tee_response(
     if not resp.headers.get("accept-ranges"):
         out_headers["Accept-Ranges"] = "bytes"
 
+    # CORS：让浏览器能读取 Range 相关头（跨域场景必需）
+    out_headers["Access-Control-Expose-Headers"] = (
+        "Accept-Ranges, Content-Range, Content-Length, ETag, Last-Modified"
+    )
+
     status_code = resp.status_code
     content_length_str = resp.headers.get("content-length")
     content_length = (
