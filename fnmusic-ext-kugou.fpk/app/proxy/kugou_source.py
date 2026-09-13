@@ -1046,18 +1046,89 @@ def track_item_to_raw(it: dict) -> dict:
 
 QUALITY_FALLBACK = ["high", "320", "128", "64"]
 
+# relate_goods[].level -> 配置音质值 映射表
+# level 2=128kbps mp3, 4=320kbps mp3, 5=flac(无损), 6=flac(Hi-Res)
+# suffix 是输出格式后缀（mp3/flac），quality 是 /song/url 请求参数
+QUALITY_TIERS = [
+    {"level": 2, "quality": "128",  "suffix": "mp3"},
+    {"level": 4, "quality": "320",  "suffix": "mp3"},
+    {"level": 5, "quality": "flac", "suffix": "flac"},
+    {"level": 6, "quality": "high", "suffix": "flac"},
+]
 
-async def resolve_url(song_id: str) -> tuple[str | None, str | None]:
+
+def _parse_relate_goods(data: dict) -> dict[int, dict]:
+    """解析 data.relate_goods[] 为 {level: item_dict} 索引。"""
+    rel = data.get("relate_goods") if isinstance(data, dict) else None
+    if not isinstance(rel, list):
+        return {}
+    out: dict[int, dict] = {}
+    for it in rel:
+        if not isinstance(it, dict):
+            continue
+        try:
+            lvl = int(it.get("level"))
+        except (TypeError, ValueError):
+            continue
+        out[lvl] = it
+    return out
+
+
+def _select_quality_tier(data: dict) -> dict | None:
+    """从 relate_goods[] 匹配音质档位。
+
+    1) 精确匹配：配置的 kugou_quality 在 relate_goods 里存在对应 level
+    2) 降级匹配：配置音质不在结果中时，从低到高取首个可用 level
+    返回 {level, quality, suffix, bitrate, size, match}，无 relate_goods 时返回 None。
+    """
+    by_level = _parse_relate_goods(data)
+    if not by_level:
+        return None
+    pref = str(CFG.get("kugou_quality") or "high").strip().lower()
+    for tier in QUALITY_TIERS:
+        if tier["quality"] != pref:
+            continue
+        item = by_level.get(tier["level"])
+        if item is None:
+            continue
+        try:
+            bitrate = int(item.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        try:
+            size = int(item.get("size") or item.get("filesize") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return {**tier, "bitrate": bitrate, "size": size, "match": "exact"}
+    # 降级：从低到高取首个可用
+    for tier in QUALITY_TIERS:
+        item = by_level.get(tier["level"])
+        if item is None:
+            continue
+        try:
+            bitrate = int(item.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        try:
+            size = int(item.get("size") or item.get("filesize") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return {**tier, "bitrate": bitrate, "size": size, "match": "downgrade"}
+    return None
+
+async def resolve_url(song_id: str, quality_tier: dict | None = None) -> tuple[str | None, str | None]:
     """按音质档位尝试解析播放直链。
 
     返回 (url, ext)：解析失败返回 (None, None)。
+    quality_tier: 匹配好的 {quality, suffix, ...}；None 则用 CFG 默认档位。
     song_id 为 "hash" 部分，不含 "kugou:" 前缀。
     """
     if not song_id:
         return None, None
-    pref = str(CFG.get("kugou_quality") or "high")
+    pref = str(quality_tier["quality"]) if quality_tier else str(CFG.get("kugou_quality") or "high")
     order = [pref] + [q for q in QUALITY_FALLBACK if q != pref]
-    logger.warning("[KUGOU] resolve_url hash=%s order=%s", song_id, order)
+    tier_suffix = str(quality_tier.get("suffix") or "") if quality_tier else ""
+    logger.warning("[KUGOU] resolve_url hash=%s order=%s suffix=%s", song_id, order, tier_suffix)
 
     async with _client() as c:
         for q in order:
@@ -1224,6 +1295,19 @@ async def fetch_privilege_lite_info(song_id: str) -> dict | None:
                 info_obj = data.get("info")
                 if isinstance(info_obj, dict):
                     cover_url = str(info_obj.get("image") or "").strip()
+                # 1) 从 relate_goods[] 匹配音质档位，覆写 extname/quality/size/bitrate
+                tier = _select_quality_tier(data)
+                if tier:
+                    data["extname"] = tier["suffix"]
+                    data["quality"] = tier["quality"]
+                    data["_matched_tier"] = tier
+                    if tier["bitrate"]:
+                        data["bitrate"] = tier["bitrate"]
+                    if tier["size"]:
+                        data["filesize"] = tier["size"]
+                    logger.warning("[KUGOU] privilege_lite tier match hash=%s tier=%s suffix=%s match=%s bitrate=%s size=%s",
+                                   song_id, tier["quality"], tier["suffix"], tier["match"],
+                                   tier["bitrate"], tier["size"])
                 # info.extname 是真正的格式名（"mp3"/"flac"）；
                 # data.quality 是比特率（"128"/"320"），不能当格式。
                 if info_obj.get("extname") and not data.get("extname"):
@@ -1236,6 +1320,8 @@ async def fetch_privilege_lite_info(song_id: str) -> dict | None:
                     if cover_url and not raw_item.get("cover_url"):
                         raw_item["cover_url"] = cover_url
                         raw_item["union_cover"] = cover_url
+                    if tier:
+                        raw_item["_matched_tier"] = tier
                     _remember_song(raw_item)
                     return raw_item
     except Exception as e:

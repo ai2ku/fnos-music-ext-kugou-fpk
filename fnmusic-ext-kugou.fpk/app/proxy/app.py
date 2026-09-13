@@ -606,10 +606,13 @@ async def fetch_kugou_search(keyword: str, limit: int, page: int = 1) -> dict | 
         return None
 
 
-async def resolve_kugou_url(song_id: str) -> tuple[str | None, str | None]:
-    """调 KuGouMusicApi /song/url，返回 (play_url, ext)。"""
+async def resolve_kugou_url(song_id: str, quality_tier: dict | None = None) -> tuple[str | None, str | None]:
+    """调 KuGouMusicApi /song/url，返回 (play_url, ext)。
+
+    quality_tier: 匹配好的 {quality, suffix, ...}；None 则用 CFG 默认档位。
+    """
     try:
-        return await kugou_source.resolve_url(song_id)
+        return await kugou_source.resolve_url(song_id, quality_tier=quality_tier)
     except Exception as e:
         logger.warning("kugou resolve_url failed: %s", e)
         return None, None
@@ -4420,7 +4423,8 @@ async def stream_track(request: Request):
     src = source_from_online_guid(guid)
     if src == "kugou":
         raw_song_id = song_id_from_online_guid(guid)
-        play_url, resolved_ext = await resolve_kugou_url(raw_song_id)
+        info = await kugou_source.get_info(raw_song_id) or {}
+        play_url, resolved_ext = await resolve_kugou_url(raw_song_id, quality_tier=info.get("_matched_tier"))
         if not play_url:
             return JSONResponse(
                 content={"code": 404, "msg": "online source unavailable", "data": None},
