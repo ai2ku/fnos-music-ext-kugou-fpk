@@ -46,6 +46,7 @@
 
 ```
 fnmusic-ext-kugou-fpk/
+├── LICENSE                          # MIT 协议（仓库根目录，不随 FPK 打包）
 ├── build-fpk.sh                     # 打包脚本（本地跑，含语法/JSON 校验）
 ├── fnpack-1.2.3-linux-amd64         # 打包工具
 ├── dist/                            # 产物：fnmusic_ext_kugou-1.0.0.fpk
@@ -233,4 +234,6 @@ sudo rm -rf /var/apps/fnmusic_ext_kugou/var
 
 ## License
 
-MIT（继承自 fnos_music_ext 上游）
+MIT，见 [`LICENSE`](./LICENSE)。
+
+代码改造自 fnos_music_ext 上游（同样为 MIT）；`requirements.txt` 依赖 fastapi / uvicorn / httpx / mutagen 各自按其协议分发。
