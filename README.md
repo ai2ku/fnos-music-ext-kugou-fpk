@@ -2,7 +2,7 @@
 
 为飞牛音乐（`trim_music`）接入自建 **KuGouMusicApi** 作为外部音源。
 
-一键安装、图形化配置向导、零命令。酷狗是**唯一外部音源**——历史上的 musicdl / musicbox / 网易云接入已全部下线，仓库里不再有相关代码。
+一键安装、图形化配置向导、零命令。酷狗是**唯一外部音源**——，本项目不涉及破解官方接口，VIP及其付费歌曲仍需开通会员或单独付费（KuGouMusicApi可设置概念版，概念版可通过活动获取免费VIP从而实现免费听歌！）。
 
 > ## ⚠️ 重要：KuGouMusicApi 需自行部署，本 FPK 不包含它
 >
@@ -14,7 +14,7 @@
 
 本项目参考并构建了以下项目：
 
-- [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) —— 飞牛音乐扩展框架，本项目的起点
+- [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) —— 从此项目获得开发灵感
 - [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) —— 酷狗音乐 API，提供搜索、直链、歌词与元数据能力
 
 ## 效果展示
@@ -57,7 +57,7 @@
 | 在线播放 | `/track/stream` + HLS 兜底 + `preset.m3u8`，边播边存磁盘缓存回放 |
 | 歌词 | 从 KuGouMusicApi 拉取，磁盘 sidecar 缓存 |
 | 封面 | 代理主动上传换官方 `coverId` 并回写；统一 1600 尺寸；磁盘缓存 |
-| 歌手/专辑/歌单 | `track/artist-detail`、`track/album-detail`、`playlist/detail`、`playlist/batch-detail` |
+| 歌手/专辑/歌单 | `track/artist-detail`、`track/album-detail`、`playlist/detail`、`playlist/batch-detail`，自动导入登录账号的酷狗歌单 |
 | 收藏 | 只读注入：GET `/favorite-track/list` 会从本地收藏文件读入并合并；**写入链路不可达**（见 FAQ） |
 | 播放历史 | 透传上游，兜底补空 `coverId` |
 | 登录 | 二维码登录 KuGouMusicApi（`/_ext/login/qr/*`） |
@@ -306,7 +306,3 @@ sudo rm -rf /var/apps/fnmusic_ext_kugou/var
 ## License
 
 GPL-2.0，见 [`LICENSE`](./LICENSE)。
-
-上游项目 [fnos_music_ext](https://github.com/javycoder/fnos_music_ext) 原为 MIT 授权；本项目在其基础上改造，以 GPL-2.0 授权发布。
-
-`requirements.txt` 依赖各自按其协议分发：fastapi (MIT)、uvicorn (BSD-3-Clause)、httpx (BSD-3-Clause)、mutagen (GPL-2.0)。
