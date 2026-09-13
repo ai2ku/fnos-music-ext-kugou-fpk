@@ -2351,10 +2351,28 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
 
 
 
+def _bytes_cache_headers(body: bytes) -> dict:
+    """为内存缓存的音频生成缓存协商头：ETag + Last-Modified + Cache-Control。
+
+    ETag 用内容哈希生成（内容稳定），Last-Modified 用当前时间（首次缓存时刻近似），
+    使浏览器可做 If-None-Match / If-Modified-Since 协商，避免重复下载。
+    """
+    etag = hashlib.md5(body).hexdigest()
+    now_ts = time.time()
+    mtime_str = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(now_ts))
+    return {
+        "ETag": f'"{etag}"',
+        "Last-Modified": mtime_str,
+        "Cache-Control": "private, max-age=86400, must-revalidate",
+        "Access-Control-Expose-Headers": "Accept-Ranges, Content-Range, Content-Length, ETag, Last-Modified",
+    }
+
+
 def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: str) -> Response:
     """纯内存响应：不落盘，仅在当前进程内缓存的音频上支持 Range。"""
     file_size = len(body)
     rng = parse_http_range(range_header, file_size)
+    cache_hdrs = _bytes_cache_headers(body)
 
     def iter_bytes(offset: int, length: int) -> AsyncGenerator[bytes, None]:
         async def gen() -> AsyncGenerator[bytes, None]:
@@ -2374,6 +2392,7 @@ def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: st
                 "Content-Type": media_type,
                 "Content-Length": str(file_size),
                 "Accept-Ranges": "bytes",
+                **cache_hdrs,
             },
         )
 
@@ -2387,6 +2406,7 @@ def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: st
             "Content-Length": str(length),
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Accept-Ranges": "bytes",
+            **cache_hdrs,
         },
     )
 
@@ -4295,14 +4315,18 @@ def stream_tee_response(
     resolved_ext: str | None = None,
     pre_info: dict | None = None,
 ) -> Response:
-    out_headers = {"Accept-Ranges": "bytes"}
-    for k in ("content-type", "content-length", "content-range"):
-        v = resp.headers.get(k)
-        if v:
-            out_headers[k] = v
+    # 黑名单透传：保留上游全部头，仅剔除 hop-by-hop + 不可预知长度
+    out_headers = filter_headers(
+        resp.headers,
+        exclude_keys={"content-length", "content-encoding"},
+    )
 
-    if resolved_ext:
+    # content-type：上游有则保留，无则按 resolved_ext 补全
+    if resolved_ext and not resp.headers.get("content-type"):
         out_headers["content-type"] = media_type_for_ext(resolved_ext)
+
+    # 始终声明支持 Range
+    out_headers.setdefault("Accept-Ranges", "bytes")
 
     status_code = resp.status_code
     content_length_str = resp.headers.get("content-length")
