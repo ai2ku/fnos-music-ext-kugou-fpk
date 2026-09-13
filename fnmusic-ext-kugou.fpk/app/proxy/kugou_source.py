@@ -1224,6 +1224,10 @@ async def fetch_privilege_lite_info(song_id: str) -> dict | None:
                 info_obj = data.get("info")
                 if isinstance(info_obj, dict):
                     cover_url = str(info_obj.get("image") or "").strip()
+                # info.extname 是真正的格式名（"mp3"/"flac"）；
+                # data.quality 是比特率（"128"/"320"），不能当格式。
+                if info_obj.get("extname") and not data.get("extname"):
+                    data["extname"] = info_obj["extname"]
                 tp = data.get("trans_param")
                 if isinstance(tp, dict) and not cover_url:
                     cover_url = str(tp.get("union_cover") or "").strip()
