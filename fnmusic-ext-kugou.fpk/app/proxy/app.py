@@ -2054,10 +2054,10 @@ def build_online_track(item: dict) -> dict:
         "sampleRate": 44100,
         "channel": 2,
         "bitrate": bitrate,
-        "codec": "酷狗源" if src == "kugou" else play_format,
+        "codec": play_format,
         "container": "",
         "duration": duration_ms,
-        "format": "酷狗源" if src == "kugou" else play_format,
+        "format": play_format,
         "path": spec_path,
         "size": file_size,
     }
