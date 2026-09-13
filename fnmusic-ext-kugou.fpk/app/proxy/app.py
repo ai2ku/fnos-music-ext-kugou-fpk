@@ -56,7 +56,7 @@ CONF = {
     "kugou_token": os.environ.get("FNMUSIC_KUGOU_TOKEN", ""),
     "kugou_userid": os.environ.get("FNMUSIC_KUGOU_USERID", ""),
     "kugou_dfid": os.environ.get("FNMUSIC_KUGOU_DFID", ""),
-    "kugou_t1": os.environ.get("FNMUSIC_KUGOU_/track/", ""),
+    "kugou_t1": os.environ.get("FNMUSIC_KUGOU_T1", ""),
     "kugou_mid": os.environ.get("FNMUSIC_KUGOU_MID", ""),
     "kugou_guid": os.environ.get("FNMUSIC_KUGOU_GUID", ""),
     "kugou_dev": os.environ.get("FNMUSIC_KUGOU_DEV", ""),
@@ -560,7 +560,7 @@ if _ENV_FILE.exists():
             "FNMUSIC_KUGOU_TOKEN": ("kugou_token", "str"),
             "FNMUSIC_KUGOU_USERID": ("kugou_userid", "str"),
             "FNMUSIC_KUGOU_DFID": ("kugou_dfid", "str"),
-            "FNMUSIC_KUGOU_/track/": ("kugou_t1", "str"),
+            "FNMUSIC_KUGOU_T1": ("kugou_t1", "str"),
             "FNMUSIC_KUGOU_MID": ("kugou_mid", "str"),
             "FNMUSIC_KUGOU_GUID": ("kugou_guid", "str"),
             "FNMUSIC_KUGOU_DEV": ("kugou_dev", "str"),
@@ -4325,8 +4325,9 @@ def stream_tee_response(
     if resolved_ext and not resp.headers.get("content-type"):
         out_headers["content-type"] = media_type_for_ext(resolved_ext)
 
-    # 始终声明支持 Range
-    out_headers.setdefault("Accept-Ranges", "bytes")
+    # 上游已有 accept-ranges 则保留，无则补全
+    if not resp.headers.get("accept-ranges"):
+        out_headers["Accept-Ranges"] = "bytes"
 
     status_code = resp.status_code
     content_length_str = resp.headers.get("content-length")
@@ -6328,7 +6329,7 @@ async def login_qr_check(key: str):
                 "FNMUSIC_KUGOU_TOKEN": credentials["token"],
                 "FNMUSIC_KUGOU_USERID": credentials["userid"],
                 "FNMUSIC_KUGOU_DFID": credentials["dfid"],
-                "FNMUSIC_KUGOU_/track/": credentials["t1"],
+                "FNMUSIC_KUGOU_T1": credentials["t1"],
                 "FNMUSIC_KUGOU_MID": credentials["mid"],
                 "FNMUSIC_KUGOU_GUID": credentials["guid"],
                 "FNMUSIC_KUGOU_DEV": credentials["dev"],
@@ -6442,7 +6443,7 @@ async def login_logout():
                         env_content[k.strip()] = v.strip()
             # 清除凭证字段
             for key in ["FNMUSIC_KUGOU_TOKEN", "FNMUSIC_KUGOU_USERID", "FNMUSIC_KUGOU_DFID",
-                       "FNMUSIC_KUGOU_/track/", "FNMUSIC_KUGOU_MID", "FNMUSIC_KUGOU_GUID",
+                       "FNMUSIC_KUGOU_T1", "FNMUSIC_KUGOU_MID", "FNMUSIC_KUGOU_GUID",
                        "FNMUSIC_KUGOU_DEV", "FNMUSIC_KUGOU_MAC"]:
                 env_content[key] = ""
             with open(env_path, "w") as f:

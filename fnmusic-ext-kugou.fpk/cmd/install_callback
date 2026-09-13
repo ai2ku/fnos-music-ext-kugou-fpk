@@ -112,8 +112,6 @@ ENV_FILE="$APP_DIR/.env"
     echo "FNMUSIC_KUGOU_DEV="
     echo "FNMUSIC_KUGOU_MAC="
     echo "FNMUSIC_LIBRARY_DIR="
-    echo "FNMUSIC_LLM_BASE_URL="
-    echo "FNMUSIC_LLM_API_KEY="
 } > "$ENV_FILE" || { echo "[install_callback] FAIL: 写 .env" >> "$LOGF"; exit 1; }
 chmod 666 "$ENV_FILE" 2>/dev/null || true
 echo "[install_callback] .env 写好" >> "$LOGF"

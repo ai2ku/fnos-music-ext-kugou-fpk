@@ -1,0 +1,66 @@
+[
+  {
+    "stepTitle": "酷狗音源配置",
+    "items": [
+      {
+        "type": "text",
+        "field": "FNMUSIC_KUGOU_URL",
+        "label": "KuGouMusicApi 基地址",
+        "initValue": "http://127.0.0.1:8899",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写 KuGouMusicApi 地址"
+          }
+        ]
+      },
+      {
+        "type": "select",
+        "field": "FNMUSIC_KUGOU_QUALITY",
+        "label": "优先音质",
+        "initValue": "128",
+        "options": [
+          {
+            "label": "128kbps（推荐）",
+            "value": "128"
+          },
+          {
+            "label": "high（最高）",
+            "value": "high"
+          },
+          {
+            "label": "320kbps（需 VIP）",
+            "value": "320"
+          },
+          {
+            "label": "64kbps（保底）",
+            "value": "64"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "FNMUSIC_KUGOU_SEARCH_TIMEOUT",
+        "label": "搜索超时（秒）",
+        "initValue": "15",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写超时秒数"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "曲库设置（可选）",
+    "items": [
+      {
+        "type": "text",
+        "field": "FNMUSIC_LIBRARY_DIR",
+        "label": "飞牛曲库目录（留空使用默认）",
+        "initValue": ""
+      }
+    ]
+  }
+]
