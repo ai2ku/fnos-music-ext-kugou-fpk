@@ -4315,14 +4315,16 @@ def stream_tee_response(
     resolved_ext: str | None = None,
     pre_info: dict | None = None,
 ) -> Response:
-    # 黑名单透传：保留上游全部头，仅剔除 hop-by-hop + 不可预知长度
+    # 黑名单透传：保留上游全部头，仅剔除 hop-by-hop + content-encoding
+    # content-length 透传：浏览器需要它来判断资源总大小、支持 Range/seek
     out_headers = filter_headers(
         resp.headers,
-        exclude_keys={"content-length", "content-encoding"},
+        exclude_keys={"content-encoding"},
     )
 
-    # content-type：上游有则保留，无则按 resolved_ext 补全
-    if resolved_ext and not resp.headers.get("content-type"):
+    # content-type：上游返回 application/octet-stream 时按 resolved_ext 覆盖为真实音频类型
+    ct = (resp.headers.get("content-type") or "").strip().lower()
+    if resolved_ext and (not ct or ct == "application/octet-stream"):
         out_headers["content-type"] = media_type_for_ext(resolved_ext)
 
     # 上游已有 accept-ranges 则保留，无则补全
@@ -4330,9 +4332,17 @@ def stream_tee_response(
         out_headers["Accept-Ranges"] = "bytes"
 
     # CORS：让浏览器能读取 Range 相关头（跨域场景必需）
-    out_headers["Access-Control-Expose-Headers"] = (
-        "Accept-Ranges, Content-Range, Content-Length, ETag, Last-Modified"
-    )
+    if not resp.headers.get("access-control-expose-headers"):
+        out_headers["Access-Control-Expose-Headers"] = (
+            "Accept-Ranges, Content-Range, Content-Length, ETag, Last-Modified"
+        )
+
+    # 连接复用
+    out_headers["Connection"] = "keep-alive"
+
+    # transfer-encoding：仅在无 content-length 时补全（两者互斥，不能同时存在）
+    if "content-length" not in out_headers:
+        out_headers["Transfer-Encoding"] = "chunked"
 
     status_code = resp.status_code
     content_length_str = resp.headers.get("content-length")
