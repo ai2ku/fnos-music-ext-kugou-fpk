@@ -4,6 +4,23 @@
 
 一键安装、图形化配置向导、零命令。酷狗是**唯一外部音源**——历史上的 musicdl / musicbox / 网易云接入已全部下线，仓库里不再有相关代码。
 
+## 灵感与来源
+
+本项目参考并构建了以下项目：
+
+- [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) —— 飞牛音乐扩展框架，本项目的起点
+- [MakcRe/KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi) —— 酷狗音乐 API，提供搜索、直链、歌词与元数据能力
+
+## 效果展示
+
+![效果展示 01](./images/01.jpg)
+![效果展示 02](./images/02.png)
+![效果展示 03](./images/03.png)
+![效果展示 04](./images/04.png)
+![效果展示 05](./images/05.jpg)
+![效果展示 06](./images/06.jpg)
+![效果展示 07](./images/07.png)
+
 ## 架构
 
 ```
@@ -46,7 +63,9 @@
 
 ```
 fnmusic-ext-kugou-fpk/
+├── LICENSE                          # GPL-2.0 协议（仓库根目录，不随 FPK 打包）
 ├── build-fpk.sh                     # 打包脚本（本地跑，含语法/JSON 校验）
+├── images/                          # README 展示用截图
 ├── fnpack-1.2.3-linux-amd64         # 打包工具
 ├── dist/                            # 产物：fnmusic_ext_kugou-1.0.0.fpk
 └── fnmusic-ext-kugou.fpk/           # FPK 源码目录
@@ -233,4 +252,8 @@ sudo rm -rf /var/apps/fnmusic_ext_kugou/var
 
 ## License
 
-MIT（继承自 fnos_music_ext 上游）
+GPL-2.0，见 [`LICENSE`](./LICENSE)。
+
+上游项目 [fnos_music_ext](https://github.com/javycoder/fnos_music_ext) 原为 MIT 授权；本项目在其基础上改造，以 GPL-2.0 授权发布。
+
+`requirements.txt` 依赖各自按其协议分发：fastapi (MIT)、uvicorn (BSD-3-Clause)、httpx (BSD-3-Clause)、mutagen (GPL-2.0)。

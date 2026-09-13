@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
 # fnmusic-ext cmd/start_callback
 # 极简：install 阶段已准备好，服务启停由 cmd/main 管理
 exit 0

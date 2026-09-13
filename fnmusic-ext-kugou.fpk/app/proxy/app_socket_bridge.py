@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+#
+# 本程序是自由软件：你可以按照 GNU 通用公共许可证（第 2 版或更高版本）
+# 的条件重新发布和/或修改它。完整许可证见仓库根目录 LICENSE 文件。
+
 """
 fnmusic_ext_kugou.sock 桥接器
 

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
 # fnmusic-ext cmd/uninstall_callback
 # 卸载后清理 /tmp 状态
 rm -f /tmp/fnmusic-ext.pid /tmp/fnmusic-ext-appdest /tmp/fnmusic-ext-*.log 2>/dev/null

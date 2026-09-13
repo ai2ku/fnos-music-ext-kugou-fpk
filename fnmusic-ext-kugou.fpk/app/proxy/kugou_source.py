@@ -1,3 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+#
+# 本程序是自由软件：你可以按照 GNU 通用公共许可证（第 2 版或更高版本）
+# 的条件重新发布和/或修改它。完整许可证见仓库根目录 LICENSE 文件。
+
 """KuGouMusicApi 源适配模块。
 
 把 KuGouMusicApi 的核心接口封装为 fnos_music_ext 期望的契约：
