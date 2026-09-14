@@ -1057,6 +1057,24 @@ QUALITY_TIERS = [
 ]
 
 
+def _pick_relate_quality_fields(item: dict) -> tuple[int, int]:
+    """从 relate_goods 单项里读取码率与文件大小。
+
+    线上真实结构在 item.info 下；保留顶层兼容，避免旧回包失效。
+    """
+    bitrate = 0
+    size = 0
+    info_obj = item.get("info")
+    if isinstance(info_obj, dict):
+        bitrate = _to_int(info_obj.get("bitrate") or 0)
+        size = _to_int(info_obj.get("filesize") or info_obj.get("size") or 0)
+    if not bitrate:
+        bitrate = _to_int(item.get("bitrate") or 0)
+    if not size:
+        size = _to_int(item.get("filesize") or item.get("size") or 0)
+    return bitrate, size
+
+
 def _parse_relate_goods(data: dict) -> dict[int, dict]:
     """解析 data.relate_goods[] 为 {level: item_dict} 索引。"""
     rel = data.get("relate_goods") if isinstance(data, dict) else None
@@ -1091,28 +1109,14 @@ def _select_quality_tier(data: dict) -> dict | None:
         item = by_level.get(tier["level"])
         if item is None:
             continue
-        try:
-            bitrate = int(item.get("bitrate") or 0)
-        except (TypeError, ValueError):
-            bitrate = 0
-        try:
-            size = int(item.get("size") or item.get("filesize") or 0)
-        except (TypeError, ValueError):
-            size = 0
+        bitrate, size = _pick_relate_quality_fields(item)
         return {**tier, "bitrate": bitrate, "size": size, "match": "exact"}
     # 降级：从低到高取首个可用
     for tier in QUALITY_TIERS:
         item = by_level.get(tier["level"])
         if item is None:
             continue
-        try:
-            bitrate = int(item.get("bitrate") or 0)
-        except (TypeError, ValueError):
-            bitrate = 0
-        try:
-            size = int(item.get("size") or item.get("filesize") or 0)
-        except (TypeError, ValueError):
-            size = 0
+        bitrate, size = _pick_relate_quality_fields(item)
         return {**tier, "bitrate": bitrate, "size": size, "match": "downgrade"}
     return None
 
@@ -1273,6 +1277,7 @@ async def _refresh_privilege_tier(song_id: str, base_info: dict) -> dict | None:
                 info["bitrate"] = tier["bitrate"]
             if tier["size"]:
                 info["file_size"] = tier["size"]
+            info["filesize"] = tier["size"]
             info["_matched_tier"] = tier
             _remember_song(info)
             logger.warning("[KUGOU] refresh tier hash=%s tier=%s suffix=%s match=%s bitrate=%s size=%s",
