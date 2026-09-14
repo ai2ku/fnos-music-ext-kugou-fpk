@@ -1012,15 +1012,21 @@ def track_item_to_raw(it: dict) -> dict:
     album = _album_name_from_albuminfo(it.get("albuminfo"))
     artist = "、".join(singer_names)
     title = _strip_singer_prefix_from_name(str(it.get("name") or ""), singer_names, album)
-    duration_s = _timelen_to_seconds(it.get("timelen"))
+    info_obj = it.get("info")
+    if isinstance(info_obj, dict):
+        duration_s = _timelen_to_seconds(info_obj.get("timelen")) or _timelen_to_seconds(it.get("timelen"))
+    else:
+        duration_s = _timelen_to_seconds(it.get("timelen"))
     ext = _format_from_any(it)
     cover = str(it.get("cover") or "").strip()
     if not cover:
         trans_param = it.get("trans_param")
         if isinstance(trans_param, dict):
             cover = str(trans_param.get("union_cover") or "").strip()
-    file_size = _to_int(it.get("size"))
-    bitrate = _to_int(it.get("bitrate"))
+    if not cover and isinstance(info_obj, dict):
+        cover = str(info_obj.get("image") or info_obj.get("cover") or "").strip()
+    file_size = _to_int((info_obj or {}).get("filesize")) or _to_int((info_obj or {}).get("size")) or _to_int(it.get("size"))
+    bitrate = _to_int((info_obj or {}).get("bitrate")) or _to_int(it.get("bitrate"))
 
     return {
         "id": f"kugou:{sid}",
@@ -1346,6 +1352,8 @@ async def fetch_privilege_lite_info(song_id: str) -> dict | None:
                 info_obj = data.get("info")
                 if isinstance(info_obj, dict):
                     cover_url = str(info_obj.get("image") or "").strip()
+                    if not data.get("timelen"):
+                        data["timelen"] = info_obj.get("timelen")
                 # 1) 从 relate_goods[] 匹配音质档位，覆写 extname/quality/size/bitrate
                 tier = _select_quality_tier(data)
                 if tier:
@@ -1363,6 +1371,8 @@ async def fetch_privilege_lite_info(song_id: str) -> dict | None:
                 # data.quality 是比特率（"128"/"320"），不能当格式。
                 if info_obj.get("extname") and not data.get("extname"):
                     data["extname"] = info_obj["extname"]
+                if info_obj.get("duration") and not data.get("duration"):
+                    data["duration"] = info_obj.get("duration")
                 tp = data.get("trans_param")
                 if isinstance(tp, dict) and not cover_url:
                     cover_url = str(tp.get("union_cover") or "").strip()
