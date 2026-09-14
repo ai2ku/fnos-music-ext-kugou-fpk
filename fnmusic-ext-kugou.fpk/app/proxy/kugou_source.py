@@ -331,11 +331,30 @@ def search_item_to_raw(it: dict) -> dict:
     suffix = str(it.get("Suffix") or "").strip()
     if suffix:
         title = f"{title} {suffix}" if title else suffix
-    ext = str(it.get("ExtName") or "mp3").strip().lower() or "mp3"
-    cover = str(it.get("Image") or "").strip()
-    file_size = _to_int(it.get("FileSize") or 0)
-    bitrate = _to_int(it.get("Bitrate") or 0)
-    duration = _to_int(it.get("Duration") or 0)
+    pref = str(CFG.get("kugou_quality") or "high").strip().lower()
+    block_order = {
+        "high": ("Res", "SQ", "HQ", None),
+        "flac": ("SQ", "Res", "HQ", None),
+        "320": ("HQ", "Res", "SQ", None),
+        "128": (None, "HQ", "SQ", "Res"),
+    }.get(pref, ("Res", "SQ", "HQ", None))
+    selected = {}
+    selected_name = ""
+    for name in block_order:
+        if name is None:
+            break
+        candidate = it.get(name)
+        if isinstance(candidate, dict) and (
+            candidate.get("FileHash") or candidate.get("Hash") or candidate.get("BitRate") or candidate.get("Bitrate")
+        ):
+            selected = candidate
+            selected_name = name
+            break
+    ext = str(selected.get("ExtName") or it.get("ExtName") or "mp3").strip().lower() or "mp3"
+    cover = str(selected.get("Image") or it.get("Image") or "").strip()
+    file_size = _to_int(selected.get("FileSize") or it.get("FileSize") or 0)
+    bitrate = _to_int(selected.get("BitRate") or selected.get("Bitrate") or it.get("Bitrate") or 0)
+    duration = _to_int(selected.get("Duration") or it.get("Duration") or 0)
     if not duration and file_size and bitrate:
         duration = int(round(file_size * 8 / (bitrate * 1000)))
     return {
@@ -354,6 +373,7 @@ def search_item_to_raw(it: dict) -> dict:
         "file_size": file_size,
         "bitrate": bitrate,
         "lyric": "",
+        **({"_matched_tier": {"quality": pref, "block": selected_name}} if selected_name else {}),
     }
 
 
@@ -1014,10 +1034,14 @@ def track_item_to_raw(it: dict) -> dict:
     title = _strip_singer_prefix_from_name(str(it.get("name") or ""), singer_names, album)
     info_obj = it.get("info")
     if isinstance(info_obj, dict):
-        duration_s = _timelen_to_seconds(info_obj.get("timelen")) or _timelen_to_seconds(it.get("timelen"))
+        duration_s = _to_float(info_obj.get("timelen")) or _to_float(it.get("timelen"))
     else:
-        duration_s = _timelen_to_seconds(it.get("timelen"))
-    ext = _format_from_any(it)
+        duration_s = _to_float(it.get("timelen"))
+    tier = _select_quality_tier(it)
+    if tier:
+        ext = tier["suffix"]
+    else:
+        ext = _format_from_any(it)
     cover = str(it.get("cover") or "").strip()
     if not cover:
         trans_param = it.get("trans_param")
@@ -1027,6 +1051,11 @@ def track_item_to_raw(it: dict) -> dict:
         cover = str(info_obj.get("image") or info_obj.get("cover") or "").strip()
     file_size = _to_int((info_obj or {}).get("filesize")) or _to_int((info_obj or {}).get("size")) or _to_int(it.get("size"))
     bitrate = _to_int((info_obj or {}).get("bitrate")) or _to_int(it.get("bitrate"))
+    if tier:
+        if tier["bitrate"]:
+            bitrate = tier["bitrate"]
+        if tier["size"]:
+            file_size = tier["size"]
 
     return {
         "id": f"kugou:{sid}",
@@ -1044,13 +1073,14 @@ def track_item_to_raw(it: dict) -> dict:
         "file_size": file_size,
         "bitrate": bitrate,
         "lyric": "",
+        **({"_matched_tier": tier} if tier else {}),
     }
 
 # ============================================================
 # 音频流 URL
 # ============================================================
 
-QUALITY_FALLBACK = ["high", "320", "128", "64"]
+QUALITY_FALLBACK = ["high", "flac", "320", "128"]
 
 # relate_goods[].level -> 配置音质值 映射表
 # level 2=128kbps mp3, 4=320kbps mp3, 5=flac(无损), 6=flac(Hi-Res)
@@ -1061,6 +1091,7 @@ QUALITY_TIERS = [
     {"level": 5, "quality": "flac", "suffix": "flac"},
     {"level": 6, "quality": "high", "suffix": "flac"},
 ]
+QUALITY_TIERS_DESC = list(reversed(QUALITY_TIERS))
 
 
 def _pick_relate_quality_fields(item: dict) -> tuple[int, int]:
@@ -1102,14 +1133,14 @@ def _select_quality_tier(data: dict) -> dict | None:
     """从 relate_goods[] 匹配音质档位。
 
     1) 精确匹配：配置的 kugou_quality 在 relate_goods 里存在对应 level
-    2) 降级匹配：配置音质不在结果中时，从低到高取首个可用 level
+    2) 降级匹配：配置音质不在结果中时，从高到低在候选范围内取首个可用 level
     返回 {level, quality, suffix, bitrate, size, match}，无 relate_goods 时返回 None。
     """
     by_level = _parse_relate_goods(data)
     if not by_level:
         return None
     pref = str(CFG.get("kugou_quality") or "high").strip().lower()
-    for tier in QUALITY_TIERS:
+    for tier in QUALITY_TIERS_DESC:
         if tier["quality"] != pref:
             continue
         item = by_level.get(tier["level"])
@@ -1117,8 +1148,14 @@ def _select_quality_tier(data: dict) -> dict | None:
             continue
         bitrate, size = _pick_relate_quality_fields(item)
         return {**tier, "bitrate": bitrate, "size": size, "match": "exact"}
-    # 降级：从低到高取首个可用
-    for tier in QUALITY_TIERS:
+    pref_idx = None
+    for idx, tier in enumerate(QUALITY_TIERS_DESC):
+        if tier["quality"] == pref:
+            pref_idx = idx
+            break
+    candidates = QUALITY_TIERS_DESC[pref_idx:] if pref_idx is not None else QUALITY_TIERS_DESC
+    # 降级：从配置的档位开始，继续按高->低顺序取首个可用
+    for tier in candidates:
         item = by_level.get(tier["level"])
         if item is None:
             continue
