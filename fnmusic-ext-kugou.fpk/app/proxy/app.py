@@ -572,6 +572,41 @@ async def fetch_kugou_playlist_tracks(app_state, guid: str, page: int = 1, size:
         logger.warning("[KUGOU_PLAYLIST_TRACKS] guid=%s err=%s", guid, e)
         return {"items": [], "total": 0, "page": page, "pagesize": size}
 
+
+async def fetch_kugou_playlist_tracks_full(app_state, guid: str) -> dict:
+    if not is_kugou_playlist_guid(guid):
+        return {"items": [], "total": 0, "page": 1, "pagesize": 50}
+    pid = kugou_playlist_id_from_guid(guid)
+    if not pid:
+        return {"items": [], "total": 0, "page": 1, "pagesize": 50}
+
+    page_size = 50
+    all_items: list[dict] = []
+    declared_total = 0
+    page = 1
+
+    while True:
+        payload = await fetch_kugou_playlist_tracks(app_state, guid, page=page, size=page_size)
+        items = payload.get("items") or []
+        declared_total = int(payload.get("total") or declared_total)
+        if not items:
+            break
+        all_items.extend(items)
+        if len(all_items) >= declared_total:
+            break
+        if len(items) < page_size:
+            break
+        page += 1
+        if page > 200:
+            break
+
+    return {
+        "items": all_items,
+        "total": declared_total or len(all_items),
+        "page": 1,
+        "pagesize": page_size,
+    }
+
 # ===== KuGouMusicApi 源适配（新增）=====
 import kugou_source  # noqa: E402
 
@@ -1975,11 +2010,58 @@ async def fetch_kugou_album_tracks(app_state, album_guid: str, page: int = 1, si
     return result
 
 
-def _safe_int_or_none(v: Any) -> int | None:
-    """把 discNo/trackNo 之类的可选序号字段转成 int 或 None。
+async def fetch_kugou_album_tracks_full(app_state, album_guid: str) -> dict:
+    """酷狗专辑歌曲全量获取，供 /track/album-detail/list 在 size=-1 时一次拿全。
 
-    0/空值/非数字都视为无值（飞牛对 discNo/trackNo 接受 null）。
+    /album/songs 单页 pagesize 硬上限 50，无法像歌手单曲那样用 2000 一次吐完；
+    所以这里按 pagesize=50 翻页，取到 total 或空页为止。
     """
+    s = str(album_guid or "").strip()
+    if not s.startswith("online:kugou:album:"):
+        return {"items": [], "total": 0, "page": 1, "pagesize": 50, "album_id": ""}
+    album_id = s[len("online:kugou:album:"):].strip()
+    if not album_id:
+        return {"items": [], "total": 0, "page": 1, "pagesize": 50, "album_id": ""}
+
+    page_size = 50
+    all_items: list[dict] = []
+    declared_total = 0
+    page = 1
+
+    while True:
+        try:
+            payload = await kugou_source.get_album_songs(album_id, page=page, pagesize=page_size)
+        except Exception as e:
+            logger.warning("[KUGOU_ALBUM_TRACKS] album_id=%s page=%s size=%s(err) err=%s",
+                           album_id, page, page_size, e)
+            break
+        items = payload.get("items") or []
+        declared_total = int(payload.get("total") or declared_total)
+        logger.warning("[KUGOU_ALBUM_TRACKS] album_id=%s page=%s size=%s got=%s total=%s",
+                       album_id, page, page_size, len(items), declared_total)
+        if not items:
+            break
+        all_items.extend(items)
+        if len(all_items) >= declared_total:
+            break
+        if len(items) < page_size:
+            break
+        page += 1
+        if page > 200:
+            break
+
+    logger.warning("[KUGOU_ALBUM_TRACKS] album_id=%s 全量收工 got=%s total=%s pagesize=%s",
+                   album_id, len(all_items), declared_total, page_size)
+    return {
+        "items": all_items,
+        "total": declared_total or len(all_items),
+        "page": 1,
+        "pagesize": page_size,
+    }
+
+
+def _safe_int_or_none(v: Any) -> int | None:
+    """Convert discNo/trackNo to int or None; 0/empty/non-numeric becomes None."""
     if v is None or v == "":
         return None
     try:
@@ -6031,12 +6113,14 @@ async def track_album_detail_list(request: Request):
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
         page = 1
-    try:
-        # 酷狗 /album/songs pagesize 硬上限 50，超过返 errmsg="invalid param" 空结果。
-        size = min(50, max(1, int(request.query_params.get("size") or 50)))
-    except (TypeError, ValueError):
-        size = 50
-    payload = await fetch_kugou_album_tracks(request.app, album_guid, page=page, size=size)
+    # size=-1 同 artist-detail/list：客户端表示「一次拿全」。
+    # 酷狗 /album/songs pagesize 硬上限 50，超过返 errmsg="invalid param" 空结果，
+    # 所以全量路径按 50 条/页翻页补齐，而不是把 size 直接截断成 50 单页。
+    size = _resolve_kugou_size(request.query_params.get("size"), default=50)
+    if size < 0:
+        payload = await fetch_kugou_album_tracks_full(request.app, album_guid)
+    else:
+        payload = await fetch_kugou_album_tracks(request.app, album_guid, page=page, size=size)
     # get_album_songs 内部已按嵌套结构（base/audio_info/authors）归一化；
     # 不要再套 track_item_to_raw，否则会把 title 清空。
     raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
@@ -6306,13 +6390,11 @@ async def playlist_track_list(request: Request):
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
         page = 1
-    try:
-        size = int(request.query_params.get("size") or 50)
-    except (TypeError, ValueError):
-        size = 50
-    if size < 1:
-        size = 50
-    payload = await fetch_kugou_playlist_tracks(request.app, guid, page=page, size=size)
+    size = _resolve_kugou_size(request.query_params.get("size"), default=50)
+    if size < 0:
+        payload = await fetch_kugou_playlist_tracks_full(request.app, guid)
+    else:
+        payload = await fetch_kugou_playlist_tracks(request.app, guid, page=page, size=size)
     raw_tracks = [kugou_source.track_item_to_raw(it) for it in (payload.get("items") or []) if isinstance(it, dict)]
     raw_tracks = [x for x in raw_tracks if x]
     tracks = [build_online_track(x) for x in raw_tracks]
