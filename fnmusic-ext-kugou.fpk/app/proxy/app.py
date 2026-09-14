@@ -6157,9 +6157,11 @@ async def track_album_detail_list(request: Request):
     # get_album_songs 内部已按嵌套结构（base/audio_info/authors）归一化；
     # 不要再套 track_item_to_raw，否则会把 title 清空。
     raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
+    page_size = max(size, 1) if size >= 1 else max(len(raw_tracks), 1)
+    track_offset = (max(page, 1) - 1) * page_size if size >= 1 else 0
     tracks = [
-        build_online_track(x)
-        for x in raw_tracks if x.get("hash") or x.get("id")
+        {**build_online_track(x), "trackNo": track_offset + idx + 1}
+        for idx, x in enumerate(raw_tracks) if x.get("hash") or x.get("id")
     ]
     return JSONResponse(
         content={
