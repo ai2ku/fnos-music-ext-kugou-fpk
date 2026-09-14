@@ -2002,12 +2002,45 @@ async def fetch_kugou_album_tracks(app_state, album_guid: str, page: int = 1, si
     album_id = s[len("online:kugou:album:"):].strip()
     if not album_id:
         return None
-    try:
-        result = await kugou_source.get_album_songs(album_id, page=page, pagesize=size)
-    except Exception as e:
-        logger.warning("[KUGOU_ALBUM_TRACKS] album/songs error album=%s err=%s", album_id, e)
-        return {"items": [], "total": 0, "page": page, "pagesize": size, "album_id": album_id}
-    return result
+    upstream_page_size = 40
+
+    if size <= upstream_page_size:
+        try:
+            result = await kugou_source.get_album_songs(album_id, page=page, pagesize=size)
+        except Exception as e:
+            logger.warning("[KUGOU_ALBUM_TRACKS] album/songs error album=%s err=%s", album_id, e)
+            return {"items": [], "total": 0, "page": page, "pagesize": size, "album_id": album_id}
+        return result
+
+    # 飞牛客户端 size=120 时，按上游 pagesize=40 聚合 3 页。
+    # page=2 则从上游第 4 页开始，避免把上一页内容重复吐回去。
+    pages_needed = (size + upstream_page_size - 1) // upstream_page_size
+    start_page = 1 + (max(page, 1) - 1) * pages_needed
+    all_items: list[dict] = []
+    declared_total = 0
+
+    for p in range(start_page, start_page + pages_needed):
+        try:
+            payload = await kugou_source.get_album_songs(album_id, page=p, pagesize=upstream_page_size)
+        except Exception as e:
+            logger.warning("[KUGOU_ALBUM_TRACKS] album_id=%s page=%s size=%s(err) err=%s", album_id, p, upstream_page_size, e)
+            break
+
+        items = payload.get("items") or []
+        declared_total = int(payload.get("total") or declared_total)
+        if not items:
+            break
+        all_items.extend(items)
+        if len(all_items) >= size:
+            break
+
+    return {
+        "items": all_items[:size],
+        "total": declared_total or len(all_items),
+        "page": page,
+        "pagesize": size,
+        "album_id": album_id,
+    }
 
 
 async def fetch_kugou_album_tracks_full(app_state, album_guid: str) -> dict:
@@ -2087,7 +2120,7 @@ def build_online_track(item: dict) -> dict:
 
     duration_out = item.get("duration_s") or 0
     try:
-        duration_out = float(duration_out)
+        duration_out = int(float(duration_out))
     except (TypeError, ValueError):
         duration_out = 0
 
@@ -3748,7 +3781,7 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
         "artists": vo.get("artists") or [],
         "album": album_obj,
         "genres": list(vo.get("genres") or []),
-        "duration": vo.get("duration") or 0,
+        "duration": int(vo.get("duration") or 0),
         "coverId": guid,
         "coverUrl": cover_url,
         "format": vo.get("format") or "mp3",
@@ -5693,7 +5726,7 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
     return {
         "guid": guid,
         "title": vo.get("title") or "",
-        "duration": vo.get("duration") or 0,
+        "duration": int(vo.get("duration") or 0),
         "isFavorite": True,
         "isCue": False,
         "genres": [],
@@ -6124,7 +6157,10 @@ async def track_album_detail_list(request: Request):
     # get_album_songs 内部已按嵌套结构（base/audio_info/authors）归一化；
     # 不要再套 track_item_to_raw，否则会把 title 清空。
     raw_tracks = [it for it in (payload.get("items") or []) if isinstance(it, dict)]
-    tracks = [build_online_track(x) for x in raw_tracks if x.get("hash") or x.get("id")]
+    tracks = [
+        build_online_track(x)
+        for x in raw_tracks if x.get("hash") or x.get("id")
+    ]
     return JSONResponse(
         content={
             "code": 0,
@@ -6132,6 +6168,7 @@ async def track_album_detail_list(request: Request):
             "data": {
                 "list": tracks,
                 "total": int(payload.get("total") or len(tracks)),
+                "sort": "trackNo,asc",
             },
         },
         status_code=200,
