@@ -262,7 +262,7 @@ def search_item_to_raw(it: dict) -> dict:
             duration_ms = _to_int(it.get("duration") or 0)
         duration = duration_ms / 1000.0 if duration_ms > 1000 else _to_float(duration_ms)
         ext = str(it.get("extname") or it.get("quality") or "mp3").strip().lower() or "mp3"
-        file_size = _to_int(it.get("filesize") or it.get("filesize_128") or 0)
+        file_size = _to_int(it.get("filesize") or it.get("filesize_128") or it.get("size") or 0)
         bitrate = _to_int(it.get("bitrate") or 0)
         if not duration and file_size and bitrate:
             duration = file_size * 8 / (bitrate * 1000)
@@ -308,7 +308,7 @@ def search_item_to_raw(it: dict) -> dict:
             "ext": str(it.get("extname") or it.get("quality") or "mp3").strip().lower() or "mp3",
             "cover_url": str(it.get("cover") or it.get("image") or "").strip(),
             "union_cover": str(it.get("cover") or it.get("image") or "").strip(),
-            "file_size": _to_int(it.get("filesize") or 0),
+            "file_size": _to_int(it.get("filesize") or it.get("file_size") or it.get("size") or 0),
             "bitrate": _to_int(it.get("bitrate") or 0),
             "lyric": "",
         }
@@ -1244,13 +1244,59 @@ async def get_user_playlists(page: int = 1, pagesize: int = 500) -> dict:
         return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
 
 
+async def _refresh_privilege_tier(song_id: str, base_info: dict) -> dict | None:
+    """搜索结果缓存缺少音质档位时，补拉 /privilege/lite 并合并匹配结果。"""
+    if not song_id:
+        return None
+    try:
+        async with _client() as c:
+            r = await c.get("/privilege/lite", params={"hash": song_id})
+            if r.status_code != 200:
+                return None
+            body = r.json()
+            status = body.get("status", body.get("code"))
+            if status not in (1, 200, 0):
+                return None
+            data = body.get("data") or body
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                data = data[0]
+            if not isinstance(data, dict):
+                return None
+            tier = _select_quality_tier(data)
+            if not tier:
+                return None
+            info = dict(base_info or {})
+            info["id"] = f"kugou:{song_id}"
+            info["source"] = "kugou"
+            info["ext"] = tier["suffix"]
+            if tier["bitrate"]:
+                info["bitrate"] = tier["bitrate"]
+            if tier["size"]:
+                info["file_size"] = tier["size"]
+            info["_matched_tier"] = tier
+            _remember_song(info)
+            logger.warning("[KUGOU] refresh tier hash=%s tier=%s suffix=%s match=%s bitrate=%s size=%s",
+                           song_id, tier["quality"], tier["suffix"], tier["match"],
+                           tier["bitrate"], tier["size"])
+            return info
+    except Exception as e:
+        logger.warning("refresh_privilege_tier %s err=%s", song_id, e)
+    return None
+
+
 async def get_info(song_id: str) -> dict | None:
     """从内存索引拿元数据。搜过的歌直接命中；未搜过则用 /privilege/lite?hash= 回源。"""
     if not song_id:
         return None
     cached = _search_index.get(song_id)
     if cached:
-        return dict(cached)
+        info = dict(cached)
+        # 搜索列表缓存没有 relate_goods 匹配结果时，补拉一次 privilege/lite 修正后缀、大小、码率。
+        if not info.get("_matched_tier"):
+            refreshed = await _refresh_privilege_tier(song_id, info)
+            if refreshed:
+                return refreshed
+        return info
     # 未搜过（直接进入详情页），用 /privilege/lite?hash= 拉元数据
     lite_info = await fetch_privilege_lite_info(song_id)
     if lite_info:
