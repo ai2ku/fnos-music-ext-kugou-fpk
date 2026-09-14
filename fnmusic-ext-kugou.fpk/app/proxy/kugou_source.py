@@ -350,11 +350,12 @@ def search_item_to_raw(it: dict) -> dict:
             selected = candidate
             selected_name = name
             break
-    ext = str(selected.get("ExtName") or it.get("ExtName") or "mp3").strip().lower() or "mp3"
+    selected_upper = selected_name.upper()
+    ext = "flac" if selected_upper in {"SQ", "RES"} else "mp3"
     cover = str(selected.get("Image") or it.get("Image") or "").strip()
     file_size = _to_int(selected.get("FileSize") or it.get("FileSize") or 0)
     bitrate = _to_int(selected.get("BitRate") or selected.get("Bitrate") or it.get("Bitrate") or 0)
-    duration = _to_int(selected.get("Duration") or it.get("Duration") or 0)
+    duration = _to_int(selected.get("TimeLength") or selected.get("Duration") or it.get("Duration") or 0) * 1000
     if not duration and file_size and bitrate:
         duration = int(round(file_size * 8 / (bitrate * 1000)))
     return {
