@@ -1992,9 +1992,8 @@ def build_online_track(item: dict) -> dict:
     except (TypeError, ValueError):
         bitrate = 0
     if not bitrate:
-        bitrate = 1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000
-    elif bitrate < 1000:
-        bitrate *= 1000
+        bitrate = 1411 if play_format in ("flac", "wav", "ape", "wv") else 320
+    bitrate = bitrate * 1000
 
     spec_path = f"online/{src}/{guid}.{play_format}"
     album_guid = f"{guid}:album"
