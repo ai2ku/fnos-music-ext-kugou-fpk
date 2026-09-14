@@ -131,6 +131,39 @@ def _kugou_playlist_field(it: dict, keys: tuple[str, ...], default: Any = "") ->
     return default
 
 
+def _kugou_playlist_obj_from_detail(it: dict, coll_id: str = "", fallback_name: str = "") -> dict | None:
+    """把酷狗 /playlist/detail 的单条 data 映射成飞牛 playlist detail 格式。"""
+    raw_coll_id = str(_kugou_playlist_field(it, ("global_collection_id", "globalCollectionId", "collection_id", "collectionId")) or "").strip()
+    raw_pid = str(_kugou_playlist_field(it, ("listid", "listId", "id", "playlistId", "playlist_id", "pid", "playId")) or "").strip()
+    key = raw_coll_id or raw_pid or coll_id
+    name = str(_kugou_playlist_field(it, ("name", "title", "playlistName", "playlist_name")) or "").strip() or fallback_name
+    if not key:
+        return None
+
+    try:
+        track_count = int(_kugou_playlist_field(it, ("song_count", "songcount", "count", "trackCount", "track_count", "num", "playlist_num")) or 0)
+    except (TypeError, ValueError):
+        track_count = 0
+
+    ts = int(time.time())
+    guid = kugou_playlist_guid(key, name)
+    return {
+        "guid": guid,
+        "id": guid,
+        "name": name or "酷狗歌单",
+        "title": name or "酷狗歌单",
+        "coverId": guid,
+        "coverUrl": str(_kugou_playlist_field(it, ("pic", "cover", "img")) or ""),
+        "creator": str(_kugou_playlist_field(it, ("creator", "owner", "user", "nickname")) or ""),
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": track_count,
+        "collectionId": raw_coll_id,
+        "source": "kugou",
+        "isKugouPlaylist": True,
+    }
+
+
 def build_kugou_playlist_obj(it: dict) -> dict:
     # 酷狗 /user/playlist 返回: global_collection_id / listid / name / count / owner / pic
     coll_id = str(_kugou_playlist_field(it, ("global_collection_id", "globalCollectionId", "collection_id")) or "").strip()
@@ -4734,6 +4767,36 @@ async def _fetch_kugou_playlist_cover_url(request: Request, coll_id: str) -> str
     return ""
 
 
+
+async def _fetch_kugou_playlist_detail_obj(request: Request, coll_id: str) -> dict | None:
+    """用歌单 ID 回源酷狗 /playlist/detail，映射为飞牛 playlist detail 对象。"""
+    if not coll_id:
+        return None
+    coll_id = kugou_playlist_id_from_guid(coll_id)
+    if not coll_id:
+        return None
+    try:
+        async with httpx.AsyncClient(base_url=CONF["kugou_url"], timeout=float(CONF["kugou_search_timeout"]), follow_redirects=True) as c:
+            auth = kugou_source._auth_header()
+            headers = {"Authorization": auth} if auth else {}
+            r = await c.get("/playlist/detail", params={"ids": coll_id}, headers=headers)
+            if r.status_code != 200:
+                logger.warning("[KUGOU_PLAYLIST_DETAIL] http=%s coll_id=%s", r.status_code, coll_id)
+                return None
+            data = r.json()
+            items = data.get("data") or []
+            if not isinstance(items, list):
+                items = []
+            for item in items:
+                if isinstance(item, dict):
+                    obj = _kugou_playlist_obj_from_detail(item, coll_id=coll_id)
+                    if obj is not None:
+                        return obj
+            logger.warning("[KUGOU_PLAYLIST_DETAIL] EMPTY coll_id=%s", coll_id)
+    except Exception as e:
+        logger.warning("[KUGOU_PLAYLIST_DETAIL] error coll_id=%s err=%s", coll_id, e)
+    return None
+
 async def _fetch_kugou_artist_cover_url(request: Request, artist_id: str) -> str:
     """用歌手 ID 回源酷狗，取歌手详情里的 sizable_avatar 封面。"""
     if not artist_id:
@@ -6129,8 +6192,8 @@ async def playlist_detail(request: Request):
                 }
             })
 
-    # 未找到，返回空
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+    # 用户歌单未命中时回源酷狗 /playlist/detail，避免酷狗列表漏登或本地状态不同步时直接空掉。
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": await _fetch_kugou_playlist_detail_obj(request, guid)})
 
 
 @app.get("/music/api/v1/playlist/batch-detail")
@@ -6174,6 +6237,7 @@ async def playlist_batch_detail(request: Request):
 
     now_ts = int(time.time())
     kugou_details = []
+    matched_guids = set()
     for b in bundles:
         if b.get("guid") in kugou_ids:
             kugou_details.append({
@@ -6185,6 +6249,14 @@ async def playlist_batch_detail(request: Request):
                 "trackCount": int(b.get("trackCount") or 0),
                 "source": "kugou", "isKugouPlaylist": True,
             })
+            matched_guids.add(b.get("guid"))
+
+    missing_guids = [g for g in kugou_ids if g not in matched_guids]
+    if missing_guids:
+        for m in missing_guids:
+            obj = await _fetch_kugou_playlist_detail_obj(request, m)
+            if obj is not None:
+                kugou_details.append(obj)
 
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": kugou_details + official_list}})
 
