@@ -1970,12 +1970,11 @@ def build_online_track(item: dict) -> dict:
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
 
-    duration_s = item.get("duration_s") or 0
+    duration_out = item.get("duration_s") or 0
     try:
-        duration_s = float(duration_s)
+        duration_out = float(duration_out)
     except (TypeError, ValueError):
-        duration_s = 0
-    duration_ms = int(duration_s * 1000)
+        duration_out = 0
 
     ext = str(item.get("ext") or "mp3") or "mp3"
     play_format = play_format_from_ext(ext)
@@ -2058,7 +2057,7 @@ def build_online_track(item: dict) -> dict:
         "bitrate": bitrate,
         "codec": play_format,
         "container": "",
-        "duration": duration_ms,
+        "duration": duration_out,
         "format": play_format,
         "path": spec_path,
         "size": file_size,
@@ -2072,7 +2071,7 @@ def build_online_track(item: dict) -> dict:
         "discNo": _safe_int_or_none(item.get("disc_no") or item.get("discNo")),
         "trackNo": _safe_int_or_none(item.get("track_no") or item.get("trackNo")),
         "isrc": None,
-        "duration": duration_ms,
+        "duration": duration_out,
         "isCue": False,
         "createdAt": created_at,
         "updatedAt": updated_at,
