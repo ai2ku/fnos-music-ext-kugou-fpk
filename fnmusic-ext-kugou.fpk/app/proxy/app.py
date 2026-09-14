@@ -2952,11 +2952,22 @@ async def merged_search_meta(
         )
         return JSONResponse(content=envelope)
 
-    # 未命中：酷狗全量轮询 + 官方全量，合并后缓存，再切片返回。
+    # 未命中：酷狗全量轮询 + 官方全量并发拉取，合并后缓存，再切片返回。
     # 酷狗 /search 不支持一次全量，按余数末页法轮询全部结果再合并。
-    kugou_payload = await _fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag, cap=cap)
-
-    upstream_json = await _upstream_search_envelope(request, upstream_client)
+    kugou_task = asyncio.create_task(_fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag, cap=cap))
+    upstream_task = asyncio.create_task(_upstream_search_envelope(request, upstream_client))
+    try:
+        kugou_payload, upstream_json = await asyncio.gather(kugou_task, upstream_task)
+    except asyncio.CancelledError:
+        for t in (kugou_task, upstream_task):
+            if not t.done():
+                t.cancel()
+        raise
+    except Exception:
+        for t in (kugou_task, upstream_task):
+            if not t.done():
+                t.cancel()
+        raise
 
     if not isinstance(upstream_json, dict):
         if isinstance(kugou_payload, dict):
@@ -3776,41 +3787,8 @@ async def search_track(request: Request):
     if size is not None and size < 1:
         size = 50
 
-    url_path = request.url.path
-    params = dict(request.query_params)
-    params.pop("size", None)
-    params.pop("page", None)
-    url_path = f"{url_path}?{urlencode(params)}" if params else url_path
-    headers = copy_incoming_headers(request)
-
-    req = upstream_client.build_request("GET", url_path, headers=headers)
-    upstream_resp = await upstream_client.send(req)
-
-    resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
-
-    if upstream_resp.status_code != 200:
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=upstream_resp.headers.get("content-type"),
-        )
-
-    try:
-        upstream_json = upstream_resp.json()
-    except Exception:
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=upstream_resp.headers.get("content-type"),
-        )
-
-    if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
-        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
-
     if not keyword:
-        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+        return await forward_to_upstream(request, upstream_client)
 
     logger.warning("[SEARCH] keyword=%r page=%d size=%d kugou_enabled=%s token_len=%d userid=%s",
                    keyword, page, size, CONF.get("kugou_enabled"),
@@ -3945,7 +3923,61 @@ async def search_track(request: Request):
                        keyword, len(result.get("items", [])), cap, result["complete"])
         return result
 
+    url_path = request.url.path
+    params = dict(request.query_params)
+    params.pop("size", None)
+    params.pop("page", None)
+    url_path = f"{url_path}?{urlencode(params)}" if params else url_path
+    headers = copy_incoming_headers(request)
+    req = upstream_client.build_request("GET", url_path, headers=headers)
+    upstream_task = asyncio.create_task(upstream_client.send(req))
+    kugou_prefetch_task = asyncio.create_task(_fetch_online_pages()) if CONF.get("kugou_enabled", True) else None
+
+    upstream_resp = await upstream_task
+    resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+    if upstream_resp.status_code != 200:
+        if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
+            kugou_prefetch_task.cancel()
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    try:
+        upstream_json = upstream_resp.json()
+    except Exception:
+        if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
+            kugou_prefetch_task.cancel()
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+
+    if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+        if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
+            kugou_prefetch_task.cancel()
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
     online_all: dict | None = None
+    if kugou_prefetch_task is not None:
+        try:
+            online_all = await asyncio.wait_for(kugou_prefetch_task, timeout=float(CONF.get("search_timeout", 15)))
+        except asyncio.TimeoutError:
+            logger.warning("[SEARCH_KUGOU_ALL_TIMEOUT] keyword=%r timeout=%s", keyword, CONF.get("search_timeout", 15))
+            kugou_prefetch_task.cancel()
+            online_all = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[SEARCH_KUGOU_ALL_ERROR] keyword=%r err=%s", keyword, exc)
+            online_all = None
+    else:
+        online_all = None
 
     # 飞牛官方 total 在首页更稳定；后续页官方结果可能已空，沿用已缓存的官方 total。
     parent = _search_data_root(upstream_json)
@@ -3954,10 +3986,6 @@ async def search_track(request: Request):
     if cached_official_total is None or current_official_total > _read_int(cached_official_total, 0):
         entry["official_total"] = current_official_total
     official_total = _read_int(entry.get("official_total"), current_official_total)
-
-    if CONF.get("kugou_enabled", True):
-        # 酷狗不支持全量拉取，按 50 条/页轮询直到取够 total。
-        online_all = await _fetch_online_pages()
 
     logger.warning("[SEARCH_KUGOU_PAGE] keyword=%r official_total=%d kugou_pages=%s fetched_pages=%s online_items=%d online_total=%s",
                    keyword, official_total, ((online_all or {}).get("page")), ((online_all or {}).get("fetched_pages")), len((online_all or {}).get("items", [])), (online_all or {}).get("total"))
