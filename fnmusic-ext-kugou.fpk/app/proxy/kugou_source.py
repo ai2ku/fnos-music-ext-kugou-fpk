@@ -256,14 +256,32 @@ def search_item_to_raw(it: dict) -> dict:
         raw_name = _pick_ci(it, "audio_name", "songname", "name", "OriSongName")
         # 注意：_strip_singer_prefix_from_name 期望 list[str]，不是 dict 列表
         title = _strip_singer_prefix_from_name(raw_name, [singer_name] if singer_name else [], album_name)
-        # timelength / playTime 都是毫秒
-        duration_ms = _to_int(it.get("timelength") or it.get("playTime") or it.get("timelength_128") or 0)
+        pref = str(CFG.get("kugou_quality") or "high").strip().lower()
+        quality_key = {
+            "high": "high",
+            "flac": "flac",
+            "320": "320",
+            "128": "128",
+        }.get(pref, "high")
+        # timelength / playTime 都是毫秒；按配置音质读对应 *_flac / *_high / *_320 / *_128。
+        duration_ms = _to_int(
+            it.get(f"timelength_{quality_key}")
+            or it.get("timelength")
+            or it.get("playTime")
+            or it.get("timelength_128")
+            or 0
+        )
         if not duration_ms:
             duration_ms = _to_int(it.get("duration") or 0)
         duration = duration_ms / 1000.0 if duration_ms > 1000 else _to_float(duration_ms)
-        ext = str(it.get("extname") or it.get("quality") or "mp3").strip().lower() or "mp3"
-        file_size = _to_int(it.get("filesize") or it.get("filesize_128") or it.get("size") or 0)
-        bitrate = _to_int(it.get("bitrate") or 0)
+        ext = "flac" if quality_key in {"flac", "high"} else "mp3"
+        file_size = _to_int(
+            it.get(f"filesize_{quality_key}")
+            or it.get("filesize_128")
+            or it.get("size")
+            or 0
+        )
+        bitrate = _to_int(it.get(f"bitrate_{quality_key}") or it.get("bitrate_128") or it.get("bitrate") or 0)
         if not duration and file_size and bitrate:
             duration = file_size * 8 / (bitrate * 1000)
         cover = _cover_from_any(it)
