@@ -273,7 +273,7 @@ def search_item_to_raw(it: dict) -> dict:
         )
         if not duration_ms:
             duration_ms = _to_int(it.get("duration") or 0)
-        duration = duration_ms / 1000.0 if duration_ms > 1000 else _to_float(duration_ms)
+        duration = _to_float(duration_ms)
         ext = "flac" if quality_key in {"flac", "high"} else "mp3"
         file_size = _to_int(
             it.get(f"filesize_{quality_key}")
@@ -282,8 +282,6 @@ def search_item_to_raw(it: dict) -> dict:
             or 0
         )
         bitrate = _to_int(it.get(f"bitrate_{quality_key}") or it.get("bitrate_128") or it.get("bitrate") or 0)
-        if not duration and file_size and bitrate:
-            duration = file_size * 8 / (bitrate * 1000)
         cover = _cover_from_any(it)
         return {
             "id": f"kugou:{sid}",
@@ -374,8 +372,6 @@ def search_item_to_raw(it: dict) -> dict:
     file_size = _to_int(selected.get("FileSize") or it.get("FileSize") or 0)
     bitrate = _to_int(selected.get("BitRate") or selected.get("Bitrate") or it.get("Bitrate") or 0)
     duration = _to_int(selected.get("TimeLength") or selected.get("Duration") or it.get("Duration") or 0) * 1000
-    if not duration and file_size and bitrate:
-        duration = int(round(file_size * 8 / (bitrate * 1000)))
     return {
         "id": f"kugou:{sid}",
         "source": "kugou",
@@ -630,12 +626,6 @@ async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50
         audio_info = it.get("audio_info") or {}
         album_info = it.get("album_info") or {}
         tp = it.get("trans_param") or {}
-        sid = str(audio_info.get("hash") or audio_info.get("hash_320")
-                  or audio_info.get("hash_128") or base.get("audio_id")
-                  or it.get("hash") or it.get("filehash") or "").strip()
-        if not sid:
-            continue
-
         # 歌手：authors[] 带真实 author_id，可直接生成 artist guid。
         authors_raw = it.get("authors") or []
         singers: list[dict] = []
@@ -666,21 +656,52 @@ async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50
         if suffix and suffix not in title:
             title = f"{title} {suffix}"
 
-        # audio_info.duration 是毫秒；兜底扁平 timelength 时 >10000 才当毫秒。
-        duration_ms = _to_int(audio_info.get("duration") or audio_info.get("duration_320")
-                              or audio_info.get("duration_128") or 0)
-        if duration_ms <= 0:
-            raw_tl = _to_int(it.get("timelength") or 0)
-            duration_ms = raw_tl if raw_tl > 1000 else int(raw_tl * 1000)
-        duration = duration_ms / 1000.0
+        pref = str(CFG.get("kugou_quality") or "high").strip().lower()
+        quality_key = {
+            "high": "high",
+            "flac": "flac",
+            "320": "320",
+            "128": "128",
+        }.get(pref, "high")
 
-        bitrate = _to_int(audio_info.get("bitrate") or it.get("bitrate") or 0)
-        file_size = _to_int(audio_info.get("filesize_320") or audio_info.get("filesize")
-                            or it.get("size") or it.get("filesize") or 0)
-        if not duration and file_size and bitrate:
-            duration = file_size * 8 / (bitrate * 1000)
-        ext = str(audio_info.get("extname") or it.get("extname") or it.get("filetype")
-                  or "mp3").strip().lower() or "mp3"
+        sid = str(
+            audio_info.get(f"hash_{quality_key}")
+            or audio_info.get("hash_flac")
+            or audio_info.get("hash_320")
+            or audio_info.get("hash_128")
+            or audio_info.get("hash")
+            or base.get("audio_id")
+            or it.get("hash")
+            or it.get("filehash")
+            or ""
+        ).strip()
+        if not sid:
+            continue
+
+        duration = _to_float(
+            audio_info.get(f"duration_{quality_key}")
+            or audio_info.get("duration_flac")
+            or audio_info.get("duration_320")
+            or audio_info.get("duration_128")
+            or audio_info.get("duration")
+            or 0
+        )
+
+        bitrate = _to_int(
+            audio_info.get(f"bitrate_{quality_key}")
+            or audio_info.get("bitrate_high")
+            or audio_info.get("bitrate")
+            or 0
+        )
+        file_size = _to_int(
+            audio_info.get(f"filesize_{quality_key}")
+            or audio_info.get("filesize_flac")
+            or audio_info.get("filesize_320")
+            or audio_info.get("filesize_128")
+            or audio_info.get("filesize")
+            or 0
+        )
+        ext = "flac" if quality_key in {"flac", "high"} else "mp3"
         cover = str(album_info.get("cover") or tp.get("union_cover")
                     or it.get("image") or "").strip()
 
@@ -985,12 +1006,8 @@ def _album_name_from_albuminfo(albuminfo: Any) -> str:
 
 
 def _timelen_to_seconds(value: Any) -> float:
-    """酷狗 timelen 是毫秒；兼容已是秒数的旧数据。"""
-    ms = _to_int(value)
-    if ms <= 0:
-        return 0.0
-    # 若数值明显是毫秒（大于 1000），按毫秒转秒；否则按秒处理。
-    return ms / 1000 if ms > 1000 else float(ms)
+    """酷狗 timelen 直接返回原始数值，不做单位换算。"""
+    return _to_float(value)
 
 
 
