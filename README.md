@@ -73,7 +73,7 @@ fnmusic-ext-kugou-fpk/
 ├── build-fpk.sh                     # 打包脚本（本地跑，含语法/JSON 校验）
 ├── images/                          # README 展示用截图
 ├── fnpack-1.2.3-linux-amd64         # 打包工具
-├── dist/                            # 产物：fnmusic_ext_kugou-2.0.0.fpk
+├── dist/                            # 产物：fnmusic_ext_kugou-2.1.0.fpk
 └── fnmusic-ext-kugou.fpk/           # FPK 源码目录
     ├── manifest                     # 应用元信息（appname / version / 作者地址）
     ├── ICON.png ICON192.png ICON256.png
@@ -137,7 +137,7 @@ curl -sS http://127.0.0.1:8899/health || curl -sS http://127.0.0.1:8899/
 
 ### 安装第 1~4 步
 
-1. 飞牛应用中心 → 右上角「手动安装」→ 上传 `dist/fnmusic_ext_kugou-2.0.0.fpk`
+1. 飞牛应用中心 → 右上角「手动安装」→ 上传 `dist/fnmusic_ext_kugou-2.1.0.fpk`
 2. 授权 root 权限
 3. 配置向导：填 KuGouMusicApi 地址 → 选音质 → 保存
 4. 打开飞牛音乐，搜索即可
