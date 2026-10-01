@@ -6643,6 +6643,7 @@ async def login_status():
     })
 
 
+@app.get("/_ext/login/logout")
 @app.post("/_ext/login/logout")
 async def login_logout():
     """退出登录，清除凭证"""
@@ -6736,6 +6737,7 @@ async def login_status_gateway():
     return await login_status()
 
 
+@app.get("/app/fnmusic_ext_kugou/_ext/login/logout")
 @app.post("/app/fnmusic_ext_kugou/_ext/login/logout")
 async def login_logout_gateway():
     return await login_logout()
